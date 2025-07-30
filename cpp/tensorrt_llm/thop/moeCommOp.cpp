@@ -143,9 +143,20 @@ void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherInd
         gatheredScalesPtr, localExpertIds.data_ptr<int>(), localScalesPtr, stream);
 }
 
-void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor sendIndices, torch::Tensor output,
-    torch::Tensor recvRankCumSum, torch::Tensor recvIndices, torch::Tensor allWorkspaces, int64_t epRank,
-    int64_t epSize)
+void setTensorsParams(tensorrt_llm::kernels::tensorsParams& params, int index, torch::Tensor const& tensor)
+{
+    TORCH_CHECK(tensor.dim() == 2, "tensor must be a 2D tensor");
+    int eltSize = tensor.dtype().itemsize();
+    params.ptrs[index] = static_cast<void*>(tensor.data_ptr());
+    params.lens[index] = tensor.size(1) * eltSize;
+    params.strides[index] = tensor.stride(0) * eltSize;
+    assert(params.totalLen == 0);
+    params.totalLen += params.lens[index];
+}
+
+void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, torch::Tensor sendIndices,
+    c10::List<torch::Tensor> outputs, torch::Tensor recvRankCumSum, torch::Tensor recvIndices,
+    torch::Tensor allWorkspaces, int64_t epRank, int64_t epSize)
 {
     CHECK_INPUT(sendRankCumSum, torch::kInt32);
     CHECK_INPUT(sendIndices, torch::kInt32);
@@ -154,15 +165,15 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
     // allWorkspaces is a uint64 tensor, but may not be contiguous
     TORCH_CHECK(allWorkspaces.dtype() == torch::kUInt64, "allWorkspaces must be a uint64 tensor");
 
-    TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor");
-    TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
+    // TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor");
+    // TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
     TORCH_CHECK(sendRankCumSum.dim() == 1, "sendRankCumSum must be a 1D tensor");
     TORCH_CHECK(sendIndices.dim() == 1, "sendIndices must be a 1D tensor");
     TORCH_CHECK(recvRankCumSum.dim() == 1, "recvRankCumSum must be a 1D tensor");
     TORCH_CHECK(recvIndices.dim() == 1, "recvIndices must be a 1D tensor");
     TORCH_CHECK(allWorkspaces.dim() == 2, "allWorkspaces must be a 2D tensor");
 
-    TORCH_CHECK(input.size(1) == output.size(1), "input and output must have the same second dimension");
+    // TORCH_CHECK(input.size(1) == output.size(1), "input and output must have the same second dimension");
     TORCH_CHECK(sendRankCumSum.size(0) == epSize, "sendRankCumSum must have epSize elements");
     TORCH_CHECK(recvRankCumSum.size(0) == epSize, "recvRankCumSum must have epSize elements");
     TORCH_CHECK(allWorkspaces.size(0) == epSize, "allWorkspaces must have epSize elements");
@@ -172,22 +183,40 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
     tensorrt_llm::kernels::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
     tensorrt_llm::kernels::SendRecvDataInfo sendRecvDataInfo;
 
-    size_t eltSize = input.dtype().itemsize();
-    size_t eltCountPerU64 = sizeof(uint64_t) / eltSize;
-    TORCH_CHECK(input.size(1) % (eltCountPerU64 * 2) == 0, "input.size(1) must be aligned to 16 bytes");
-    sendRecvDataInfo.vectorSizeInU64 = input.size(1) / eltCountPerU64;
-    sendRecvDataInfo.DoPreCompute();
+    // size_t eltSize = input.dtype().itemsize();
+    // size_t eltCountPerU64 = sizeof(uint64_t) / eltSize;
+    // TORCH_CHECK(input.size(1) % (eltCountPerU64 * 2) == 0, "input.size(1) must be aligned to 16 bytes");
+    // sendRecvDataInfo.vectorSizeInU64 = input.size(1) / eltCountPerU64;
+    // sendRecvDataInfo.DoPreCompute();
 
     tensorrt_llm::kernels::SendRecvDispls sendDispls, recvDispls;
-    sendDispls.dataPtr = static_cast<uint64_t*>(input.data_ptr());
+    TORCH_CHECK(inputs.size() == outputs.size(), "inputs and outputs must have the same size");
+    // sendDispls.dataPtr = static_cast<uint64_t*>(input.data_ptr());
     sendDispls.rankCountCumSum = sendRankCumSum.data_ptr<int>();
     sendDispls.rankLocalIndices = sendIndices.data_ptr<int>();
-    sendDispls.vectorStrideInU64 = input.stride(0) / eltCountPerU64;
+    sendDispls.params.tensorCount = inputs.size();
+    for (int i = 0; i < inputs.size(); i++)
+    {
+        setTensorsParams(sendDispls.params, i, inputs[i]);
+    }
+    // sendDispls.vectorStrideInU64 = input.stride(0) / eltCountPerU64;
 
-    recvDispls.dataPtr = static_cast<uint64_t*>(output.data_ptr());
+    // recvDispls.dataPtr = static_cast<uint64_t*>(output.data_ptr());
     recvDispls.rankCountCumSum = recvRankCumSum.data_ptr<int>();
     recvDispls.rankLocalIndices = recvIndices.data_ptr<int>();
-    recvDispls.vectorStrideInU64 = output.stride(0) / eltCountPerU64;
+    recvDispls.params.tensorCount = outputs.size();
+    for (int i = 0; i < outputs.size(); i++)
+    {
+        setTensorsParams(recvDispls.params, i, outputs[i]);
+        TORCH_CHECK(recvDispls.params.lens[i] == sendDispls.params.lens[i],
+            "inputs and outputs must have the same second dimension");
+    }
+    // recvDispls.vectorStrideInU64 = output.stride(0) / eltCountPerU64;
+    // recvDispls.params = tensorrt_llm::kernels::onePtrParams(static_cast<void*>(output.data_ptr()), output.size(1) *
+    // eltSize, output.stride(0) * eltSize);
+
+    sendRecvDataInfo.vectorSizeInU64 = (sendDispls.params.totalLen + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+    sendRecvDataInfo.DoPreCompute();
 
     tensorrt_llm::kernels::MoeCommWorkspace workspace;
     workspace.workspacePtr = allWorkspaces.data_ptr<uint64_t>();
@@ -332,7 +361,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "moe_comm(Tensor input, Tensor send_rank_cum_sum, Tensor send_indices, Tensor output, Tensor "
+        "moe_comm(Tensor[] inputs, Tensor send_rank_cum_sum, Tensor send_indices, Tensor[] outputs, Tensor "
         "recv_rank_cum_sum, Tensor recv_indices, Tensor all_workspaces, int ep_rank, int ep_size) -> ()");
 }
 

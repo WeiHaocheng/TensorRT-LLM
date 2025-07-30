@@ -41,6 +41,57 @@ inline __device__ void store128(uint64_t* ptr, uint64_t v0, uint64_t v1)
     asm volatile("st.volatile.global.v2.u64 [%2], {%0,%1};" ::"l"(v0), "l"(v1), "l"(ptr) : "memory");
 }
 
+__inline__ __device__ void process128(
+    tensorsParams params, bool isSender, int tokenIdx, int packetId, int vecIndex, void* regs, int regsOffset)
+{
+    // at most 16 bytes
+    int offset = packetId * AllToAllChannelCommunicatorBase::DATA_PAYLOAD_SIZE_PER_PACKET + vecIndex;
+    int needProcessLen, ptrIndex, ptrOffset;
+    needProcessLen = params.getNeedProcessLen(offset, ptrIndex, ptrOffset);
+    if (needProcessLen == 0)
+    {
+        return;
+    }
+
+    int processedLen = 0;
+    while (processedLen < needProcessLen)
+    {
+        int curProcessedLen;
+        void* ptr = params.getPtr(tokenIdx, ptrIndex, ptrOffset, curProcessedLen);
+        void* regsPtr = regs + regsOffset + processedLen;
+
+        if (curProcessedLen == 16)
+        {
+            if (isSender)
+            {
+                load128((uint64_t*) ptr, *(uint64_t*) (regsPtr), *((uint64_t*) (regsPtr) + 1));
+            }
+            else
+            {
+                store128((uint64_t*) ptr, *(uint64_t*) (regsPtr), *((uint64_t*) (regsPtr) + 1));
+            }
+        }
+        else
+        {
+#pragma unroll 4
+            for (int i = 0; i < curProcessedLen; i += 4)
+            {
+                if (isSender)
+                {
+                    (*(int32_t*) (regsPtr + i)) = (*(int32_t*) (ptr + i));
+                }
+                else
+                {
+                    (*(int32_t*) (ptr + i)) = (*(int32_t*) (regsPtr + i));
+                }
+            }
+        }
+
+        processedLen += curProcessedLen;
+        ptrOffset += curProcessedLen;
+    }
+}
+
 template <bool isSender>
 class AllToAllChannelCommunicator : public AllToAllChannelCommunicatorBase
 {
@@ -52,7 +103,7 @@ private:
     const MoeEpWorldInfo worldInfo;
     const MoeCommWorkspace workspace;
     const SendRecvDataInfo sendRecvDataInfo;
-    const SendRecvDispls dataDispls;
+    SendRecvDispls dataDispls;
     int peerRank;           // peer rank index
     bool const flagThread;
     int const group;        // primitives group index
@@ -156,12 +207,10 @@ public:
         {
             int idxInSlice = vecId - sliceStartIndice;
             int vecRealIdx = groupSharedBuffer->groupIndiceBuffer[idxInSlice];
-            uint64_t* src = dataDispls.getVectorDataPtr(vecRealIdx);
             uint64_t* slicePtr = stepFifoEntryPtr
                 + idxInSlice * sendRecvDataInfo.dataPacketCountPerVector * PACKET_SIZE_IN_U64 + 2 * wid;
             for (int packetId = 0; packetId < sendRecvDataInfo.dataPacketCountPerVector; packetId++)
             {
-                int vecOff = packetId * DATA_PAYLOAD_SIZE_PER_PACKET_IN_U64;
 #pragma unroll
                 for (int g = 0; g < U64_DATA_REG_PER_THREAD / 2; g++)
                 {
@@ -169,10 +218,8 @@ public:
                     __syncwarp();
                     if (!flagThread || g % 2 == 0)
                     {
-                        if (ix * EltPer16B + vecOff < eltN)
-                        {
-                            load128((uint64_t*) (src + ix * EltPer16B + vecOff), regs[2 * g + 0], regs[2 * g + 1]);
-                        }
+                        process128(dataDispls.params, true, vecRealIdx, packetId, ix * 16, (void*) (regs),
+                            2 * g * sizeof(uint64_t));
                     }
                     __syncwarp();
                 }
@@ -206,13 +253,11 @@ public:
             int idxInSlice = vecId - sliceStartIndice;
             int vecRealIdx = groupSharedBuffer->groupIndiceBuffer[idxInSlice];
 
-            uint64_t* dst = dataDispls.getVectorDataPtr(vecRealIdx);
             uint64_t* slicePtr = stepFifoEntryPtr
                 + idxInSlice * sendRecvDataInfo.dataPacketCountPerVector * PACKET_SIZE_IN_U64 + 2 * wid;
             for (int packetId = 0; packetId < sendRecvDataInfo.dataPacketCountPerVector; packetId++)
             {
                 uint64_t* packetPtr = slicePtr + packetId * PACKET_SIZE_IN_U64;
-                int vecOff = packetId * DATA_PAYLOAD_SIZE_PER_PACKET_IN_U64;
 
                 bool needReload;
                 uint64_t flag = getFlag();
@@ -241,10 +286,8 @@ public:
                     __syncwarp();
                     if (!flagThread || g % 2 == 0)
                     {
-                        if (ix * EltPer16B + vecOff < eltN)
-                        {
-                            store128((uint64_t*) (dst + ix * EltPer16B + vecOff), regs[2 * g + 0], regs[2 * g + 1]);
-                        }
+                        process128(dataDispls.params, false, vecRealIdx, packetId, ix * 16, (void*) (regs),
+                            2 * g * sizeof(uint64_t));
                     }
                     __syncwarp();
                 }
@@ -344,10 +387,6 @@ void moeAllToAll(MoeEpWorldInfo worldInfo, SendRecvDataInfo sendRecvDataInfo, Se
     SendRecvDispls recvDispls, MoeCommWorkspace workspace, cudaStream_t stream)
 {
     sendRecvDataInfo.DoPreCompute();
-    TLLM_CHECK_WITH_INFO(
-        reinterpret_cast<uintptr_t>(sendDispls.dataPtr) % 16 == 0, "sendDispls.dataPtr must be 16-byte aligned");
-    TLLM_CHECK_WITH_INFO(
-        reinterpret_cast<uintptr_t>(recvDispls.dataPtr) % 16 == 0, "recvDispls.dataPtr must be 16-byte aligned");
     dim3 block = AllToAllChannelCommunicatorBase::getLaunchBlockDim();
     dim3 grid = AllToAllChannelCommunicatorBase::getLaunchGridDim(worldInfo.epSize);
     moeAllToAllKernel<<<grid, block, 0, stream>>>(worldInfo, workspace, sendRecvDataInfo, sendDispls, recvDispls);

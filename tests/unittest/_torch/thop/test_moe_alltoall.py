@@ -82,9 +82,11 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                                      dtype=torch.uint64,
                                      device=torch.device('cuda'))
 
-        torch.ops.trtllm.moe_comm(input_tensor, send_cumsum, send_indices,
-                                  output_tensor, recv_cumsum, recv_indices,
-                                  all_workspaces, 0, 1)
+        torch.ops.trtllm.moe_comm([
+            input_tensor,
+        ], send_cumsum, send_indices, [
+            output_tensor,
+        ], recv_cumsum, recv_indices, all_workspaces, 0, 1)
 
         torch.testing.assert_close(output_tensor,
                                    ref_output_tensor,
@@ -97,6 +99,8 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                                    8,
                                    dtype=torch.float16,
                                    device=torch.device('cuda'))
+        input_tensors = [input_tensor]
+
         send_cumsum = torch.ones(1,
                                  dtype=torch.int32,
                                  device=torch.device('cuda'))
@@ -107,6 +111,8 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                                     8,
                                     dtype=torch.float16,
                                     device=torch.device('cuda'))
+        output_tensors = [output_tensor]
+
         recv_cumsum = torch.ones(1,
                                  dtype=torch.int32,
                                  device=torch.device('cuda'))
@@ -118,25 +124,31 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                                      workspace_size,
                                      dtype=torch.uint64,
                                      device=torch.device('cuda'))
-        torch.ops.trtllm.moe_comm(input_tensor, send_cumsum, send_indices,
-                                  output_tensor, recv_cumsum, recv_indices,
+        torch.ops.trtllm.moe_comm(input_tensors, send_cumsum, send_indices,
+                                  output_tensors, recv_cumsum, recv_indices,
                                   all_workspaces, 0, 1)
         torch.cuda.synchronize()
 
     @parameterized.expand([
-        (2, 5, 8, torch.float16),  # small input as smoke test
-        (2, 1, 8, torch.float16),  # some ranks have no data to send/recv
-        (4, 5, 8, torch.float16),  # small input with larger world size
-        (4, 901, 32768, torch.bfloat16),  # large input that reuses workspace
-        (8, 901, 32768,
+        (2, 5, [4, 4], torch.float16),  # small input as smoke test
+        (2, 1, [8], torch.float16),  # some ranks have no data to send/recv
+        (4, 5, [8], torch.float16),  # small input with larger world size
+        #(4, 901, 32768, torch.bfloat16),  # large input that reuses workspace
+        (4, 300, [32768, 16, 16,
+                  4], torch.bfloat16),  # large input that reuses workspace
+        (8, 901, [
+            32768,
+        ],
          torch.float16),  # large input that reuses workspace, larger world size
         (
-            8, 16384, 128, torch.float16
+            8, 16384, [
+                128,
+            ], torch.float16
         ),  # large input count with small vector dim that requires more indices per fifo
     ])
     def test_moe_alltoall_multi_rank_single_gpu(self, world_size,
                                                 input_entry_per_rank,
-                                                vector_dim, dtype):
+                                                vector_dims, dtype):
         torch.cuda.set_device(0)
         max_world_size = 8
         assert world_size <= max_world_size, f"should run with world_size at most {max_world_size}"
@@ -148,27 +160,37 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
             torch.ops.trtllm.set_moe_max_usable_sm_count(max_sm_count)
             has_setup_max_sm_count = True
 
-        # Create a random input tensor
-        input_tensor = torch.randn(input_entry_per_rank * world_size,
-                                   vector_dim,
-                                   dtype=dtype,
-                                   device=torch.device('cuda'))
-        output_tensor = torch.zeros(input_entry_per_rank * world_size,
-                                    vector_dim,
-                                    dtype=dtype,
-                                    device=torch.device('cuda'))
-        ref_output_tensor = torch.zeros(input_entry_per_rank * world_size,
-                                        vector_dim,
-                                        dtype=dtype,
-                                        device=torch.device('cuda'))
+        tensor_count = len(vector_dims)
+        input_tensors = []
+        output_tensors = []
+        ref_output_tensors = []
+        for vector_dim in vector_dims:
+            input_tensors.append(
+                torch.randn(input_entry_per_rank * world_size,
+                            vector_dim,
+                            dtype=dtype,
+                            device=torch.device('cuda')))
+            output_tensors.append(
+                torch.zeros(input_entry_per_rank * world_size,
+                            vector_dim,
+                            dtype=dtype,
+                            device=torch.device('cuda')))
+            ref_output_tensors.append(
+                torch.zeros(input_entry_per_rank * world_size,
+                            vector_dim,
+                            dtype=dtype,
+                            device=torch.device('cuda')))
+
         target_rank_ids = torch.randint(0,
                                         world_size,
                                         (input_entry_per_rank * world_size, ),
                                         dtype=torch.int32,
                                         device=torch.device('cuda'))
+        input_tensors_all_ranks = []
+        for i in range(tensor_count):
+            input_tensors_all_ranks.append(
+                list(torch.split(input_tensors[i], input_entry_per_rank)))
 
-        input_tensors_all_ranks = list(
-            torch.split(input_tensor, input_entry_per_rank))
         target_rank_ids_all_ranks = list(
             torch.split(target_rank_ids, input_entry_per_rank))
 
@@ -210,7 +232,8 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
         recv_ids_all_ranks = []
         recv_cumsum_all_ranks = []
 
-        output_tensors_all_ranks = []
+        # Initialize output_tensors_all_ranks as a list of lists
+        output_tensors_all_ranks = [[] for _ in range(tensor_count)]
 
         total_recv_all_ranks_cpu = []
         output_indice_offset = 0
@@ -227,17 +250,21 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                 local_recv_count_pair = local_recv_counts[other_rank].cpu(
                 ).item()
                 send_rank_start_end = send_start_end_all_ranks[other_rank][rank]
-                ref_output_tensor[output_indice_offset:output_indice_offset + local_recv_count_pair] = \
-                    input_tensors_all_ranks[other_rank][send_ids_all_ranks[other_rank][send_rank_start_end[0]:send_rank_start_end[1]]]
+                for i in range(tensor_count):
+                    ref_output_tensors[i][output_indice_offset:output_indice_offset + local_recv_count_pair] = \
+                        input_tensors_all_ranks[i][other_rank][send_ids_all_ranks[other_rank][send_rank_start_end[0]:send_rank_start_end[1]]]
                 output_indice_offset += local_recv_count_pair
             local_recv_cumsum = torch.cumsum(local_recv_counts,
                                              dim=0).to(torch.int32)
             recv_cumsum_all_ranks.append(local_recv_cumsum)
             total_recv_count = local_recv_cumsum[-1].cpu()
             total_recv_all_ranks_cpu.append(total_recv_count)
-            output_tensors_all_ranks.append(output_tensor[
-                output_start_current_rank:output_start_current_rank +
-                total_recv_count])
+            # Correctly append output tensors for each tensor index
+            for i in range(tensor_count):
+                output_tensors_all_ranks[i].append(
+                    output_tensors[i]
+                    [output_start_current_rank:output_start_current_rank +
+                     total_recv_count])
             output_start_current_rank += total_recv_count
             local_recv_ids = torch.arange(total_recv_count,
                                           dtype=torch.int32,
@@ -264,19 +291,28 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
 
         # do alltoall in parallel
         for rank in range(world_size):
+            input_tensors_this_rank = [
+                input_tensors_all_ranks[i][rank] for i in range(tensor_count)
+            ]
+            output_tensors_this_rank = [
+                output_tensors_all_ranks[i][rank] for i in range(tensor_count)
+            ]
             with torch.cuda.stream(cuda_streams_all_ranks[rank]):
                 torch.ops.trtllm.moe_comm(
-                    input_tensors_all_ranks[rank], send_cumsum_all_ranks[rank],
-                    send_ids_all_ranks[rank], output_tensors_all_ranks[rank],
+                    input_tensors_this_rank, send_cumsum_all_ranks[rank],
+                    send_ids_all_ranks[rank], output_tensors_this_rank,
                     recv_cumsum_all_ranks[rank], recv_ids_all_ranks[rank],
                     all_workspaces, rank, world_size)
         for rank in range(world_size):
             cuda_streams_all_ranks[rank].synchronize()
 
-        torch.testing.assert_close(output_tensor,
-                                   ref_output_tensor,
-                                   atol=1e-5,
-                                   rtol=1e-5)
+        for i in range(tensor_count):
+            # Concatenate output tensors from all ranks for comparison
+            actual_output = torch.cat(output_tensors_all_ranks[i], dim=0)
+            torch.testing.assert_close(actual_output,
+                                       ref_output_tensors[i],
+                                       atol=1e-5,
+                                       rtol=1e-5)
 
     @parameterized.expand([
         (0, 8, 256, 4, 3, False),

@@ -155,6 +155,88 @@ struct MoeExpertParallelInfo
     int topK = 1;
 };
 
+#ifdef __CUDACC__
+__inline__ __device__ void* getPtrHelper(void* ptr, int len, int stride, int tokenIdx, int offset, int& curProcessedLen)
+{
+    if (offset + 16 <= len)
+    {
+        curProcessedLen = 16;
+        return ptr + tokenIdx * stride + offset;
+    }
+    else if (offset >= len)
+    {
+        curProcessedLen = 0;
+        return nullptr;
+    }
+    else
+    {
+        curProcessedLen = len - offset;
+        return ptr + tokenIdx * stride + offset;
+    }
+}
+#endif
+
+static constexpr int MAX_TENSOR_COUNT = 4;
+
+struct tensorsParams
+{
+    int tensorCount;
+    void* ptrs[MAX_TENSOR_COUNT];
+    int totalLen;
+    int lens[MAX_TENSOR_COUNT];
+    int strides[MAX_TENSOR_COUNT];
+
+    tensorsParams()
+        : tensorCount(0)
+        , totalLen(0)
+    {
+    }
+
+#ifdef __CUDACC__
+    __inline__ __device__ int getNeedProcessLen(int offset, int& ptrIndex, int& ptrOffset)
+    {
+        if (offset >= totalLen)
+        {
+            return 0;
+        }
+
+        int leftOffset = offset;
+        ptrIndex = 0;
+        while (leftOffset > 0 && ptrIndex < tensorCount)
+        {
+            if (lens[ptrIndex] < leftOffset)
+            {
+                leftOffset -= lens[ptrIndex];
+                ptrIndex++;
+            }
+            else
+            {
+                break;
+            }
+        }
+        ptrOffset = leftOffset;
+
+        return min(totalLen - offset, 16);
+    }
+
+    __inline__ __device__ void* getPtr(int tokenIdx, int& ptrIndex, int& offset, int& curProcessedLen)
+    {
+        void* ret = nullptr;
+        if (offset < lens[ptrIndex])
+        {
+            ret = getPtrHelper(ptrs[ptrIndex], lens[ptrIndex], strides[ptrIndex], tokenIdx, offset, curProcessedLen);
+        }
+        else
+        {
+            ptrIndex++;
+            offset = 0;
+            ret = getPtrHelper(ptrs[ptrIndex], lens[ptrIndex], strides[ptrIndex], tokenIdx, offset, curProcessedLen);
+        }
+        return ret;
+    }
+#endif
+};
+
 struct SendRecvDataInfo
 {
     int vectorSizeInU64;
@@ -187,11 +269,10 @@ struct SendRecvDataInfo
 // struct holding Send/Recv data pointer and its displacement information.
 struct SendRecvDispls
 {
-    uint64_t* dataPtr;
+    tensorsParams params;
     int const* rankCountCumSum;  // length = epSize
     int const* rankLocalIndices; // length = rankCountCumSum[epRank] - rankCountCumSum[epRank - 1] if epRank > 0 else
                                  // rankCountCumSum[epRank]
-    int vectorStrideInU64;
 
 #ifdef __CUDACC__
     __inline__ __device__ int getCount(int rank) const
@@ -209,10 +290,6 @@ struct SendRecvDispls
         return rankLocalIndices[globalVectorIndex];
     }
 
-    __inline__ __device__ uint64_t* getVectorDataPtr(int realVectorIndex) const
-    {
-        return dataPtr + realVectorIndex * vectorStrideInU64;
-    }
 #endif
 };
 
