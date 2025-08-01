@@ -41,12 +41,30 @@ inline __device__ void store128(uint64_t* ptr, uint64_t v0, uint64_t v1)
     asm volatile("st.volatile.global.v2.u64 [%2], {%0,%1};" ::"l"(v0), "l"(v1), "l"(ptr) : "memory");
 }
 
-__inline__ __device__ void process128(
-    tensorsParams params, bool isSender, int tokenIdx, int packetId, int vecIndex, void* regs, int regsOffset)
+template <bool isSender>
+__forceinline__ __device__ void shortCircuitProcess128(void* ptr, void* regsPtr)
 {
-    // at most 16 bytes
-    int offset = packetId * AllToAllChannelCommunicatorBase::DATA_PAYLOAD_SIZE_PER_PACKET + vecIndex;
+    if (isSender)
+    {
+        load128((uint64_t*) ptr, *(uint64_t*) (regsPtr), *((uint64_t*) (regsPtr) + 1));
+    }
+    else
+    {
+        store128((uint64_t*) ptr, *(uint64_t*) (regsPtr), *((uint64_t*) (regsPtr) + 1));
+    }
+}
+
+__forceinline__ __device__ bool isAlign128(void* ptr)
+{
+    return ((uint64_t) ptr & 0xF) == 0;
+}
+
+template <bool isSender>
+__inline__ __device__ void process128(
+    tensorsParams params, int tokenIdx, int offset, void* regs, int regsOffset)
+{
     int needProcessLen, ptrIndex, ptrOffset;
+    // at most 16 bytes
     needProcessLen = params.getNeedProcessLen(offset, ptrIndex, ptrOffset);
     if (needProcessLen == 0)
     {
@@ -57,10 +75,10 @@ __inline__ __device__ void process128(
     while (processedLen < needProcessLen)
     {
         int curProcessedLen;
-        void* ptr = params.getPtr(tokenIdx, ptrIndex, ptrOffset, curProcessedLen);
+        void* ptr = params.getPtr(tokenIdx, ptrIndex, ptrOffset, curProcessedLen, needProcessLen - processedLen);
         void* regsPtr = regs + regsOffset + processedLen;
 
-        if (curProcessedLen == 16)
+        if (curProcessedLen == 16 && isAlign128(ptr))
         {
             if (isSender)
             {
@@ -218,8 +236,17 @@ public:
                     __syncwarp();
                     if (!flagThread || g % 2 == 0)
                     {
-                        process128(dataDispls.params, true, vecRealIdx, packetId, ix * 16, (void*) (regs),
-                            2 * g * sizeof(uint64_t));
+                        int offset = packetId * AllToAllChannelCommunicatorBase::DATA_PAYLOAD_SIZE_PER_PACKET + ix * 16;
+                        if (offset + 16 <= dataDispls.params.lens[0])
+                        {
+                            void* ptr = dataDispls.params.ptrs[0] + vecRealIdx * dataDispls.params.strides[0] + offset;
+                            shortCircuitProcess128<true>(ptr, (void*) (regs + 2 * g));
+                        }
+                        else if (offset < dataDispls.params.totalLen)
+                        {
+                            process128<true>(dataDispls.params, vecRealIdx, offset, (void*) (regs),
+                                2 * g * sizeof(uint64_t));
+                        }
                     }
                     __syncwarp();
                 }
@@ -286,8 +313,17 @@ public:
                     __syncwarp();
                     if (!flagThread || g % 2 == 0)
                     {
-                        process128(dataDispls.params, false, vecRealIdx, packetId, ix * 16, (void*) (regs),
-                            2 * g * sizeof(uint64_t));
+                        int offset = packetId * AllToAllChannelCommunicatorBase::DATA_PAYLOAD_SIZE_PER_PACKET + ix * 16;
+                        if (offset + 16 <= dataDispls.params.lens[0])
+                        {
+                            void* ptr = dataDispls.params.ptrs[0] + vecRealIdx * dataDispls.params.strides[0] + offset;
+                            shortCircuitProcess128<false>(ptr, (void*) (regs + 2 * g));
+                        }
+                        else if (offset < dataDispls.params.totalLen)
+                        {
+                            process128<false>(dataDispls.params, vecRealIdx, offset, (void*) (regs),
+                                2 * g * sizeof(uint64_t));
+                        }
                     }
                     __syncwarp();
                 }

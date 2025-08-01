@@ -156,11 +156,11 @@ struct MoeExpertParallelInfo
 };
 
 #ifdef __CUDACC__
-__inline__ __device__ void* getPtrHelper(void* ptr, int len, int stride, int tokenIdx, int offset, int& curProcessedLen)
+__inline__ __device__ void* getPtrHelper(void* ptr, int len, int stride, int tokenIdx, int offset, int& curProcessedLen, int maxLen)
 {
-    if (offset + 16 <= len)
+    if (offset + maxLen <= len)
     {
-        curProcessedLen = 16;
+        curProcessedLen = maxLen;
         return ptr + tokenIdx * stride + offset;
     }
     else if (offset >= len)
@@ -219,18 +219,18 @@ struct tensorsParams
         return min(totalLen - offset, 16);
     }
 
-    __inline__ __device__ void* getPtr(int tokenIdx, int& ptrIndex, int& offset, int& curProcessedLen)
+    __inline__ __device__ void* getPtr(int tokenIdx, int& ptrIndex, int& offset, int& curProcessedLen, int maxLen)
     {
         void* ret = nullptr;
         if (offset < lens[ptrIndex])
         {
-            ret = getPtrHelper(ptrs[ptrIndex], lens[ptrIndex], strides[ptrIndex], tokenIdx, offset, curProcessedLen);
+            ret = getPtrHelper(ptrs[ptrIndex], lens[ptrIndex], strides[ptrIndex], tokenIdx, offset, curProcessedLen, maxLen);
         }
         else
         {
             ptrIndex++;
             offset = 0;
-            ret = getPtrHelper(ptrs[ptrIndex], lens[ptrIndex], strides[ptrIndex], tokenIdx, offset, curProcessedLen);
+            ret = getPtrHelper(ptrs[ptrIndex], lens[ptrIndex], strides[ptrIndex], tokenIdx, offset, curProcessedLen, maxLen);
         }
         return ret;
     }
