@@ -65,11 +65,13 @@ static constexpr int FIFO_SIZE_IN_U64 = 1024 * 1024 / 8;
 #define ALIGN_256 alignas(256)
 #endif
 
+#define VALUE_SIZE 512
+
 struct ALIGN_256 MoeCommFifoConnInfo
 {
     volatile uint64_t head;  // write position
     volatile uint64_t tail;  // read position
-    volatile uint64_t count; // for counter
+    volatile int values[VALUE_SIZE]; // for values
 };
 
 struct MoeCommWorkspace
@@ -108,7 +110,7 @@ struct MoeCommWorkspace
 };
 
 void computeCountAndIndice(int* experts, int* sendCounts, int* recvCounts, int* sendIndiceWorkspace,
-    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, MoeCommWorkspace workspace, int tokenCount,
+    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, int* expertStatics, int* gatheredExpertStatics, MoeCommWorkspace workspace, int tokenCount,
     int maxTokenCountPerRank, int topK, int expert_count, int rankId, int rankCount, cudaStream_t stream);
 
 void computeCumsum(int* sendCountsCumsum, int* recvCountsCumsum, int rankId, int rankCount, cudaStream_t stream);

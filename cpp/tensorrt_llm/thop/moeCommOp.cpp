@@ -279,7 +279,7 @@ moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> scales, c10:
 
     tensorrt_llm::kernels::moe_prepare::computeCountAndIndice(expertsIds.data_ptr<int>(),
         sendRankCountCumSum.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(),
-        backwardRecvRankIndices.data_ptr<int>(), recvRankIndices.data_ptr<int>(), workspace, tokenCount,
+        backwardRecvRankIndices.data_ptr<int>(), recvRankIndices.data_ptr<int>(), localExpertStaticsPtr, gatheredExpertStaticsPtr, workspace, tokenCount,
         maxTokenCountPerRank, topK, slotCount, epRank, epSize, stream);
 
     tensorrt_llm::kernels::moe_prepare::computeCumsum(
