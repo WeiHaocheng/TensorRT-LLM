@@ -773,9 +773,57 @@ __global__ void loopbackKernel(FusedMoeFieldInfo sendFieldInfo, FusedMoeFieldInf
         tensorrt_llm::kernels::fused_moe_impl::s2gAllFields<false>(
             recvFieldInfo, expertParallelInfo, tokenIndex, sharedMemoryBase, warpId, laneId);
     }
-
     cp_async_bulk_wait_group_read<0>();
     __syncwarp();
+}
+
+
+
+
+__global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace)
+{
+    __shared__ uint64_t allWarpSmemBar[32];
+    extern __shared__ int4 allWarpShm[];
+
+
+    bool isSender = blockIdx.z == 0;
+    int channelCount = gridDim.y;
+    int group = threadIdx.y;
+    SendRecvDispls dataDispls = isSender ? params.sendDispls : params.recvDispls;
+
+    FusedMoePairInfo pairInfo;
+    int peerRank = blockIdx.x * FusedMoeCommunicator::GROUP_COUNT_PER_BLOCK + group;  
+    if (peerRank >= params.worldInfo.epInfo.epSize)
+    {
+        return;
+    }
+
+    int rankCount = isSender ? dataDispls.getCount(pairInfo.senderRank) : dataDispls.getCount(pairInfo.receiverRank);
+    pairInfo.channel = blockIdx.y;
+    pairInfo.channelCount = channelCount;
+    pairInfo.senderRank = isSender ? params.worldInfo.epInfo.epRank : peerRank;
+    pairInfo.receiverRank = isSender ? peerRank : params.worldInfo.epInfo.epRank;
+
+    int tokenCount;
+    int* groupStartPtr = dataDispls.getGroupStart(pairInfo.senderRank, pairInfo.channel, countPerChannel, tokenCount);
+
+    if (tokenCount == 0)
+    {
+        return;
+    }
+
+    if (isSender)
+    {
+        FusedMoeCommunicatorDevice<true> comm(
+            params.worldInfo, workspace, params.sendCommMeta, params.sendFieldInfo, dataDispls, pairInfo, params.expertParallelInfo, groupSharedBuffer, channelCount);
+        comm.run();
+    }
+    else
+    {
+        FusedMoeCommunicatorDevice<false> comm(
+            params.worldInfo, workspace, params.recvCommMeta, params.recvFieldInfo, dataDispls, pairInfo, params.expertParallelInfo, groupSharedBuffer, channelCount);
+        comm.run();
+    }
 }
 
 // G2S -> Pack -> Unpack -> S2G
@@ -802,6 +850,21 @@ void launchLoopback(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo co
     loopbackKernel<<<gridDim, blockDim, warpShmSize * warpsPerBlock, stream>>>(sendFieldInfo, recvFieldInfo,
         expertParallelInfo, sendCommMeta, recvCommMeta, recvIndexMapping, tokenCount, hasBasicFields);
     TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, bool hasBasicFields, cudaStream_t stream)
+{
+    int warpSendShmSize = params.sendFieldInfo.computeSingleWarpShmSize(
+        params.expertParallelInfo.topK, params.sendFieldInfo.expertScales != nullptr, hasBasicFields);
+    int warpRecvShmSize = params.recvFieldInfo.computeSingleWarpShmSize(
+        params.expertParallelInfo.topK, params.recvFieldInfo.expertScales != nullptr, hasBasicFields);
+    int warpShmSize = warpSendShmSize;
+    TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize(%d) not same as warpRecvShmSize(%d)",
+        warpSendShmSize, warpRecvShmSize);
+
+    dim3 block = FusedMoeCommunicator::getLaunchBlockDim();
+    dim3 grid = FusedMoeCommunicator::getLaunchGridDim(params.worldInfo.epInfo.epSize);
+    moeAllToAllKernel<<<grid, block, warpSendShmSize * FusedMoeCommunicator::GROUP_COUNT_PER_BLOCK, stream>>>(params, workspace);
 }
 
 } // namespace fused_moe_comm_tests
