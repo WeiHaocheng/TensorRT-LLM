@@ -44,7 +44,7 @@ This document lists all user-facing modules under the TensorRT-LLM `_torch/modul
 - RoPE positional encoding (optional fusion)
 - Sliding Window Attention support
 - Chunked Attention support
-- Attention Sinks support
+- Attention Sinks support (StreamingLLM): Per-head learnable sink parameters added to softmax normalization, allowing the model to drain excess attention weight and improve long-context inference quality. Only supported with the TRTLLM backend.
 - Tensor Parallelism support
 - Multiple quantization methods support
 - LoRA fine-tuning support
@@ -221,8 +221,14 @@ This document lists all user-facing modules under the TensorRT-LLM `_torch/modul
 **Main Features**:
 - Sparse expert activation
 - Multiple routing strategies support
+- Multiple backend implementations (Cutlass, Triton, DeepGemm, TRTLLMGen, CuteDSL, WideEP, Vanilla)
+- Tensor Parallelism support
 - Expert Parallelism support
-- Quantization support
+- Expert Parallel Load Balancing (EPLB) for dynamic expert redistribution
+- Multiple AllToAll communication strategies (NVLinkOneSided, NVLinkTwoSided, DeepEP, DeepEPLowLatency, AllGatherReduceScatter)
+- Configurable activation types (Swiglu, Geglu, Silu, Gelu, Relu, etc.)
+- Quantization support (FP8, NVFP4, MxFP4, W4A8, etc.)
+- torch.compile support
 
 ### Routing Methods
 
@@ -230,9 +236,13 @@ This document lists all user-facing modules under the TensorRT-LLM `_torch/modul
 |------------|-------------|
 | `DefaultMoeRoutingMethod` | Standard Top-K routing |
 | `RenormalizeMoeRoutingMethod` | Routing with renormalization |
+| `RenormalizeNaiveMoeRoutingMethod` | Naive renormalization routing |
 | `DeepSeekV3MoeRoutingMethod` | DeepSeek V3 specific routing |
 | `LoadBalancedMoeRoutingMethod` | Load-balanced routing |
 | `Llama4RenormalizeMoeRoutingMethod` | Llama 4 specific routing |
+| `MiniMaxM2MoeRoutingMethod` | MiniMax M2 specific routing |
+| `SparseMixerMoeRoutingMethod` | SparseMixer routing |
+| `StaticMoeRoutingMethod` | Static routing |
 
 **Code Path**: `tensorrt_llm/_torch/modules/fused_moe/`
 
