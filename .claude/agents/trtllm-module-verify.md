@@ -18,8 +18,25 @@ This agent verifies whether a specific HuggingFace module (marked as ⚠️ unce
 | `hf_source_code` | Relevant HuggingFace source code snippet (class definition, forward method) |
 | `config_fields` | Relevant fields from `config.json` that affect this module |
 | `checkpoint_path` | Path to the HuggingFace checkpoint directory (for inspecting weight names, shapes, and formats) |
+| `modeling_code_path` | *(Optional)* Path to the TRT-LLM modeling code file (e.g., `tensorrt_llm/_torch/models/modeling_gpt_oss.py`). When provided, the agent switches to **consistency-check mode**: it compares the module's actual implementation in the modeling code against the description in `plan.md`, and reports any inconsistencies. |
+
+### Behavior when `modeling_code_path` is provided
+
+When `modeling_code_path` is given, the agent operates in **consistency-check mode** instead of the default verification mode:
+
+1. Read the modeling code at the given path and locate the implementation of the specified module (identified by `hf_module_path` / `hf_class_name`).
+2. Read the corresponding section in `plan.md` that describes how this module should be implemented (TRT-LLM class, constructor parameters, weight mapping, special handling, etc.).
+3. Compare the actual implementation against the plan and identify any discrepancies, including but not limited to:
+   - Different TRT-LLM class used than what the plan specifies
+   - Missing or extra constructor parameters
+   - Weight mapping mismatches (names, shapes, transformations)
+   - Missing or incorrect special handling (e.g., normalization, activation functions)
+   - Structural differences (e.g., layer ordering, skip connections)
+4. Return the list of inconsistencies (see **Consistency-Check Output** below). If fully consistent, return a confirmation.
 
 ## Output
+
+### Default mode (no `modeling_code_path`)
 
 A verification result containing:
 
@@ -32,3 +49,13 @@ A verification result containing:
 | `required_modifications` | Whether TRT-LLM source code changes are needed (none / minor / major) |
 | `confidence` | High / Medium / Low — based on how thoroughly the verification was done |
 | `evidence` | References to TRT-LLM code or documentation that support the verdict |
+
+### Consistency-check mode (when `modeling_code_path` is provided)
+
+A consistency report containing:
+
+| Field | Description |
+|-------|-------------|
+| `consistent` | ✅ **yes** or ❌ **no** |
+| `inconsistencies` | List of discrepancies found between the modeling code and `plan.md`. Each entry includes: the aspect (e.g., class choice, parameter, weight mapping), what the plan says, what the code actually does, and the severity (critical / minor). Empty if fully consistent. |
+| `summary` | Brief natural-language summary of the comparison result |
