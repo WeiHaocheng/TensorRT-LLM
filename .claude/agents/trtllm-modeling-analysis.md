@@ -37,6 +37,8 @@ The generated `plan.md` must **strictly focus on analysis and mapping**. The fol
 
 **IMPORTANT**: This output must be written to a file named `plan.md` in the current working directory. Do NOT just print the content — use a file-write tool to persist it to disk so the user can access it after the agent finishes.
 
+**NOTE**: When analyzing `hf_modeling_path`, do NOT only look at the modeling file itself. You should also examine **other code files in the same directory** (e.g., `configuration_*.py`, `convert_*.py`, etc.), as they may contain important config classes, model constants, or helper utilities that the modeling code depends on. Make sure to list and review all relevant files under that directory to get a complete picture of the model implementation.
+
 A markdown document with three major sections:
 
 #### Part 1: Module Mapping
@@ -388,6 +390,17 @@ Generate module mapping for the first part of plan.md:
 | `model.embed_tokens` | `nn.Embedding` | `Embedding` | Token embedding |
 | `model.layers[i].self_attn` | `LlamaAttention` | `Attention` | Fuse QKV |
 
+#### MoE-Specific Analysis
+
+When the model uses Mixture of Experts, document the following in `plan.md`:
+
+1. **MoE architecture**: `num_experts`, `experts_per_token`, routing method (top-k renormalize, etc.), whether the gate/router has bias.
+2. **weight_loading_mode**: Determine whether to use `FUSED_GATE_UP_PROJ` or `VANILLA`. **Default to `FUSED_GATE_UP_PROJ`** for performance. Only use `VANILLA` if weights cannot be stacked into a single `[num_experts, ...]` tensor.
+3. **Weight layout**: Document whether the checkpoint stores gate/up weights in concatenated (`[gate_rows; up_rows]`) or interleaved (`[gate_row0, up_row0, gate_row1, up_row1, ...]`) format. If interleaved, note that `_transform_weights` must de-interleave and re-concatenate before loading.
+4. **Custom activation parameters**: Document any SwiGLU `alpha`/`beta`/`limit` values and where they come from (config field or hardcoded in HuggingFace source).
+5. **MoE bias**: Whether the expert MLPs use bias terms (`bias=True` in `create_moe`).
+6. **Gate/Router mapping**: How router weight/bias names map to the TRT-LLM Gate module (e.g., `mlp.router` → `mlp.gate`).
+
 ### Step 5: Generate Weight Loading Plan (Part 2)
 
 Generate weight loading plan for the second part of plan.md:
@@ -465,16 +478,9 @@ Evaluate whether the model can be built with TensorRT-LLM:
 1. **Check module compatibility**: Whether each HuggingFace module has a corresponding TensorRT-LLM class
 2. **Check quantization compatibility**: Whether the quantization method is supported by TensorRT-LLM
 
-**Supported module types:**
-- Embedding, Linear, RMSNorm, LayerNorm, Attention (MHA/GQA/MQA)
-
 **Supported quantization methods:**
 - None (FP16/BF16), GPTQ, AWQ, INT8, FP8, SmoothQuant
 
-**Unsupported features:**
-- Mixture of Experts (MoE) - partial support
-- Cross-Attention (Encoder-Decoder)
-- GGML/GGUF format
 
 ### Step 8: Write plan.md to Disk
 
@@ -500,35 +506,6 @@ Compile all analysis results into a structured markdown document and **write it 
 **⚠️ Reminder**: The plan.md must contain ONLY the three parts above. Do NOT append a work schedule/timeline section or a TensorRT-LLM modeling code section. See the "Output Constraints" section above.
 
 After writing the file, verify it was created successfully, then output the compatibility conclusion.
-
-## Supported Features
-
-### Module Types
-
-| HuggingFace | TensorRT-LLM | Status |
-|-------------|--------------|--------|
-| `nn.Embedding` | `Embedding` | ✅ Supported |
-| `nn.Linear` | `Linear` | ✅ Supported |
-| `nn.LayerNorm` | `LayerNorm` | ✅ Supported |
-| `*RMSNorm` | `RMSNorm` | ✅ Supported |
-| `*Attention` (MHA/GQA/MQA) | `Attention` | ✅ Supported |
-| `*MLP` (SwiGLU/GeGLU) | `Linear` layers | ✅ Supported |
-| `*RotaryEmbedding` | Built into `Attention` | ✅ Supported |
-| `MoELayer` | `MoeModule` | ⚠️ Partial |
-| Cross-Attention | - | ❌ Not Supported |
-
-### Quantization Methods
-
-| Method | Status | TensorRT-LLM Config |
-|--------|--------|---------------------|
-| FP16/BF16 | ✅ Supported | Native |
-| GPTQ (4-bit) | ✅ Supported | `QuantAlgo.W4A16_GPTQ` |
-| AWQ (4-bit) | ✅ Supported | `QuantAlgo.W4A16_AWQ` |
-| INT8 weight-only | ✅ Supported | `QuantAlgo.W8A16` |
-| FP8 | ✅ Supported | `QuantAlgo.FP8` |
-| SmoothQuant | ✅ Supported | `QuantAlgo.W8A8_SQ` |
-| GGML/GGUF | ❌ Not Supported | - |
-| bitsandbytes | ⚠️ Limited | Convert first |
 
 ## Workflow Diagram
 
