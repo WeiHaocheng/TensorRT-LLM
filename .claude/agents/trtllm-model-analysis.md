@@ -1,5 +1,5 @@
 ---
-name: trtllm-modeling-analysis
+name: trtllm-model-analysis
 description: Guide for analyzing HuggingFace models to determine TensorRT-LLM compatibility and generate a structured porting plan. Use this skill to produce a plan.md file (written to the current working directory) containing module mapping, weight loading details, and quantization analysis.
 ---
 
@@ -389,17 +389,6 @@ Generate module mapping for the first part of plan.md:
 |-------------------|-------------------|-------------------|-------|
 | `model.embed_tokens` | `nn.Embedding` | `Embedding` | Token embedding |
 | `model.layers[i].self_attn` | `LlamaAttention` | `Attention` | Fuse QKV |
-
-#### MoE-Specific Analysis
-
-When the model uses Mixture of Experts, document the following in `plan.md`:
-
-1. **MoE architecture**: `num_experts`, `experts_per_token`, routing method (top-k renormalize, etc.), whether the gate/router has bias.
-2. **weight_loading_mode**: Determine whether to use `FUSED_GATE_UP_PROJ` or `VANILLA`. **Default to `FUSED_GATE_UP_PROJ`** for performance. Only use `VANILLA` if weights cannot be stacked into a single `[num_experts, ...]` tensor.
-3. **Weight layout**: Document whether the checkpoint stores gate/up weights in concatenated (`[gate_rows; up_rows]`) or interleaved (`[gate_row0, up_row0, gate_row1, up_row1, ...]`) format. If interleaved, note that `_transform_weights` must de-interleave and re-concatenate before loading.
-4. **Custom activation parameters**: Document any SwiGLU `alpha`/`beta`/`limit` values and where they come from (config field or hardcoded in HuggingFace source).
-5. **MoE bias**: Whether the expert MLPs use bias terms (`bias=True` in `create_moe`).
-6. **Gate/Router mapping**: How router weight/bias names map to the TRT-LLM Gate module (e.g., `mlp.router` → `mlp.gate`).
 
 ### Step 5: Generate Weight Loading Plan (Part 2)
 

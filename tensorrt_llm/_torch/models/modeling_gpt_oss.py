@@ -113,7 +113,7 @@ class GptOssMoE(nn.Module):
             hidden_size=self.hidden_dim,
             num_experts=self.num_experts,
             top_k=self.top_k,
-            dtype=config.torch_dtype,
+            dtype=model_config.torch_dtype,
             moe_backend_cls=get_moe_cls(model_config),
         )
 
@@ -135,7 +135,7 @@ class GptOssMoE(nn.Module):
             routing_method=self.gate.routing_method,
             hidden_size=self.hidden_dim,
             intermediate_size=config.intermediate_size,
-            dtype=config.torch_dtype,
+            dtype=model_config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
@@ -199,14 +199,15 @@ class GptOssAttention(Attention):
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
-            dtype=config.torch_dtype,
+            dtype=model_config.torch_dtype,
             config=model_config,
         )
 
         # Attention sinks: one value per local attention head (TP-adjusted).
         # self.num_heads is already divided by tp_size in Attention.__init__.
+        # Backend requires float32 for attention_sinks.
         self.sinks = nn.Parameter(
-            torch.empty(self.num_heads, dtype=config.torch_dtype),
+            torch.empty(self.num_heads, dtype=torch.float32),
             requires_grad=False,
         )
 
@@ -219,9 +220,7 @@ class GptOssAttention(Attention):
         **kwargs,
     ) -> torch.Tensor:
         if attention_mask is None:
-            attention_mask = (
-                PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL
-                if self.is_sliding else PredefinedAttentionMask.CAUSAL)
+            attention_mask = PredefinedAttentionMask.CAUSAL
         return super().forward(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -254,12 +253,12 @@ class GptOssDecoderLayer(DecoderLayer):
         self.input_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
+            dtype=model_config.torch_dtype,
         )
         self.post_attention_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
+            dtype=model_config.torch_dtype,
         )
 
     def forward(
@@ -302,7 +301,7 @@ class GptOssModel(DecoderModel):
             self.embed_tokens = Embedding(
                 config.vocab_size,
                 config.hidden_size,
-                dtype=config.torch_dtype,
+                dtype=model_config.torch_dtype,
                 enable_torch_compile_for_embedding=model_config.
                 enable_torch_compile_for_embedding,
             )
@@ -310,7 +309,7 @@ class GptOssModel(DecoderModel):
             self.embed_tokens = Embedding(
                 config.vocab_size,
                 config.hidden_size,
-                dtype=config.torch_dtype,
+                dtype=model_config.torch_dtype,
                 mapping=model_config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
@@ -326,7 +325,7 @@ class GptOssModel(DecoderModel):
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
+            dtype=model_config.torch_dtype,
         )
 
     def forward(
@@ -365,6 +364,24 @@ class GptOssForCausalLM(DecoderModelForCausalLM[GptOssModel, GptOssConfig]):
 
     def __init__(self, model_config: ModelConfig[GptOssConfig]):
         config = model_config.pretrained_config
+
+        # Default torch_dtype to bfloat16 if not set in the checkpoint.
+        if getattr(config, 'torch_dtype', None) is None:
+            config.torch_dtype = torch.bfloat16
+
+        # Expand exclude_modules patterns to also cover child modules.
+        # HF patterns like "model.layers.*.self_attn" only match the parent
+        # Attention module, not child Linear modules (o_proj, qkv_proj).
+        # Append ".*" variants so child modules are also excluded from quant.
+        quant_config = model_config.quant_config
+        if quant_config and quant_config.exclude_modules:
+            expanded = list(quant_config.exclude_modules)
+            for pattern in list(quant_config.exclude_modules):
+                child_pattern = pattern + '.*'
+                if child_pattern not in expanded:
+                    expanded.append(child_pattern)
+            quant_config.exclude_modules = expanded
+
         super().__init__(
             GptOssModel(model_config),
             config=model_config,

@@ -59,3 +59,7 @@ A consistency report containing:
 | `consistent` | ✅ **yes** or ❌ **no** |
 | `inconsistencies` | List of discrepancies found between the modeling code and `plan.md`. Each entry includes: the aspect (e.g., class choice, parameter, weight mapping), what the plan says, what the code actually does, and the severity (critical / minor). Empty if fully consistent. |
 | `summary` | Brief natural-language summary of the comparison result |
+
+## MoE Module Handling
+
+If the module being verified is an MoE module, read `trtllm-modeling/references/moe_module_notes.md` and apply its checks.
