@@ -111,7 +111,7 @@ For each failed test, produce a recommendation block:
 **Root cause**: <1-2 sentence explanation>
 
 **Recommended fix**:
-Reference `trtllm-modeling/references/trtllm_test_failure_recommendations.md` for common error patterns and fixes, and customize the recommendation based on the specific error details and root cause identified.
+Reference `trtllm-modeling/references/trtllm_test_fix_recommendations.md` for common error patterns and fixes, and customize the recommendation based on the specific error details and root cause identified.
 
 - <Concrete action 1>
 - <Concrete action 2 if needed>

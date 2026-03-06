@@ -18,7 +18,9 @@ This agent verifies whether a specific HuggingFace module (marked as ⚠️ unce
 | `hf_source_code` | Relevant HuggingFace source code snippet (class definition, forward method) |
 | `config_fields` | Relevant fields from `config.json` that affect this module |
 | `checkpoint_path` | Path to the HuggingFace checkpoint directory (for inspecting weight names, shapes, and formats) |
-| `modeling_code_path` | *(Optional)* Path to the TRT-LLM modeling code file (e.g., `tensorrt_llm/_torch/models/modeling_gpt_oss.py`). When provided, the agent switches to **consistency-check mode**: it compares the module's actual implementation in the modeling code against the description in `plan.md`, and reports any inconsistencies. |
+| `modeling_code_path` | *(Optional)* Path to the TRT-LLM modeling code file (e.g., `tensorrt_llm/_torch/models/modeling_gpt_oss.py`). When provided, the agent switches to **consistency-check mode**: it compares the module's actual implementation in the modeling code against the description in `plan.md`, and reports any inconsistencies. Also triggers module-level tests. |
+| `model_definition_file_hf` | *(Optional)* Path to the HuggingFace modeling source file (e.g., `modeling_llama.py`). When provided along with `modeling_code_path`, enables module-level tests. |
+| `repo_path` | *(Optional)* Root of the TensorRT-LLM repo (default: current working directory). Used for module-level tests. |
 
 ### Behavior when `modeling_code_path` is provided
 
@@ -33,6 +35,32 @@ When `modeling_code_path` is given, the agent operates in **consistency-check mo
    - Missing or incorrect special handling (e.g., normalization, activation functions)
    - Structural differences (e.g., layer ordering, skip connections)
 4. Return the list of inconsistencies (see **Consistency-Check Output** below). If fully consistent, return a confirmation.
+
+#### Module-Level Test (only when `modeling_code_path` and `model_definition_file_hf` are provided)
+
+After the consistency-check steps above, run module-level tests to verify that TRT-LLM modules produce the same outputs as their HuggingFace counterparts.
+
+1. **Extract module classes** from `modeling_code_path` — find locally defined `nn.Module` subclasses, excluding `*Model` and `*ForCausalLM` classes. If `hf_class_name` is provided, filter to only that module.
+
+2. **Create test file** under `./tests/<MODEL_NAME>_auto_generated_tests/`:
+   - Import the TRT-LLM module from `modeling_code_path` and the HF module from `model_definition_file_hf`.
+   - Instantiate both with weights loaded from `checkpoint_path`.
+   - Run both with the same input tensors, compare outputs with `torch.allclose`.
+   - On mismatch, raise `AssertionError` with tensor values, shapes, and the operation being compared.
+
+3. **Run tests and parse results**:
+   ```bash
+   <pytest_command> 2>&1 | tee /tmp/test_output_$(date +%s).txt
+   echo "EXIT_CODE:$?"
+   ```
+   Then parse failures with:
+   ```bash
+   python3 .claude/skills/trtllm-model-test/scripts/generate_report.py \
+     --output-file <captured_output_file> \
+     --exit-code <exit_code> \
+     --format markdown
+   ```
+   For any failures, analyze root causes and produce fix recommendations. Reference `.claude/skills/trtllm-modeling/references/trtllm_test_fix_recommendations.md` for common error patterns and fixes.
 
 ## Output
 
@@ -59,6 +87,9 @@ A consistency report containing:
 | `consistent` | ✅ **yes** or ❌ **no** |
 | `inconsistencies` | List of discrepancies found between the modeling code and `plan.md`. Each entry includes: the aspect (e.g., class choice, parameter, weight mapping), what the plan says, what the code actually does, and the severity (critical / minor). Empty if fully consistent. |
 | `summary` | Brief natural-language summary of the comparison result |
+| `module_test_status` | ✅ **passed**, ❌ **failed**, or ⏭️ **skipped** (skipped when `model_definition_file_hf` is not provided) |
+| `module_test_results` | Per-test results table with test ID, status, and duration. Empty if skipped. |
+| `module_test_recommendations` | Fix recommendations for any failed module-level tests. Empty if all passed or skipped. |
 
 ## MoE Module Handling
 
