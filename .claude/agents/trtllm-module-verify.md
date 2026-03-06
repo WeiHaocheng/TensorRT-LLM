@@ -19,13 +19,14 @@ This agent verifies whether a specific HuggingFace module (marked as ⚠️ unce
 | `config_fields` | Relevant fields from `config.json` that affect this module |
 | `checkpoint_path` | Path to the HuggingFace checkpoint directory (for inspecting weight names, shapes, and formats) |
 | `modeling_code_path` | *(Optional)* Path to the TRT-LLM modeling code file (e.g., `tensorrt_llm/_torch/models/modeling_gpt_oss.py`). When provided, the agent switches to **consistency-check mode**: it compares the module's actual implementation in the modeling code against the description in `plan.md`, and reports any inconsistencies. Also triggers module-level tests. |
-| `model_definition_file_hf` | *(Optional)* Path to the HuggingFace modeling source file (e.g., `modeling_llama.py`). When provided along with `modeling_code_path`, enables module-level tests. |
-| `repo_path` | *(Optional)* Root of the TensorRT-LLM repo (default: current working directory). Used for module-level tests. |
+
+Print all parsed input parameters.
 
 ### Behavior when `modeling_code_path` is provided
 
-When `modeling_code_path` is given, the agent operates in **consistency-check mode** instead of the default verification mode:
+When `modeling_code_path` is given, the agent operates in **consistency-check mode** to check module consistency and perform module level test instead of the default verification mode:
 
+#### Module consistency verification
 1. Read the modeling code at the given path and locate the implementation of the specified module (identified by `hf_module_path` / `hf_class_name`).
 2. Read the corresponding section in `plan.md` that describes how this module should be implemented (TRT-LLM class, constructor parameters, weight mapping, special handling, etc.).
 3. Compare the actual implementation against the plan and identify any discrepancies, including but not limited to:
@@ -36,16 +37,17 @@ When `modeling_code_path` is given, the agent operates in **consistency-check mo
    - Structural differences (e.g., layer ordering, skip connections)
 4. Return the list of inconsistencies (see **Consistency-Check Output** below). If fully consistent, return a confirmation.
 
-#### Module-Level Test (only when `modeling_code_path` and `model_definition_file_hf` are provided)
+#### Module level test
 
-After the consistency-check steps above, run module-level tests to verify that TRT-LLM modules produce the same outputs as their HuggingFace counterparts.
+Run module-level tests to verify that TRT-LLM modules produce the same outputs as their HuggingFace counterparts.
+Don't reuse existing test files, since they may not match the provided model/module definition files. Instead, for given `model_definition_file`, perform:
 
 1. **Extract module classes** from `modeling_code_path` — find locally defined `nn.Module` subclasses, excluding `*Model` and `*ForCausalLM` classes. If `hf_class_name` is provided, filter to only that module.
 
-2. **Create test file** under `./tests/<MODEL_NAME>_auto_generated_tests/`:
-   - Import the TRT-LLM module from `modeling_code_path` and the HF module from `model_definition_file_hf`.
-   - Instantiate both with weights loaded from `checkpoint_path`.
-   - Run both with the same input tensors, compare outputs with `torch.allclose`.
+2. **Create test file**:
+   - Create a new test file under `./tests/<MODEL_NAME>_auto_generated_tests/` that imports the provided definition file and contains test cases for each identified module.
+   - Add test cases that instantiate the module with loading weights from HuggingFace model weights in `checkpoint_path`.
+   - For each module, add test case to run the HuggingFace module (import from HuggingFace model file) and the corresponding TRT-LLM module, then compare their results using `torch.allclose`. 
    - On mismatch, raise `AssertionError` with tensor values, shapes, and the operation being compared.
 
 3. **Run tests and parse results**:
@@ -87,7 +89,7 @@ A consistency report containing:
 | `consistent` | ✅ **yes** or ❌ **no** |
 | `inconsistencies` | List of discrepancies found between the modeling code and `plan.md`. Each entry includes: the aspect (e.g., class choice, parameter, weight mapping), what the plan says, what the code actually does, and the severity (critical / minor). Empty if fully consistent. |
 | `summary` | Brief natural-language summary of the comparison result |
-| `module_test_status` | ✅ **passed**, ❌ **failed**, or ⏭️ **skipped** (skipped when `model_definition_file_hf` is not provided) |
+| `module_test_status` | ✅ **passed**, ❌ **failed**, or ⏭️ **skipped** (skipped when `modeling_code_path` not provided). |
 | `module_test_results` | Per-test results table with test ID, status, and duration. Empty if skipped. |
 | `module_test_recommendations` | Fix recommendations for any failed module-level tests. Empty if all passed or skipped. |
 
