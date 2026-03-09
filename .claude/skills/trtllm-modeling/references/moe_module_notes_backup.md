@@ -1,15 +1,53 @@
-# MoE Analysis Checklist
+# MoE Module Notes
 
-## MoEWeightLoadingMode Selection
+## MoE-Specific Verification Checks
 
-**Always use `MoEWeightLoadingMode.FUSED_GATE_UP_PROJ`** unless `plan.md` explicitly specifies otherwise. 
+When verifying MoE models, check the following:
+
+- `weight_loading_mode` matches `plan.md` exactly (should be `FUSED_GATE_UP_PROJ` unless plan says otherwise)
+- `create_moe` parameters (`bias`, `swiglu_alpha`/`swiglu_beta`/`swiglu_limit`, `reduce_results`) match `plan.md`
+- `_transform_weights` produces keys matching the chosen loading mode's expected format (see "FUSED_GATE_UP_PROJ Weight Format" table below)
+
+## MoE Analysis Checklist
+
+When analyzing an MoE model for porting, document the following:
+
+1. **MoE architecture**: `num_experts`, `experts_per_token`, routing method (top-k renormalize, etc.), whether the gate/router has bias.
+2. **Gate/Router mapping**: How the HuggingFace router weight/bias names map to the TRT-LLM `Gate` module. Common mapping: `mlp.router` → `mlp.gate`. Ensure the router weight name is correctly mapped in `_transform_weights` so that TRT-LLM's `Gate` module loads it.
+3. **MoE bias**: Whether the expert MLPs use bias terms (`bias=True` in `create_moe`). Check the HuggingFace source for `bias` arguments in expert linear layers.
+4. **Custom activation parameters source**: Document where SwiGLU `alpha`/`beta`/`limit` values come from — whether they are read from a config field (e.g., `config.swiglu_alpha`) or hardcoded in the HuggingFace modeling source. This is important for correctly initializing `create_moe`.
+
+## MoE Model Implementation Guide
+
+When implementing MoE (Mixture of Experts) models, follow these rules:
+
+### weight_loading_mode Selection
+
+**Always use `MoEWeightLoadingMode.FUSED_GATE_UP_PROJ`** unless `plan.md` explicitly specifies otherwise. This mode has better performance than VANILLA because the MoE backend handles weight splitting internally, avoiding per-expert tensor creation overhead.
 
 - `FUSED_GATE_UP_PROJ`: Weights are stored as stacked tensors indexed by expert_id. The MoE backend internally splits gate/up weights via `.chunk(2, dim=0)`. Expected key names: `gate_up_proj`, `down_proj`, `gate_up_proj.bias`, `down_proj.bias`, `gate_up_proj_weight_scale`, `down_proj_weight_scale`.
 - `VANILLA`: Weights are stored as per-expert individual tensors with keys like `{expert_id}.w1.weight`, `{expert_id}.w3.weight`, `{expert_id}.w2.weight`. Only use this when FUSED_GATE_UP_PROJ cannot work (e.g., expert weights are not stackable).
 
+### FUSED_GATE_UP_PROJ Weight Format
+
+The FUSED_GATE_UP_PROJ loading code expects weights in **transposed** format. For each weight type, the per-expert tensor shape and the code's processing are:
+
+| Key | Per-expert shape stored | Code processing | Result |
+|-----|----------------------|-----------------|--------|
+| `gate_up_proj[e]` | `[packed_hidden, 2*inter]` | `.transpose(0,1).chunk(2, dim=0)` | w1 `[inter, packed_hidden]`, w3 `[inter, packed_hidden]` |
+| `down_proj[e]` | `[packed_inter, hidden]` | `.transpose(0,1)` | `[hidden, packed_inter]` |
+| `gate_up_proj_weight_scale[e]` | `[num_blocks, 2*inter]` | `.transpose(0,1).chunk(2, dim=0)` | w1_scale `[inter, num_blocks]`, w3_scale `[inter, num_blocks]` |
+| `down_proj_weight_scale[e]` | `[num_blocks, hidden]` | `.transpose(0,1)` | `[hidden, num_blocks]` |
+| `gate_up_proj.bias[e]` | `[2*inter]` | `.chunk(2, dim=0)` | w1_bias `[inter]`, w3_bias `[inter]` |
+| `down_proj.bias[e]` | `[hidden]` | (no processing) | `[hidden]` |
+
 **CRITICAL**: If the HuggingFace checkpoint uses an interleaved layout (e.g., alternating gate/up rows), `_transform_weights` must de-interleave and re-concatenate into `[gate_rows; up_rows]` (contiguous halves) before storing, then transpose to match the expected format above.
 
-## MXFP4 Quantized
+### SwiGLU Parameters Device Placement
+
+When passing `swiglu_alpha`, `swiglu_beta`, `swiglu_limit` tensors to `create_moe`, always create them on CUDA: `torch.full(..., device='cuda')`. These tensors are stored as plain attributes (not `nn.Parameter`), so they won't be moved automatically by `.cuda()`.
+
+## MXFP4 Quantized Weights with FUSED_GATE_UP_PROJ
 
 MXFP4 quantized expert weights **CAN and SHOULD** use `FUSED_GATE_UP_PROJ` mode. Do not fall back to VANILLA just because weights are quantized.
 
@@ -94,13 +132,13 @@ def _fuse_down(self, key, value, transformed, target_suffix):
         transformed[new_key] = value
 ```
 
-## SwiGLU
+### Checkpoint Key → Transformed Key Mapping
 
-### Custom Activation Parameters Source
-
-Document where SwiGLU `alpha`/`beta`/`limit` values come from — whether they are read from a config field (e.g., `config.swiglu_alpha`) or hardcoded in the HuggingFace modeling source. This is important for correctly initializing `create_moe`.
-
-### Device Placement
-
-When passing `swiglu_alpha`, `swiglu_beta`, `swiglu_limit` tensors to `create_moe`, always create them on CUDA: `torch.full(..., device='cuda')`. These tensors are stored as plain attributes (not `nn.Parameter`), so they won't be moved automatically by `.cuda()`.
-
+| Checkpoint key suffix | Target key suffix | Transform |
+|----------------------|-------------------|-----------|
+| `gate_up_proj_blocks` | `gate_up_proj` | de-interleave + pack blocks + cat [up, gate] + transpose |
+| `gate_up_proj_scales` | `gate_up_proj_weight_scale` | de-interleave + cat [up, gate] + transpose |
+| `gate_up_proj_bias` | `gate_up_proj.bias` | de-interleave + cat [up, gate] (no transpose) |
+| `down_proj_blocks` | `down_proj` | pack blocks + transpose |
+| `down_proj_scales` | `down_proj_weight_scale` | transpose |
+| `down_proj_bias` | `down_proj.bias` | passthrough |
