@@ -565,15 +565,53 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor,
 
         images = mm_data.get("image")
 
+        # Convert to Kimi K2.5 processor format (medias + text)
+        medias = []
+        if images is not None:
+            if not isinstance(images, list):
+                images = [images]
+            for img in images:
+                medias.append({"type": "image", "image": img})
+
         processor_output = self.processor(
+            medias=medias,
             text=text_prompt,
-            images=images,
             return_tensors="pt",
         ).to(dtype=self._dtype)
 
         input_ids = processor_output["input_ids"]
         pixel_values = processor_output.get("pixel_values")
         grid_thws = processor_output.get("grid_thws")
+
+        # The framework inserts 1 <|media_pad|> token per image, but the
+        # vision tower produces grid_thws.prod(-1) / merge_factor embeddings
+        # per image. Expand each single placeholder to the correct count.
+        if grid_thws is not None and len(grid_thws) > 0:
+            media_token_id = getattr(self._config,
+                                     "media_placeholder_token_id", 163605)
+            # merge_kernel_size=[2,2] reduces spatial dims by 2x2=4
+            vt_cfg = getattr(self._config, "vision_tower_config", None)
+            if vt_cfg is not None:
+                mk = vt_cfg.get("merge_kernel_size", [2, 2])
+                if isinstance(mk, list):
+                    merge_factor = mk[0] * mk[1]
+                else:
+                    merge_factor = mk * mk
+            else:
+                merge_factor = 4
+            num_tokens_per_image = (grid_thws.prod(dim=-1) //
+                                    merge_factor).tolist()
+            expanded_ids = []
+            img_idx = 0
+            for tid in input_ids[0]:
+                if tid.item(
+                ) == media_token_id and img_idx < len(num_tokens_per_image):
+                    expanded_ids.extend([media_token_id] *
+                                        num_tokens_per_image[img_idx])
+                    img_idx += 1
+                else:
+                    expanded_ids.append(tid.item())
+            input_ids = torch.tensor([expanded_ids], dtype=input_ids.dtype)
 
         return input_ids, pixel_values, grid_thws
 
