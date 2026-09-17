@@ -55,6 +55,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
@@ -118,73 +119,6 @@ from . import weights as _weights
 # the code, so pinning it is meaningless; the architecture does not.
 _SM = (10, 3)
 
-
-#: Every trtllm op this target reaches for, in its forward and in the weight
-#: load. Declared here, asserted in tests/unittest/_torch/modeling_v2: a symbol
-#: that does not exist is a fact of the build, and the place to find that out
-#: is a machine with the extension built rather than every import of this
-#: module.
-REQUIRED_TRTLLM_OPS = (
-    "cublas_mm",
-    "bmm_out",
-    "nvfp4_gemm",
-    "flashinfer_rmsnorm",
-    "flashinfer_fused_add_rmsnorm",
-    "flashinfer_silu_and_mul",
-    "fp4_quantize",
-    "noaux_tc_op",
-    "fp4_block_scale_moe_runner",
-    "fused_moe",
-    "mla_rope_generation",
-    "mla_rope_append_paged_kv_assign_q",
-    "load_paged_kv_cache_for_mla",
-    "allgather",
-    "reducescatter",
-    # Not a forward call: the load-time expert/scale relayout in weights.py
-    # depends on it, so it belongs to the same contract.
-    "block_scale_interleave",
-)
-
-# Metadata fields consumed each step (sourcing mirrors the in-tree
-# FallbackFmha for this trtllm version; existence checked at first forward).
-# The tail group is read only by the first-forward contract check: this
-# target holds those features at the MLA columns' inert values, and the
-# asserts make that honest instead of silently dropping an enabled feature.
-_STEP_FIELDS = (
-    "all_rank_num_tokens",
-    "kv_lens_cuda_runtime",
-    "kv_lens_runtime",
-    "host_total_kv_lens",
-    "prompt_lens_cuda_runtime",
-    "prompt_lens_cpu_runtime",
-    "host_request_types_runtime",
-    "kv_cache_block_offsets",
-    "host_kv_cache_pool_pointers",
-    "host_kv_cache_pool_mapping",
-    "effective_workspace",
-    "tokens_per_block",
-    "max_num_requests",
-    "max_context_length",
-    "max_seq_len",
-    "num_contexts",
-    "num_ctx_tokens",
-    "num_seqs",
-    "trtllm_gen_jit_warmup",
-    "effective_beam_width",
-    "cache_indirection",
-    "block_ids_per_seq",
-    "is_cross",
-    "is_spec_decoding_enabled",
-    "use_spec_decoding",
-    "flash_mla_tile_scheduler_metadata",
-    "flash_mla_num_splits",
-    # Both are engine-prepared per-instance constants (max_num_sequences
-    # defaults to max_num_requests; the tree-mask flag is set from
-    # is_spec_dec_dynamic_tree, and this target's MTP is a linear tree), so
-    # they project like the rest.
-    "max_num_sequences",
-    "force_prepare_spec_dec_tree_mask",
-)
 
 # The cached-prefix context group. The engine only creates these attributes
 # when it prepares the metadata for MLA context over reused blocks — under
@@ -761,7 +695,11 @@ class ModelingV2Core(DecoderModel):
         self._rope_positions = 0
         self._side_stream: torch.cuda.Stream | None = None
         self._cached_ctx = False
-        self._step_contract_checked = False
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it: read once here
+        # rather than per forward, and False for the whole life of a served
+        # engine. "pending" rather than "enabled" because the check runs once
+        # -- everything it looks at is fixed at engine construction.
+        self._contract_pending = step_contract_enabled()
 
     def _rope_tables(self, device, positions: int) -> dict:
         """The duplicated-layout GPT-J rope table the MLA ops read: per
@@ -999,15 +937,23 @@ class ModelingV2Core(DecoderModel):
         }
 
     def _check_step_contract(self, md, position_ids) -> None:
-        """First-forward fail-fast: the metadata fields this target consumes
-        must exist (private trtllm surface, pinned by version), the paged
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
+        asks for it: the metadata fields this target consumes must exist
+        (private trtllm surface), the paged
         latent pool must be the single pool the MLA entries are certified
         over at the page size their fp8 column covers, the rope table must
         cover every position the engine admits, and every feature this target
         holds inert must actually be off. Everything checked is fixed at
         engine construction — once per model instance is sound."""
-        missing = [name for name in _STEP_FIELDS if not hasattr(md, name)]
-        assert not missing, f"metadata fields missing: {missing}"
+        # Calling the projection is the check: it reads every metadata field
+        # this target consumes, so a rename or removal upstream surfaces
+        # here rather than mid-forward. Deriving it this way is the point --
+        # a hand-kept list of the same names drifts silently the first time
+        # _build_step_args gains a field and nobody updates the copy.
+        try:
+            _build_step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
         # position_ids is not consumed: the MLA ops derive each context
         # token's position from its row index within the sequence and each
         # generation token's from sequence_length - 1. Checked anyway so a
@@ -1084,7 +1030,7 @@ class ModelingV2Core(DecoderModel):
             "whole spec_decoding_* group at its inert values, which is only "
             "valid while the Blackwell linear-tree gating keeps it off"
         )
-        self._step_contract_checked = True
+        self._contract_pending = False
 
     def _dp_rows(self, md, num_tokens: int) -> int:
         """The uniform row count every rank pads its token block to before the
@@ -1158,7 +1104,7 @@ class ModelingV2Core(DecoderModel):
             "spec_metadata reached the trunk; the shell owns the draft loop and must not forward it"
         )
         md = attn_metadata
-        if not self._step_contract_checked:
+        if self._contract_pending:
             self._check_step_contract(md, position_ids)
         # Read after the contract check: that is where a table too short for
         # the engine's admitted max_seq_len is regrown.
@@ -1724,9 +1670,10 @@ class MTPLayer:
         mw, rope = core._mtp, core._rope
         assert mw is not None and rope is not None, "load_weights must run before the draft loop"
         assert isinstance(attn_metadata, TrtllmAttentionMetadata)
-        assert core._step_contract_checked, (
+        assert not core._contract_pending, (
             "the trunk's first-forward contract check has not run; the shell "
-            "calls the core before the worker, so this cannot be reached first"
+            "calls the core before the worker, so this cannot be reached first. "
+            "Vacuous when the check is off, which is the only time it is free"
         )
         md = attn_metadata
         step = _build_step_args(md)
