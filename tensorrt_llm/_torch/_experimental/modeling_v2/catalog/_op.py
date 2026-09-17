@@ -189,6 +189,11 @@ class OpWrapper(ABC):
         an argument this computation does not need is still named, prefixed
         `unused_`, because dropping it would hide that the op takes it.
 
+        The prefix is only safe on an argument every call site passes
+        positionally. Rename one that a target passes by keyword and the call
+        stops binding -- the parameter is gone under that name. Those keep their
+        real names and say what is ignored in the docstring instead.
+
         Accumulate in fp32 and round once at the end: the reference has to be
         the more accurate side, or `compare`'s band measures the reference
         rather than the op.
