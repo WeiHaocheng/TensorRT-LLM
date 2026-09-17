@@ -62,9 +62,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
     mxfp8_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.embedding import embedding
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.empty import empty
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.reshape import reshape
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -508,16 +505,18 @@ class ModelingV2Core(DecoderModel):
         full_window = attn_metadata.max_seq_len
         const = self._call_tensors
         no_qk_norm = const["no_qk_norm"]
-        pos = reshape(position_ids, [-1])
+        pos = torch.reshape(position_ids, [-1])
 
         if inputs_embeds is None:
             assert input_ids is not None
-            h = embedding(input_ids, self.w["embed"])
+            h = nn.functional.embedding(input_ids, self.w["embed"])
         else:
             h = inputs_embeds
         num_tokens = h.shape[0]
         dt = h.dtype
-        attn_out = empty([num_tokens, self.heads_q * self.head_dim], dt, h.device)
+        attn_out = torch.empty(
+            [num_tokens, self.heads_q * self.head_dim], dtype=dt, device=h.device
+        )
 
         x = flashinfer_rmsnorm(h, self.w["l0_norm1"], self.eps)
         residual = h
