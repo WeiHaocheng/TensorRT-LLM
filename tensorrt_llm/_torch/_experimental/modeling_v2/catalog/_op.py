@@ -194,6 +194,11 @@ class OpWrapper(ABC):
         stops binding -- the parameter is gone under that name. Those keep their
         real names and say what is ignored in the docstring instead.
 
+        Collectives are the one documented exception to mirroring at all. A
+        collective's output is not a function of what the calling rank holds, so
+        a reference given only the local `input` could state nothing; those take
+        the group's inputs in rank order and say so in their own docstring.
+
         Accumulate in fp32 and round once at the end: the reference has to be
         the more accurate side, or `compare`'s band measures the reference
         rather than the op.
