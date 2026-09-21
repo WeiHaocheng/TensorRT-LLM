@@ -232,9 +232,9 @@ class _FusedQkNormRope(OpWrapper):
         *unused_args: object,
         **unused_kwargs: object,
     ) -> None:
-        # `eps`, `q_weight`, `k_weight`, `base` and `is_neox` keep their real
-        # names though nothing here reads them: gpt-oss passes them by keyword,
-        # and an `unused_` prefix would remove the name the call binds to.
+        # `eps`, `q_weight`, `k_weight`, `base` and `is_neox` are named though
+        # nothing here reads them: they mirror `__call__`, and gpt-oss passes
+        # them by keyword.
         #
         # The op reads the head counts as scalars and addresses qkv from
         # data_ptr(); a width that disagrees with them is read as whatever the

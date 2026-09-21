@@ -118,9 +118,9 @@ class _Nvfp4Gemm(OpWrapper):
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
-        unused_output_buffer_kind: int = 0,
-        unused_allowed_backends: str = "",
-        unused_group: list[int] | None = None,
+        output_buffer_kind: int = 0,
+        allowed_backends: str = "",
+        group: list[int] | None = None,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dequantize both operands, then one fp32 product.
@@ -176,7 +176,7 @@ class _Nvfp4Gemm(OpWrapper):
         act_sf: torch.Tensor,
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
-        unused_output_dtype: torch.dtype = torch.bfloat16,
+        output_dtype: torch.dtype = torch.bfloat16,
         *unused_args: object,
         **unused_kwargs: object,
     ) -> None:

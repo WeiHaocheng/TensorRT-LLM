@@ -107,10 +107,10 @@ class _NoauxTcOp(OpWrapper):
         self,
         router_logits: torch.Tensor,
         bias: torch.Tensor,
-        unused_n_group: int,
-        unused_topk_group: int,
+        n_group: int,
+        topk_group: int,
         topk: int,
-        unused_routed_scaling_factor: float,
+        routed_scaling_factor: float,
     ) -> None:
         # Three domains the op does not police. All three were observed to
         # return a plausible-looking wrong answer instead of raising: the kernel

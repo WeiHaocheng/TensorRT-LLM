@@ -66,8 +66,8 @@ class _Allgather(OpWrapper):
     def reference(
         self,
         per_rank_inputs: Sequence[torch.Tensor],
-        unused_sizes: Optional[List[int]] = None,
-        unused_group: Optional[List[int]] = None,
+        sizes: Optional[List[int]] = None,
+        group: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """The concatenation the collective is supposed to make.
 

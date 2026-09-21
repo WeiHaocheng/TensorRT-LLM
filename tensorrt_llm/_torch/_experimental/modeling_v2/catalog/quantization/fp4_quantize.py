@@ -97,7 +97,7 @@ class _Fp4Quantize(OpWrapper):
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor],
         sf_vec_size: int,
-        unused_sf_use_ue8m0: bool = False,
+        sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Native-torch NVFP4, with the scales in the requested layout.
@@ -140,8 +140,8 @@ class _Fp4Quantize(OpWrapper):
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor],
         sf_vec_size: int,
-        unused_sf_use_ue8m0: bool = False,
-        unused_is_sf_swizzled_layout: bool = True,
+        sf_use_ue8m0: bool = False,
+        is_sf_swizzled_layout: bool = True,
     ) -> None:
         # The kernel loads one scalar from global_scale and ignores every
         # element past the first, so a per-token [num_tokens] tensor is silently
