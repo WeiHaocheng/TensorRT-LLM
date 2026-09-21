@@ -69,8 +69,8 @@ class _CublasMm(OpWrapper):
         mat_b: torch.Tensor,
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
-        unused_output_buffer_kind: int = 0,
-        unused_group: list[int] | None = None,
+        output_buffer_kind: int = 0,
+        group: list[int] | None = None,
     ) -> torch.Tensor:
         """fp32-accumulated, TF32 off -- see `true_fp32_matmul`."""
         with true_fp32_matmul():
@@ -85,8 +85,8 @@ class _CublasMm(OpWrapper):
         mat_b: torch.Tensor,
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
-        unused_output_buffer_kind: int = 0,
-        unused_group: list[int] | None = None,
+        output_buffer_kind: int = 0,
+        group: list[int] | None = None,
     ) -> None:
         # The kernel reads mat_a as dense row-major and mat_b as dense
         # column-major; other layouts produce silently wrong results.

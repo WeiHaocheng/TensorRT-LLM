@@ -185,14 +185,12 @@ class OpWrapper(ABC):
     def reference(self, *args: Any, **kwargs: Any) -> Any:
         """What the op is supposed to compute, in plain torch.
 
-        Mirrors `__call__`'s signature so the two can be driven from one cell;
-        an argument this computation does not need is still named, prefixed
-        `unused_`, because dropping it would hide that the op takes it.
-
-        The prefix is only safe on an argument every call site passes
-        positionally. Rename one that a target passes by keyword and the call
-        stops binding -- the parameter is gone under that name. Those keep their
-        real names and say what is ignored in the docstring instead.
+        Mirrors `__call__`'s signature, parameter for parameter and name for
+        name, so the two can be driven from one cell's argument list. An
+        argument this computation does not need keeps its name anyway: dropping
+        it would hide that the op takes it, and renaming it would break every
+        call site that passes it by keyword. Say which ones are ignored in the
+        docstring; nothing in this repo's lint objects to an unused parameter.
 
         Collectives are the one documented exception to mirroring at all. A
         collective's output is not a function of what the calling rank holds, so
@@ -214,9 +212,10 @@ class OpWrapper(ABC):
         for a worse one.
 
         Mirrors `__call__`'s signature, like `reference`, because `validating`
-        forwards the call's arguments verbatim. An override that accepts only
+        forwards the call's arguments verbatim -- an override that accepts only
         the arguments it inspects raises TypeError on every call site that
-        passes the others.
+        passes the others. Parameters keep the op's own names for the same
+        reason `reference`'s do.
         """
         return None
 

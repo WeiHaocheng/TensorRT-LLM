@@ -529,9 +529,12 @@ class _ThopAttention(OpWrapper):
     ) -> None:
         """Keyword-only, because every call site passes keywords.
 
-        This op takes 115 arguments and mirroring them would restate the
-        signature without adding a claim; what it would cost is real, since an
-        `unused_` prefix on any of them removes the name a caller binds to.
+        The one entry that does not mirror `__call__`. This op takes 115
+        arguments; naming all of them here would restate the signature without
+        adding a claim, and `reference` cannot mirror it either -- it is the
+        paged-cache exception and takes gathered K/V -- so there is no shared
+        argument list left for the mirroring to preserve. `**unused_kwargs`
+        absorbs the rest.
         """
         # A context-only call with a non-multiple returns without raising:
         # measured at 6q/4kv d128, only the first
