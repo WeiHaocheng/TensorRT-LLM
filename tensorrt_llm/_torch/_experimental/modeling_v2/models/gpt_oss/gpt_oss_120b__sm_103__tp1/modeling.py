@@ -245,52 +245,25 @@ class GptOssModelingV2(ModelingV2Core):
         heads_kv = cfg.num_key_value_heads
         head_dim = cfg.head_dim
 
-        # RoPE: YaRN over the full head_dim, half-split (neox) pairs. The
+        # RoPE base: YaRN over the full head_dim, half-split (neox) pairs. The
         # engine hands this checkpoint the transformers-5.x migrated rope
         # dict (rope_theta lives inside it and cfg.rope_theta is absent);
         # a checkpoint written before that migration keeps the flat field,
-        # so both shapes are resolved here and every scalar the ramp
-        # depends on is asserted rather than defaulted.
+        # so both shapes are resolved here. `theta` stays an attribute --
+        # nothing downstream of `head_dim` needs a second name for it either
+        # (`rotary_dim` equals it exactly for this checkpoint, so the target
+        # binds `rotary_dim=cfg.head_dim` directly).
         #
-        # Unlike the block above, nothing but `PrefillTarget.__init__` and
-        # `DecodeTarget.__init__` (via `build_layer_views`) reads `theta` or
-        # the four `yarn_*` once this method returns -- they exist solely to
-        # bind `fused_qk_norm_rope`. They stay attributes anyway, rather than
-        # becoming a second copy of this derivation inside the target: the
-        # ramp has real failure modes
-        # (a missing rope key raises KeyError; `math.log` of a non-positive
-        # `theta` or `orig_max` raises ValueError), and catching those here,
-        # before the weight load, is cheaper than catching them afterward or
-        # duplicating ~20 lines of math to catch them in two places. Nothing
-        # downstream of `head_dim` has that problem -- `rotary_dim` equals it
-        # exactly for this checkpoint -- so the target binds
-        # `rotary_dim=cfg.head_dim` directly instead of reading a third name
-        # for the same value.
+        # The YaRN low/high correction-dimension ramp and its attention-factor
+        # scalar are *not* derived here. Unlike `theta`, they are read only by
+        # `PrefillTarget.__init__` and `DecodeTarget.__init__`, to bind
+        # `fused_qk_norm_rope`, and nothing between their computation and that
+        # binding would touch a core attribute -- so `build_layer_views`
+        # computes them as locals, once, and passes them straight into both
+        # constructors instead of a `self.yarn_*` a core would otherwise carry
+        # for no reason but to be bound. See the comment there.
         rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
         self.theta = float(rope.get("rope_theta", getattr(cfg, "rope_theta", 0.0)))
-        rotary_dim = head_dim
-        self.yarn_factor = float(rope["factor"])
-        beta_fast = float(rope["beta_fast"])
-        beta_slow = float(rope["beta_slow"])
-        orig_max = float(rope["original_max_position_embeddings"])
-        truncate = bool(rope.get("truncate", True))
-
-        def correction_dim(rotations: float) -> float:
-            return (
-                rotary_dim
-                * math.log(orig_max / (rotations * 2.0 * math.pi))
-                / (2.0 * math.log(self.theta))
-            )
-
-        low = correction_dim(beta_fast)
-        high = correction_dim(beta_slow)
-        if truncate:
-            low, high = math.floor(low), math.ceil(high)
-        self.yarn_low = max(low, 0.0)
-        self.yarn_high = min(high, rotary_dim - 1.0)
-        self.yarn_attn_factor = (
-            0.1 * math.log(self.yarn_factor) + 1.0 if self.yarn_factor > 1.0 else 1.0
-        )
 
         # Sliding window: half the layers mask to the newest `window` keys,
         # the rest are plain causal. The window is a mask only — the op
@@ -360,11 +333,56 @@ class GptOssModelingV2(ModelingV2Core):
         each do this independently; the two bindings are identical in
         content, not shared in code.
 
+        What it derives itself -- the YaRN low/high correction-dimension ramp
+        and its attention-factor scalar -- is the one thing both targets'
+        constructors need that is neither a weight nor per-layer config:
+        computed once, here, as locals, and passed straight into both calls
+        below, rather than carried as four `self.yarn_*` attributes on the
+        core that would exist for no reason but to be bound (see the comment
+        in `__init__`). `theta` and `cfg` are cheap to re-reach from here, so
+        recomputing the ramp costs nothing a `self.` copy would have saved.
+
         Meta is over by the time this runs, so real tensors may be built and
         `.t()`'d; never called from `__init__`, where the shell's containers
         are still meta."""
-        self._prefill = PrefillTarget(self)
-        self._decode = DecodeTarget(self)
+        cfg = self.model_config.pretrained_config
+        rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
+        rotary_dim = cfg.head_dim
+        yarn_factor = float(rope["factor"])
+        beta_fast = float(rope["beta_fast"])
+        beta_slow = float(rope["beta_slow"])
+        orig_max = float(rope["original_max_position_embeddings"])
+        truncate = bool(rope.get("truncate", True))
+
+        def correction_dim(rotations: float) -> float:
+            return (
+                rotary_dim
+                * math.log(orig_max / (rotations * 2.0 * math.pi))
+                / (2.0 * math.log(self.theta))
+            )
+
+        low = correction_dim(beta_fast)
+        high = correction_dim(beta_slow)
+        if truncate:
+            low, high = math.floor(low), math.ceil(high)
+        yarn_low = max(low, 0.0)
+        yarn_high = min(high, rotary_dim - 1.0)
+        yarn_attn_factor = 0.1 * math.log(yarn_factor) + 1.0 if yarn_factor > 1.0 else 1.0
+
+        self._prefill = PrefillTarget(
+            self,
+            yarn_factor=yarn_factor,
+            yarn_low=yarn_low,
+            yarn_high=yarn_high,
+            yarn_attn_factor=yarn_attn_factor,
+        )
+        self._decode = DecodeTarget(
+            self,
+            yarn_factor=yarn_factor,
+            yarn_low=yarn_low,
+            yarn_high=yarn_high,
+            yarn_attn_factor=yarn_attn_factor,
+        )
 
     def _probe_step_surface(self, md) -> None:
         _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
