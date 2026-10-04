@@ -6,11 +6,13 @@ Flat single-entry forward assembled from catalog entries only; every call
 that creates or transforms a tensor is a catalog entry, everything else is
 tensor-metadata reads and Python control flow. Attention consumes runtime
 state fully explicitly through thop_attention: per-step arguments are
-projected from the engine-prepared TrtllmAttentionMetadata once per forward
-in _build_step_args and shared by all layers. Two attention arguments are
-per-layer here rather than per-step: the fp32 sink logits (one extra softmax
-denominator column per query head) and attention_window_size — this
-checkpoint alternates sliding_attention (window 128) and full_attention
+projected from the engine-prepared TrtllmAttentionMetadata once per forward,
+by each target's own `step_args`, and shared by all layers. The two targets'
+projections differ only in `num_contexts`/`num_ctx_tokens` -- see
+`PrefillTarget.step_args` and `DecodeTarget.step_args`. Two attention
+arguments are per-layer here rather than per-step: the fp32 sink logits (one
+extra softmax denominator column per query head) and attention_window_size —
+this checkpoint alternates sliding_attention (window 128) and full_attention
 layers, and the window is a pure mask, so one shared pool and one
 block-offset table serve both kinds.
 
@@ -73,65 +75,6 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, register_auto_model
 
 from . import weights as _weights
-
-
-def _build_step_args(
-    md: TrtllmAttentionMetadata, *, num_contexts: int, num_ctx_tokens: int
-) -> dict:
-    """Project the prepared metadata onto thop_attention's explicit batch
-    state, once per forward; every runtime-owned value passes through as
-    the engine prepared it. CUDA-graph classes: tensors are engine-owned
-    persistent buffers refreshed in place (reference class); Python ints
-    are per-capture constants (host-derived class). attention_window_size is
-    absent here on purpose: it is per-layer, not per-step, and is rebound
-    every forward with `bind_layered` instead -- see the comment in
-    `PrefillTarget.forward` and `DecodeTarget.forward`.
-
-    `num_contexts` and `num_ctx_tokens` are passed rather than read off `md`
-    because they are the two values a decode target knows by its routing --
-    it states them as 0 instead of reading back what the predicate already
-    guaranteed."""
-    return dict(
-        sequence_length=md.kv_lens_cuda_runtime,
-        host_past_key_value_lengths=md.kv_lens_runtime,
-        host_total_kv_lens=md.host_total_kv_lens,
-        context_lengths=md.prompt_lens_cuda_runtime,
-        host_context_lengths=md.prompt_lens_cpu_runtime,
-        host_request_types=md.host_request_types_runtime,
-        kv_cache_block_offsets=md.kv_cache_block_offsets,
-        host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-        workspace_=md.effective_workspace,
-        tokens_per_block=md.tokens_per_block,
-        max_num_requests=md.max_num_requests,
-        max_context_length=md.max_context_length,
-        max_seq_len=md.max_seq_len,
-        num_contexts=num_contexts,
-        num_ctx_tokens=num_ctx_tokens,
-        trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-        use_paged_context_fmha=md.use_paged_context_fmha,
-        beam_width=md.effective_beam_width,
-        cache_indirection=md.cache_indirection,
-        block_ids_per_seq=md.block_ids_per_seq,
-        max_context_q_len_override=md.max_context_q_len_override,
-        is_cross=md.is_cross,
-        is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-        use_spec_decoding=md.use_spec_decoding,
-        is_spec_dec_tree=md.is_spec_dec_tree,
-        spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-        spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
-        spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-        spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-        spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-        spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-        spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
-        num_sparse_topk=md.num_sparse_topk,
-        flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-        flash_mla_num_splits=md.flash_mla_num_splits,
-        max_num_sequences=md.max_num_sequences,
-        force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
-    )
-
 
 # Per-call constants of this target's call shape — the values the in-tree
 # path sources from the attention module and forward args: packed-QKV
@@ -384,9 +327,6 @@ class GptOssModelingV2(ModelingV2Core):
             yarn_attn_factor=yarn_attn_factor,
         )
 
-    def _probe_step_surface(self, md) -> None:
-        _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
-
     def _select_target(self, attn_metadata) -> Target:
         """Which target runs this step.
 
@@ -407,17 +347,16 @@ class GptOssModelingV2(ModelingV2Core):
     ) -> torch.Tensor:
         """Route the step, and nothing else.
 
-        The contract check runs here rather than inside a target because it is
-        phase-independent: it does not vary by phase, so running it once in
-        the dispatcher is equivalent to duplicating it into both
-        `PrefillTarget` and `DecodeTarget` and checks nothing they would not.
+        The contract check is no longer run here: it probes `step_args`, which
+        is a target's own projection and differs by phase, so each target runs
+        its own check on its own first forward instead -- see
+        `Target._check_step_contract` in `_target.py`.
         """
         # "A new engine step has begun" is the dispatcher's knowledge, not a
         # target's: this runs once per engine forward, before either target
         # binds per-step state, so validating() catches a target that forgot
         # to rebind.
         advance_step_generation()
-        self._check_step_contract(attn_metadata)
         return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
 
 
@@ -599,7 +538,61 @@ class PrefillTarget(Target):
         self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        return _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
+        """Project the prepared metadata onto thop_attention's explicit batch
+        state, once per forward; every runtime-owned value passes through as
+        the engine prepared it. CUDA-graph classes: tensors are engine-owned
+        persistent buffers refreshed in place (reference class); Python ints
+        are per-capture constants (host-derived class). attention_window_size
+        is absent here on purpose: it is per-layer, not per-step, and is
+        rebound every forward with `bind_layered` instead -- see the comment
+        in `forward`.
+
+        This target holds the mixed batch -- context rows, and possibly
+        generation rows beside them -- so `num_contexts` and `num_ctx_tokens`
+        are read off `md` rather than assumed; it may not assume either is
+        zero. Also the probe `Target._check_step_contract` calls to validate
+        this metadata surface on the first forward.
+        """
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace_=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            num_contexts=md.num_contexts,
+            num_ctx_tokens=md.num_ctx_tokens,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
 
     def forward(
         self,
@@ -613,6 +606,7 @@ class PrefillTarget(Target):
         core = self.core
         cfg = core.model_config.pretrained_config
 
+        self._check_step_contract(attn_metadata)
         self._attn.bind_const(**self.step_args(attn_metadata))
 
         # attention_window_size is per-layer, and rebound every forward
@@ -852,7 +846,65 @@ class DecodeTarget(Target):
         self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        return _build_step_args(md, num_contexts=0, num_ctx_tokens=0)
+        """Project the prepared metadata onto thop_attention's explicit batch
+        state, once per forward; every runtime-owned value passes through as
+        the engine prepared it. CUDA-graph classes: tensors are engine-owned
+        persistent buffers refreshed in place (reference class); Python ints
+        are per-capture constants (host-derived class). attention_window_size
+        is absent here on purpose: it is per-layer, not per-step, and is
+        rebound every forward with `bind_layered` instead -- see the comment
+        in `forward`.
+
+        `num_contexts` and `num_ctx_tokens` are the literal `0` rather than
+        read off `md`: they are the two values this target knows by its
+        routing -- it is reached only when there are no context rows -- and
+        stating them is what makes that invariant checkable by
+        `test_a_decode_target_never_reads_the_phase_back` in
+        `test_modeling_v2_claims.py`; `PrefillTarget.step_args` holds the
+        mixed batch and genuinely reads both off `md` instead. Also the probe
+        `Target._check_step_contract` calls to validate this metadata surface
+        on the first forward.
+        """
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace_=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            num_contexts=0,
+            num_ctx_tokens=0,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
 
     def forward(
         self,
@@ -866,6 +918,7 @@ class DecodeTarget(Target):
         core = self.core
         cfg = core.model_config.pretrained_config
 
+        self._check_step_contract(attn_metadata)
         self._attn.bind_const(**self.step_args(attn_metadata))
 
         # attention_window_size is per-layer, and rebound every forward
