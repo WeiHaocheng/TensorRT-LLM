@@ -438,7 +438,15 @@ class PrefillTarget(Target):
     materializes K and V -- overrides `forward` itself instead.
     """
 
-    def __init__(self, core: GptOssModelingV2) -> None:
+    def __init__(
+        self,
+        core: GptOssModelingV2,
+        *,
+        yarn_factor: float,
+        yarn_low: float,
+        yarn_high: float,
+        yarn_attn_factor: float,
+    ) -> None:
         """Bind every op this target calls, once, against the real weights.
 
         `Target.__init__` only stores `self.core`; everything below is this
@@ -447,10 +455,13 @@ class PrefillTarget(Target):
         at a time, built straight from `core.w` and keeping the `.t()` views
         the hot-path GEMMs already used (zero-copy). Configuration comes
         from `cfg` throughout: `core` carries none of it past what is
-        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`,
-        the `yarn_*` quantities) or read per layer by the forward
-        (`sliding`, `window`) -- see `GptOssModelingV2.__init__` for which is
-        which. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
+        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`)
+        or read per layer by the forward (`sliding`, `window`) -- see
+        `GptOssModelingV2.__init__` for which is which. The four `yarn_*`
+        arguments are the YaRN ramp `build_layer_views` computes once and
+        passes to both targets' constructors, rather than a `self.yarn_*` the
+        core would carry for no reason but to be bound -- see the comment
+        there. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
         inert q/k norm weight -- is an input that op needs to satisfy its
         own signature, not state the model computes; the MoE runner's
         per-expert activation vectors are the same kind of fixture, but the
@@ -490,10 +501,10 @@ class PrefillTarget(Target):
             k_weight=no_qk_norm,
             base=core.theta,
             is_neox=True,
-            factor=core.yarn_factor,
-            low=core.yarn_low,
-            high=core.yarn_high,
-            attention_factor=core.yarn_attn_factor,
+            factor=yarn_factor,
+            low=yarn_low,
+            high=yarn_high,
+            attention_factor=yarn_attn_factor,
             is_qk_norm=False,
         )
 
@@ -680,7 +691,15 @@ class DecodeTarget(Target):
     materializes K and V -- overrides `forward` itself instead.
     """
 
-    def __init__(self, core: GptOssModelingV2) -> None:
+    def __init__(
+        self,
+        core: GptOssModelingV2,
+        *,
+        yarn_factor: float,
+        yarn_low: float,
+        yarn_high: float,
+        yarn_attn_factor: float,
+    ) -> None:
         """Bind every op this target calls, once, against the real weights.
 
         `Target.__init__` only stores `self.core`; everything below is this
@@ -689,10 +708,13 @@ class DecodeTarget(Target):
         at a time, built straight from `core.w` and keeping the `.t()` views
         the hot-path GEMMs already used (zero-copy). Configuration comes
         from `cfg` throughout: `core` carries none of it past what is
-        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`,
-        the `yarn_*` quantities) or read per layer by the forward
-        (`sliding`, `window`) -- see `GptOssModelingV2.__init__` for which is
-        which. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
+        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`)
+        or read per layer by the forward (`sliding`, `window`) -- see
+        `GptOssModelingV2.__init__` for which is which. The four `yarn_*`
+        arguments are the YaRN ramp `build_layer_views` computes once and
+        passes to both targets' constructors, rather than a `self.yarn_*` the
+        core would carry for no reason but to be bound -- see the comment
+        there. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
         inert q/k norm weight -- is an input that op needs to satisfy its
         own signature, not state the model computes; the MoE runner's
         per-expert activation vectors are the same kind of fixture, but the
@@ -732,10 +754,10 @@ class DecodeTarget(Target):
             k_weight=no_qk_norm,
             base=core.theta,
             is_neox=True,
-            factor=core.yarn_factor,
-            low=core.yarn_low,
-            high=core.yarn_high,
-            attention_factor=core.yarn_attn_factor,
+            factor=yarn_factor,
+            low=yarn_low,
+            high=yarn_high,
+            attention_factor=yarn_attn_factor,
             is_qk_norm=False,
         )
 
