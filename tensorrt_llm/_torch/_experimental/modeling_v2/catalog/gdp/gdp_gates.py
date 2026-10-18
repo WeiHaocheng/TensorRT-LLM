@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 # Every GDP mixer of the checkpoint (`Nemotron4GDPMixer`, 32 layers) has one geometry: 24 heads
 # (`gdp_num_heads`) and 3 Householder steps per token (`gdp_num_householder`). Its in_proj output

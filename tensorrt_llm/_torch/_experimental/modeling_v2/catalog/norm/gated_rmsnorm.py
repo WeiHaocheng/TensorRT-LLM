@@ -7,8 +7,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.mamba.layernorm_gated import _layer_norm_fwd
+
+from .._op import Arch, Cell, OpWrapper
 
 # Every GDP layer of the checkpoint (12 `linear_attention`, 20 `shortcut_moe_gdp`) builds the same
 # `Nemotron4RMSNormGated(value_dim, group_size=value_dim // gdp_num_groups, eps=gdp_norm_eps)`, so

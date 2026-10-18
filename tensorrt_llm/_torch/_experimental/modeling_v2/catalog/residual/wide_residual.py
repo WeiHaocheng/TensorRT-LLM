@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 # The checkpoint keeps 3 residual streams of its 3072-wide hidden state
 # (`wide_residual_num_streams`, `hidden_size`), and every branch norm and the final `norm` use

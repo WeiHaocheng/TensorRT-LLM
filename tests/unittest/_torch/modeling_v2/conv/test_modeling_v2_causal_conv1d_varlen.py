@@ -13,12 +13,12 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.conv.causal_conv1d_varlen import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_varlen import (
     causal_conv1d_varlen as op,
 )
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import (  # noqa: E402,F401 — path above; fixture by name
     ULP,
     assert_within_ulp,

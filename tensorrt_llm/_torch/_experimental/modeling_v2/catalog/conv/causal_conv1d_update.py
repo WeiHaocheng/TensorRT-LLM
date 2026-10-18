@@ -10,7 +10,8 @@ import torch
 import torch.nn.functional as F
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 # One geometry, as for `causal_conv1d_varlen`: every GDP layer of the checkpoint builds the same
 # `Nemotron4GDPMixer`, whose conv runs over conv_dim = 3 * 1536 (V) + 4 * 3072 (K and Q) = 16896

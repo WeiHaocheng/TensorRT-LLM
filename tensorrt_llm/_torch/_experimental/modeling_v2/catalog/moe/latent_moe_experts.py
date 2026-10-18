@@ -9,12 +9,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 # Every MoE block of the checkpoint (`Nemotron4Experts`, 28 shortcut layers plus the MTP layer)
 # has one geometry: 512 routed experts, top-10, experts working in the 768-wide latent space
