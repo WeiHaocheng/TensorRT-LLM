@@ -8,7 +8,7 @@ tp4 rank's state shapes -- 6 of the 24 GDP heads, 4224 of the 16896 conv
 channels -- with a slot stride wider than one state (the managers pack state in
 blocks). `state_views` is held to the rank's shapes. The engine path itself (the
 LLM API on 4 ranks, CUDA graphs, the overlap scheduler, every rank's slots in
-the same step) is exercised by the target's probe, not here.
+the same step) is exercised through the LLM API on a 4-GPU node, not here.
 """
 
 from types import SimpleNamespace

@@ -3,10 +3,11 @@
 """Weight table: nemotron4-nano-preview (text model) / sm_103 / tp4.
 
 One `W` per weight role, carrying its per-rank shape, its checkpoint source,
-its dtype and the part of the source a rank reads. tp4 is tensor parallel over
-the 4 GPUs of one node with no attention DP: every rank runs every request, so
-the whole split is in the weights, and this table is where it is decided. Every
-rank is handed the whole checkpoint dict. Rank `r` of `tp` holds:
+its dtype, the part of the source a rank reads and the load-time transform. tp4
+is tensor parallel over the 4 GPUs of one node with no attention DP: every rank
+runs every request, so the whole split is in the weights, and this table is
+where it is decided. Every rank is handed the whole checkpoint dict. Rank `r` of
+`tp` holds:
 
 * **its heads of every mixer** -- GDP heads `[r H/tp, (r + 1) H/tp)` (6 of 24)
   and query heads `[r Q/tp, (r + 1) Q/tp)` (4 of 16). Projections into a head
@@ -19,14 +20,14 @@ rank is handed the whole checkpoint dict. Rank `r` of `tp` holds:
   weight per (token, expert), so a slice computes its share of the down
   projection's sum. All 512 experts are on every rank, each 1/tp wide;
 * **replicated** -- what reads or writes the whole model width or picks the
-  experts: the embedding, every norm and wide-residual logit, the router and
-  its correction bias, `fc1_latent_proj`, `fc2_norm` and `fc2_latent_proj`
-  (the latent MoE's 768-wide side), and the MTP layer's own `enorm`, `hnorm`,
-  `eh_proj` and `final_layernorm`, so its input is whole on every rank with
-  no collective;
-* **its vocabulary rows of lm_head** -- `[r V/tp, (r + 1) V/tp)` of
-  `lm_head.weight`, in the shell's `LMHead`, which the base class builds
-  column-parallel when attention DP is off.
+  experts: the embedding, every norm and wide-residual coefficient, the
+  router and its correction bias, `fc1_latent_proj`, `fc2_norm` and
+  `fc2_latent_proj` (the latent MoE's 768-wide side), and the MTP layer's own
+  `enorm`, `hnorm`, `eh_proj` and `final_layernorm`, so its input is whole on
+  every rank with no collective;
+* **lm_head whole** -- `lm_head.weight` in the shell's `LMHead`, which the
+  shell builds unsplit: every rank forms every logit itself, with the
+  fp32-output GEMM the tp1 target certifies, so no logits collective runs.
 
 The GDP mixer packs its inputs, and every packed segment is laid out head
 first (key group first for K and Q; `gdp_num_groups` equals `gdp_num_heads`, so
@@ -41,13 +42,25 @@ A rank reads its block of every segment and keeps the blocks side by side in
 segment order, which is the full layout at H/tp heads: 4632 `in_proj` rows and
 4224 conv channels per rank.
 
-Every tensor keeps the checkpoint's own layout and dtype, cut to the rank's
-part: HF `[out, in]` row-major for every projection, `[E, out, in]` for the
-routed-expert stacks, `[channels, 1, kernel]` for the GDP short conv, and fp32
-for the tensors the checkpoint keeps fp32: `A_log`, the router's correction
-bias and every wide-residual logit. `dt_bias` is bf16 in the checkpoint and
-stays bf16 here. No row carries a transform: a kernel that wants another
-layout adds it to its row.
+Most weights keep the checkpoint's own layout and dtype, cut to the rank's
+part: HF `[out, in]` row-major for every projection (the forward hands
+`cublas_mm` their `.t()` views), `[E, out, in]` for the routed-expert stacks
+(as `latent_moe_experts` takes them), fp32 for the router's correction bias.
+Four kinds are laid out at load for the entries that read them, so the forward
+does no per-step arithmetic on weights:
+
+* `qkv`: the rank's query heads' rows of `q_proj` and the whole `k_proj` and
+  `v_proj` side by side, `[q | k | v]` rows, one `[q/tp + 2 kv, hidden]`
+  operand for the fused-qkv GEMM `thop_attention` reads;
+* the wide-residual coefficients, each formed from its fp32 logit exactly as
+  HF forms it on every forward and rounded to bf16 as HF's
+  `.to(streams.dtype)` rounds it: `f = sigmoid(read logit)` for every read,
+  `w = 2 sigmoid(write_logit)` and `r = 1 - max_forget * sigmoid(-retention_logit)`
+  for every write -- the `[n]` vectors `wide_residual` takes;
+* `gdp_conv`: the rank's channels of the short conv's `[channels, 1, kernel]`
+  as the `[channels, kernel]` the conv entries take;
+* `gdp_neg_a`: HF's `-A_log.float().exp()` at the rank's heads, the fp32 factor
+  of the decay `gdp_gates` computes. `dt_bias` stays the checkpoint's bf16.
 
 Which weights a block has is decided by `text_config.layer_types`:
 
@@ -108,7 +121,8 @@ Part = tuple[Any, Any]
 
 @dataclass(frozen=True)
 class W:
-    """One weight role: what it is, where its bytes come from, and which of them this rank holds.
+    """One weight role: what it is, where its bytes come from, which of them this rank
+    holds, and what happens on the way.
 
     `shape` takes the dimension bundle and returns the shape this rank declares;
     every shape is derived from configuration rather than constant.
@@ -123,6 +137,10 @@ class W:
 
     `layers` says which layers carry this weight: None for a weight that is
     not per-layer at all, or a callable `d -> iterable[int]`.
+
+    `transform` runs on each source part after it is cut, on the destination's
+    device, as `transform(tensor, d)`. None means the part is already the
+    declared layout.
     """
 
     name: str
@@ -130,6 +148,7 @@ class W:
     src: str | Callable
     dtype: torch.dtype | None = None
     layers: Callable | None = None
+    transform: Callable | None = None
 
     def layer_indices(self, d: SimpleNamespace) -> list[int] | None:
         """The layers this weight exists on, or None if it is not per-layer."""
@@ -248,18 +267,61 @@ def _moe_blocks(d: SimpleNamespace) -> list[int]:
     return _shortcut_blocks(d) + _mtp_layers(d)
 
 
-def _logits(prefix: str, suffix: str, layers: Callable) -> tuple[W, ...]:
-    """A wide-residual connection's fp32 logits: read, write and learned retention."""
+def _read_factors(logit: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`f = sigmoid(logit)`: a read's stream factors (`Nemotron4WideResidualRead.forward`,
+    `Nemotron4WideResidualConnection.read`), formed in fp32 and rounded to the streams' dtype."""
+    return torch.sigmoid(logit.float()).to(d.dtype)
+
+
+def _write_factors(logit: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`w = 2 sigmoid(write_logit)` (`Nemotron4WideResidualConnection.write`), fp32, rounded."""
+    return (2.0 * torch.sigmoid(logit.float())).to(d.dtype)
+
+
+def _retention_factors(logit: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`r = 1 - max_forget * sigmoid(-retention_logit)` (`Nemotron4WideResidualConnection.write`),
+    fp32, rounded."""
+    return (1.0 - d.retention_max_forget * torch.sigmoid(-logit.float())).to(d.dtype)
+
+
+def _conv_taps(weight: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`nn.Conv1d`'s depthwise `[channels, 1, kernel]` as the conv entries' `[channels, kernel]`."""
+    return weight.reshape(weight.shape[0], weight.shape[-1])
+
+
+def _neg_a(a_log: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`-A_log.float().exp()`, the decay's factor as `Nemotron4GDPMixer.forward` forms it."""
+    return -a_log.float().exp()
+
+
+def _connection(prefix: str, suffix: str, layers: Callable) -> tuple[W, ...]:
+    """A wide-residual connection's coefficients, each from its fp32 logit: the read
+    factors `f`, the write factors `w` and the retention `r`."""
     return tuple(
         W(
             f"{prefix}_{name}",
             shape=lambda d: (d.streams,),
             src=_block(f"{suffix}.{key}_logit"),
-            dtype=torch.float32,
             layers=layers,
+            transform=transform,
         )
-        for name, key in (("read", "read"), ("write", "write"), ("retain", "retention"))
+        for name, key, transform in (
+            ("read", "read", _read_factors),
+            ("write", "write", _write_factors),
+            ("retain", "retention", _retention_factors),
+        )
     )
+
+
+def _qkv(d: SimpleNamespace, i: int) -> list[tuple[str, Any, Any]]:
+    """Layer `i`'s attention operand: this rank's query heads' rows of `q_proj`, then the
+    one KV head's `k_proj` and `v_proj` whole, side by side in the rows of one tensor."""
+    p, q, kv = _block_prefix(d, i), d.q_width // d.tp, d.kv_width
+    return [
+        (f"{p}.self_attn.q_proj.weight", slice(0, q), slice(d.tp_rank * q, (d.tp_rank + 1) * q)),
+        (f"{p}.self_attn.k_proj.weight", slice(q, q + kv), None),
+        (f"{p}.self_attn.v_proj.weight", slice(q + kv, q + 2 * kv), None),
+    ]
 
 
 class Nemotron4NanoPreviewTp4Weights:
@@ -280,16 +342,16 @@ class Nemotron4NanoPreviewTp4Weights:
             layers=_every_block,
         ),
         # --- the wide residual: one connection per plain block, three per shortcut block ---
-        *_logits("res", "residual_connection", _plain_blocks),
+        *_connection("res", "residual_connection", _plain_blocks),
         W(
             "shortcut_read",
             shape=lambda d: (d.streams,),
             src=_block("shortcut_read.logit"),
-            dtype=torch.float32,
             layers=_shortcut_blocks,
+            transform=_read_factors,
         ),
-        *_logits("mix", "mixer_residual_connection", _shortcut_blocks),
-        *_logits("moe", "moe_residual_connection", _shortcut_blocks),
+        *_connection("mix", "mixer_residual_connection", _shortcut_blocks),
+        *_connection("moe", "moe_residual_connection", _shortcut_blocks),
         # --- the GDP mixer: this rank's heads ---
         W(
             "gdp_in",
@@ -299,16 +361,18 @@ class Nemotron4NanoPreviewTp4Weights:
         ),
         W(
             "gdp_conv",
-            shape=lambda d: (sum(_gdp_conv_segments(d)) // d.tp, 1, d.gdp_conv_kernel),
+            shape=lambda d: (sum(_gdp_conv_segments(d)) // d.tp, d.gdp_conv_kernel),
             src=_block("mixer.conv1d.weight", _segments(_gdp_conv_segments)),
             layers=_gdp_mixers,
+            transform=_conv_taps,
         ),
         W(
-            "gdp_a_log",
+            "gdp_neg_a",
             shape=lambda d: (d.gdp_heads // d.tp,),
             src=_block("mixer.A_log", _shard(0, lambda d: d.gdp_heads // d.tp)),
             dtype=torch.float32,
             layers=_gdp_mixers,
+            transform=_neg_a,
         ),
         W(
             "gdp_dt_bias",
@@ -330,21 +394,9 @@ class Nemotron4NanoPreviewTp4Weights:
         ),
         # --- the attention mixer: this rank's query heads over the one KV head ---
         W(
-            "q",
-            shape=lambda d: (d.q_width // d.tp, d.hidden),
-            src=_block("self_attn.q_proj.weight", _shard(0, lambda d: d.q_width // d.tp)),
-            layers=_attention_mixers,
-        ),
-        W(
-            "k",
-            shape=lambda d: (d.kv_width, d.hidden),
-            src=_block("self_attn.k_proj.weight"),
-            layers=_attention_mixers,
-        ),
-        W(
-            "v",
-            shape=lambda d: (d.kv_width, d.hidden),
-            src=_block("self_attn.v_proj.weight"),
+            "qkv",
+            shape=lambda d: (d.q_width // d.tp + 2 * d.kv_width, d.hidden),
+            src=_qkv,
             layers=_attention_mixers,
         ),
         W(
@@ -462,7 +514,7 @@ class Nemotron4NanoPreviewTp4Weights:
             "readout",
             shape=lambda d: (d.streams,),
             src=f"{_TEXT}.residual_readout.logit",
-            dtype=torch.float32,
+            transform=_read_factors,
         ),
     )
 
@@ -497,15 +549,11 @@ class Nemotron4NanoPreviewTp4Weights:
             latent=cfg.moe_latent_size,
             moe_inter=cfg.moe_intermediate_size,
             shared_inter=cfg.moe_shared_expert_intermediate_size,
+            retention_max_forget=cfg.wide_residual_retention_max_forget,
             mtp_enabled=mtp_enabled,
             mtp_layers=mtp_layers if mtp_enabled else 0,
             dtype=core.model_config.torch_dtype,
         )
-
-    def lm_head_rows(self, d: SimpleNamespace) -> slice:
-        """This rank's rows of `lm_head.weight`: its block of the vocabulary."""
-        n = d.vocab // d.tp
-        return slice(d.tp_rank * n, (d.tp_rank + 1) * n)
 
     def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
         """Allocate every weight the table declares, at this rank's shape.
@@ -533,11 +581,14 @@ class Nemotron4NanoPreviewTp4Weights:
             return [(entry.name, None)]
         return [(f"l{i}_{entry.name}", i) for i in layers]
 
-    def manifest(self, core) -> dict[str, list[tuple[str, Any, Any]]]:
-        """param key -> [(checkpoint key, index into the param | None, index into the source | None)]."""
+    def manifest(self, core) -> dict[str, list[tuple[str, Any, Any, Callable | None]]]:
+        """param key -> [(checkpoint key, index into the param | None, index into the source |
+        None, transform | None)]."""
         d = self.dims(core)
         return {
-            key: entry.sources(d, i) for entry in self.WEIGHTS for key, i in self._targets(entry, d)
+            key: [(ckpt, dst, src, entry.transform) for ckpt, dst, src in entry.sources(d, i)]
+            for entry in self.WEIGHTS
+            for key, i in self._targets(entry, d)
         }
 
     def expected_unconsumed(self, core, weights) -> set:
@@ -560,12 +611,14 @@ class Nemotron4NanoPreviewTp4Weights:
         consumed: set = set()
         partial: set = set()
 
-        def fill(param: nn.Parameter, ckpt_key: str, dst_index, src_index) -> None:
+        def fill(param: nn.Parameter, ckpt_key: str, dst_index, src_index, transform) -> None:
             assert ckpt_key in weights, f"checkpoint key missing: {ckpt_key}"
             # Index before materializing: an in-memory tensor copies only this view of
             # itself, and a lazy safetensors slice reads only these bytes.
             src = weights[ckpt_key][slice(None) if src_index is None else src_index]
             dst = param.data if dst_index is None else param.data[dst_index]
+            if transform is not None:
+                src = transform(src.to(dst.device, non_blocking=True), d)
             assert dst.shape == src.shape, (ckpt_key, tuple(dst.shape), tuple(src.shape))
             assert dst.dtype == src.dtype, (ckpt_key, dst.dtype, src.dtype)
             dst.copy_(src, non_blocking=True)
@@ -579,16 +632,14 @@ class Nemotron4NanoPreviewTp4Weights:
         )
         for param_key, sources in manifest.items():
             assert sources, f"declared weight with no checkpoint source: {param_key}"
-            for ckpt_key, dst_index, src_index in sources:
-                fill(core.w[param_key], ckpt_key, dst_index, src_index)
+            for ckpt_key, dst_index, src_index, transform in sources:
+                fill(core.w[param_key], ckpt_key, dst_index, src_index, transform)
 
-        # Shell-registered exception: the base class owns lm_head (untied), built
-        # column-parallel without attention DP, so the fill's shape check refuses a
-        # shell that holds anything but this rank's vocabulary rows. Name every
-        # registered parameter outside the target's own ParameterDict rather than
-        # assuming lm_head is the only one.
-        vocab_rows = self.lm_head_rows(d)
-        fill(model.lm_head.weight, "lm_head.weight", None, vocab_rows)
+        # Shell-registered exception: the shell owns lm_head (untied), built whole, so
+        # the fill's shape check refuses a shell that holds a vocabulary split. Name
+        # every registered parameter outside the target's own ParameterDict rather
+        # than assuming lm_head is the only one.
+        fill(model.lm_head.weight, "lm_head.weight", None, None, None)
         shell = {n for n, _ in model.named_parameters() if not n.startswith("model.w.")}
         assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
 
@@ -610,7 +661,7 @@ class Nemotron4NanoPreviewTp4Weights:
             f"nemotron4 tp4 weights, TP rank {r} of {d.tp}: {len(consumed)} checkpoint tensors "
             f"consumed into {len(manifest)} parameters and lm_head, {len(partial)} of them read "
             f"in part -- GDP heads {block(d.gdp_heads)}, query heads {block(d.q_heads)}, "
-            f"intermediate {block(d.moe_inter)} of every expert, vocabulary {block(d.vocab)}; "
+            f"intermediate {block(d.moe_inter)} of every expert, lm_head whole; "
             f"{len(leftover)} deliberately unconsumed "
             f"({sum(k.startswith(_VISION_PREFIXES) for k in leftover)} vision "
             f"tower/projector, {sum(k.startswith(_MTP_PREFIX) for k in leftover)} MTP)"

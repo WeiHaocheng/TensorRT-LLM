@@ -198,7 +198,7 @@ def route(
     #     lm_head whole (no enable_lm_head_tp_in_adp); tep4 and tp4 split the mixers' heads.
     #   tp4: tensor parallel over 4 ranks without attention DP. Every rank runs every
     #     request on its quarter of the mixers' heads and of every MLP's and routed
-    #     expert's intermediate width (moe_tp=4), and on a quarter of lm_head's vocabulary.
+    #     expert's intermediate width (moe_tp=4); lm_head is whole on every rank.
     topology = _topology(mapping)
 
     # Speculative decoding changes the step's structure (a verify step, a draft loop, the

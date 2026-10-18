@@ -5,17 +5,36 @@
 The text model of the Nemotron4ForConditionalGeneration checkpoint: 44 blocks
 of hidden 3072 on three wide-residual streams -- 12 GDP mixers alone, 4 dense
 relu2 MLPs, 8 attention and 20 GDP mixers each beside a latent MoE (512 routed
-experts at top-10 in a 768-wide latent space, plus a shared expert) -- and the
-checkpoint's MTP layer, live only under a `speculative_config`. Every weight is
-the checkpoint's bf16, declared in the sibling weights.py.
+experts at top-10 in a 768-wide latent space, plus a shared expert) -- read out
+of the streams, normed, and projected by an fp32-output lm_head. The
+checkpoint's MTP layer is declared and loaded only under a `speculative_config`
+(weights.py); this target has no draft forward yet. Every weight is the
+checkpoint's bf16, laid out for the entries at load.
 
 `tp4` is tensor parallel over the 4 GPUs of one node, without attention DP:
 every rank runs every request. A rank holds 6 of the 24 GDP heads, 4 of the 16
-query heads over the one KV head, which every rank keeps whole, a quarter of
-every MLP's intermediate width -- the dense MLPs', the shared experts' and each
-of the 512 routed experts' -- and a quarter of the vocabulary's lm_head rows.
-The wide residual streams, the norms, the router and the latent projections
-are replicated, so every branch ends in a partial sum over the ranks.
+query heads over the one KV head, which every rank keeps whole, and a quarter
+of every MLP's intermediate width -- the dense MLPs', the shared experts' and
+each of the 512 routed experts'. The wide residual streams, the norms, the
+router, the latent projections and lm_head are replicated.
+
+So every branch's projection back to the model width is a partial sum over the
+ranks, and an all-reduce (`allreduce`, the TP group's MNNVL workspace) makes
+it whole before the branch writes the streams: after a GDP mixer's `out_proj`,
+an attention mixer's `o_proj` and a dense MLP's down projection. A latent MoE
+reduces its routed experts' 768-wide partial before `fc2_norm`, which is not
+linear, and its shared expert's partial in the same call. That is 72
+all-reduces a forward. Each rank's GEMMs round their partial to bf16, and the
+all-reduce sums the four partials in fp32, in rank order, and rounds once, so
+every rank holds the same bits of every stream: the replicated work after it
+needs no collective, and every rank forms the same logits.
+
+The streams are `[T, 3 * 3072]` bf16, the embedding repeated three times. One
+`wide_residual` call sits between every two branches: it writes the finished
+branch's update into the streams and makes the next branch's reads, each with
+its RMSNorm -- 73 calls a forward. A shortcut block reads its routed input and
+its mixer input in the call before its mixer, from the same streams, and the
+shared expert's input in the call after it, which is HF's order.
 
 Runtime state, per rank. The engine recognizes the checkpoint as a hybrid
 (`config_utils.is_nemotron4`) and gives every rank its own cache manager over
@@ -28,42 +47,125 @@ rows in the same order, each on its own slots. `Nemotron4StateMetadata` turns
 the engine's per-step slot list into the slots the state entries read; each
 target's `step_args` projects the prepared metadata onto the explicit
 arguments its forward passes.
-
-The forward is a probe of that state, not the model: it reads every step
-argument, keeps a step counter in each request's slot the way the GDP entries
-read and write a slot, meets the other ranks in one all-gather of what each
-rank read, as the row-parallel blocks will meet in their all-reduces, and
-reports rank 0's record, and whether every rank's record equals it, as the
-step's sampled token.
 """
 
-import itertools
-import json
-import os
 import weakref
 from typing import NamedTuple
 
 import torch
+from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.softclamp_relu2 import (
+    softclamp_relu2,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    thop_attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allreduce import allreduce
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_update import (
+    causal_conv1d_update,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_varlen import (
+    causal_conv1d_varlen,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_gates import gdp_gates
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import gdp_recurrent
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
+    latent_moe_experts,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
+    flashinfer_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm import gated_rmsnorm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.wide_residual import (
+    wide_residual,
+)
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.distributed.ops import (
+    MNNVLAllReduce,
+    get_or_scale_allreduce_mnnvl_workspace,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from tensorrt_llm._utils import mpi_rank, prefer_pinned
+from tensorrt_llm._utils import prefer_pinned
 
 from . import weights as _weights
 
-#: Block types by the state they keep: a GDP mixer keeps recurrent and conv
-#: state, an attention mixer keeps paged KV, a dense MLP keeps nothing.
+#: Block types by what they run: a GDP mixer keeps recurrent and conv state, an
+#: attention mixer keeps paged KV, a dense MLP keeps nothing; the shortcut blocks
+#: run their mixer beside a latent MoE.
 _GDP_BLOCKS = ("linear_attention", "shortcut_moe_gdp")
 _ATTENTION_BLOCKS = ("shortcut_moe_attn",)
+_SHORTCUT_BLOCKS = ("shortcut_moe_attn", "shortcut_moe_gdp")
+
+# thop_attention's arguments that do not move with the step. NoPE: no positional
+# encoding at all (`Nemotron4Attention` applies none), so the rope_* values are
+# inert placeholders; q_scaling 1 keeps the softmax scale at head_dim**-0.5 = 1/16.
+_CALL_CONSTANTS = dict(
+    output_sf=None,
+    k=None,
+    v=None,
+    is_fused_qkv=True,
+    update_kv_cache=True,
+    predicted_tokens_per_seq=1,
+    attention_input_type=0,
+    is_mla_enable=False,
+    mask_type=1,
+    q_scaling=1.0,
+    quant_mode=0,
+    kv_scale_orig_quant=None,
+    kv_scale_quant_orig=None,
+    attention_sinks=None,
+    position_embedding_type=0,
+    rotary_inv_freq=None,
+    rotary_cos_sin=None,
+    rope_dim=0,
+    rope_base=10000.0,
+    rope_scale_type=0,
+    rope_scale=1.0,
+    rope_short_m_scale=1.0,
+    rope_long_m_scale=1.0,
+    rope_max_positions=1024,
+    rope_original_max_positions=1024,
+    out_scale=None,
+    latent_cache=None,
+    q_pe=None,
+    q_lora_rank=None,
+    kv_lora_rank=None,
+    qk_nope_head_dim=None,
+    qk_rope_head_dim=None,
+    v_head_dim=None,
+    rope_append=None,
+    chunked_prefill_buffer_batch_size=1,
+    attention_chunk_size=None,
+    softmax_stats_tensor=None,
+    sparse_kv_indices=None,
+    sparse_kv_offsets=None,
+    sparse_attn_indices=None,
+    sparse_attn_offsets=None,
+    sparse_attn_indices_block_size=0,
+    mrope_rotary_cos_sin=None,
+    mrope_position_deltas=None,
+    helix_position_offsets=None,
+    helix_is_inactive_rank=None,
+    cross_kv=None,
+    relative_attention_bias=None,
+    relative_attention_max_distance=0,
+    kv_norm_weight=None,
+    kv_norm_eps=1e-6,
+    skip_correction_threshold=0.0,
+)
 
 
 def _row_runs(rows: list[int]) -> list[tuple[int, int]]:
@@ -229,6 +331,249 @@ class _StateViews(NamedTuple):
     conv_states: dict[int, torch.Tensor]
 
 
+class _AllreduceWorkspace(NamedTuple):
+    """The TP group's MNNVL workspace, as `allreduce` takes it: the unicast buffer viewed
+    as its 3 Lamport stages, and the protocol's control words."""
+
+    buffer: torch.Tensor
+    flags: torch.Tensor
+    rows: int  # the most rows one call may carry, the workspace's size
+
+
+def _allreduce_workspace(model_config: ModelConfig, widths: tuple[int, ...]) -> _AllreduceWorkspace:
+    """Build (or find) the TP group's MNNVL workspace, sized for a step of
+    `max_num_tokens` rows at the widest width any all-reduce sends.
+
+    Collective over the group: every rank builds it, eagerly, before any CUDA graph
+    is captured. Nothing else in the engine grows it, so the views taken here stay
+    the workspace's record (`allreduce`'s `is_valid` checks that they do).
+    """
+    mapping = model_config.mapping
+    dtype = model_config.torch_dtype
+    rows = model_config.max_num_tokens
+    need = max(
+        MNNVLAllReduce.get_required_workspace_size(rows, width, mapping.tp_size, dtype)
+        for width in widths
+    )
+    workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, dtype, buffer_size_bytes=need)
+    return _AllreduceWorkspace(
+        buffer=workspace["uc_buffer"].view(dtype).view(3, -1),
+        flags=workspace["buffer_flags"],
+        rows=rows,
+    )
+
+
+# --- Per-layer weight views ---------------------------------------------------------------------
+#
+# Built once per target off the loaded weights: each GEMM operand as the `.t()` view cublas_mm
+# reads, each wide-residual coefficient as the bf16 [3] vector wide_residual reads. Shapes are a
+# rank's.
+
+
+class _Read(NamedTuple):
+    """One read of the streams and the RMSNorm that follows it."""
+
+    factors: torch.Tensor  # f [streams]
+    norm: torch.Tensor  # [hidden]
+
+
+class _Write(NamedTuple):
+    """One branch's write into the streams."""
+
+    retention: torch.Tensor  # r [streams]
+    write: torch.Tensor  # w [streams]
+
+
+class _Gdp(NamedTuple):
+    """A GDP mixer (`Nemotron4GDPMixer`) on this rank's 6 heads."""
+
+    layer: int  # global layer index: its state pools are step["ssm_states"/"conv_states"][layer]
+    in_proj: torch.Tensor  # [hidden, 4632]
+    conv: torch.Tensor  # [4224, 4]
+    neg_a: torch.Tensor  # -exp(A_log) [6] fp32
+    dt_bias: torch.Tensor  # [6]
+    norm: torch.Tensor  # [384]
+    out_proj: torch.Tensor  # [384, hidden], row-parallel
+
+
+class _Attention(NamedTuple):
+    """An attention mixer (`Nemotron4Attention`) on this rank's 4 query heads: fused qkv
+    over the whole KV head, NoPE."""
+
+    layer: int  # global layer index: its KV pool index is step["kv_layer"][layer]
+    qkv: torch.Tensor  # [hidden, 1536]
+    o: torch.Tensor  # [1024, hidden], row-parallel
+
+
+class _Mlp(NamedTuple):
+    """A dense soft-clamped relu2 MLP (`Nemotron4MLP`) on this rank's quarter of its width."""
+
+    up: torch.Tensor  # [hidden, 3072]
+    down: torch.Tensor  # [3072, hidden], row-parallel
+
+
+class _Moe(NamedTuple):
+    """A latent MoE (`Nemotron4MoE`): router, routed latent experts at this rank's quarter
+    of every expert's intermediate width, shared expert at a quarter of its width."""
+
+    router: torch.Tensor  # [hidden, 512]
+    router_bias: torch.Tensor  # [512] fp32
+    fc1_latent: torch.Tensor  # [hidden, 768]
+    experts_up: torch.Tensor  # [512, 1024, 768]
+    experts_down: torch.Tensor  # [512, 768, 1024]
+    fc2_norm: torch.Tensor  # [768]
+    fc2_latent: torch.Tensor  # [768, hidden]
+    shared_up: torch.Tensor  # [hidden, 1024]
+    shared_down: torch.Tensor  # [1024, hidden], row-parallel
+
+
+class _Layer(NamedTuple):
+    """One block and the streams around it.
+
+    `write` is a plain block's one write, or a shortcut block's mixer write; a
+    shortcut block then reads `shared_read` for its shared expert and writes
+    the MoE's output with `moe_write`. `next_reads` is what the call after the
+    block's last write reads: the next block's inputs (a shortcut block's
+    routed input first, then its mixer input), or, after the last block, the
+    readout with the final norm.
+    """
+
+    mixer: _Gdp | _Attention | _Mlp
+    write: _Write
+    moe: _Moe | None
+    shared_read: _Read | None
+    moe_write: _Write | None
+    next_reads: tuple[_Read, ...]
+
+
+def _block_reads(w, layer_types: tuple[str, ...], i: int) -> tuple[_Read, ...]:
+    """What block `i` reads off the streams before it runs; the readout past the last block."""
+    if i == len(layer_types):
+        return (_Read(w["readout"], w["final_norm"]),)
+    if layer_types[i] in _SHORTCUT_BLOCKS:
+        return (
+            _Read(w[f"l{i}_shortcut_read"], w[f"l{i}_shortcut_norm"]),
+            _Read(w[f"l{i}_mix_read"], w[f"l{i}_input_norm"]),
+        )
+    return (_Read(w[f"l{i}_res_read"], w[f"l{i}_input_norm"]),)
+
+
+def _layer_views(w, layer_types: tuple[str, ...]) -> tuple[_Layer, ...]:
+    layers = []
+    for i, kind in enumerate(layer_types):
+        if kind in _GDP_BLOCKS:
+            mixer = _Gdp(
+                layer=i,
+                in_proj=w[f"l{i}_gdp_in"].t(),
+                conv=w[f"l{i}_gdp_conv"],
+                neg_a=w[f"l{i}_gdp_neg_a"],
+                dt_bias=w[f"l{i}_gdp_dt_bias"],
+                norm=w[f"l{i}_gdp_norm"],
+                out_proj=w[f"l{i}_gdp_out"].t(),
+            )
+        elif kind in _ATTENTION_BLOCKS:
+            mixer = _Attention(layer=i, qkv=w[f"l{i}_qkv"].t(), o=w[f"l{i}_o"].t())
+        else:
+            mixer = _Mlp(up=w[f"l{i}_mlp_up"].t(), down=w[f"l{i}_mlp_down"].t())
+        if kind in _SHORTCUT_BLOCKS:
+            write = _Write(w[f"l{i}_mix_retain"], w[f"l{i}_mix_write"])
+            moe = _Moe(
+                router=w[f"l{i}_router"].t(),
+                router_bias=w[f"l{i}_router_bias"],
+                fc1_latent=w[f"l{i}_fc1_latent"].t(),
+                experts_up=w[f"l{i}_experts_up"],
+                experts_down=w[f"l{i}_experts_down"],
+                fc2_norm=w[f"l{i}_fc2_norm"],
+                fc2_latent=w[f"l{i}_fc2_latent"].t(),
+                shared_up=w[f"l{i}_shared_up"].t(),
+                shared_down=w[f"l{i}_shared_down"].t(),
+            )
+            shared_read = _Read(w[f"l{i}_moe_read"], w[f"l{i}_pre_moe_norm"])
+            moe_write = _Write(w[f"l{i}_moe_retain"], w[f"l{i}_moe_write"])
+        else:
+            write = _Write(w[f"l{i}_res_retain"], w[f"l{i}_res_write"])
+            moe = shared_read = moe_write = None
+        layers.append(
+            _Layer(
+                mixer=mixer,
+                write=write,
+                moe=moe,
+                shared_read=shared_read,
+                moe_write=moe_write,
+                next_reads=_block_reads(w, layer_types, i + 1),
+            )
+        )
+    return tuple(layers)
+
+
+class _Dims(NamedTuple):
+    """The text config's numbers the forward reads, at one rank's part, and where the rank's
+    GDP in_proj packs its parts."""
+
+    hidden: int
+    streams: int
+    eps: float
+    latent: int
+    q_width: int  # the rank's query heads' width
+    heads_q: int  # the rank's query heads
+    heads_kv: int  # every rank's: the one KV head is whole
+    head_dim: int
+    gdp_heads: int  # the rank's GDP heads
+    gdp_householder: int
+    gdp_key: int
+    gdp_value: int
+    gdp_value_dim: int  # the rank's heads' value width
+    gdp_eps: float
+    gdp_scale: float
+    conv: slice  # the conv input [V0..V2 | K0..K2 | Q] within the rank's in_proj output
+    beta: slice  # b0..b2
+    decay: slice  # a
+    conv_v: slice  # V0..V2 within the conv output
+    conv_k: slice  # K0..K2
+    conv_q: slice  # Q
+    top_k: int
+    num_experts: int
+    routed_scale: float
+    clamp: float
+
+
+def _dims(cfg, tp: int) -> _Dims:
+    """The rank's widths: a 1/tp of the heads of every mixer, each packed segment of the GDP
+    in_proj at its heads' block, as weights.py lays them out."""
+    n_h, heads = cfg.gdp_num_householder, cfg.gdp_num_heads // tp
+    value_dim = heads * cfg.gdp_head_dim
+    key_dim = cfg.gdp_num_groups // tp * cfg.gdp_key_head_dim
+    conv_dim = n_h * value_dim + (n_h + 1) * key_dim
+    beta_start = value_dim + conv_dim
+    return _Dims(
+        hidden=cfg.hidden_size,
+        streams=cfg.wide_residual_num_streams,
+        eps=cfg.rms_norm_eps,
+        latent=cfg.moe_latent_size,
+        q_width=cfg.num_attention_heads // tp * cfg.head_dim,
+        heads_q=cfg.num_attention_heads // tp,
+        heads_kv=cfg.num_key_value_heads,
+        head_dim=cfg.head_dim,
+        gdp_heads=heads,
+        gdp_householder=n_h,
+        gdp_key=cfg.gdp_key_head_dim,
+        gdp_value=cfg.gdp_head_dim,
+        gdp_value_dim=value_dim,
+        gdp_eps=cfg.gdp_norm_eps,
+        gdp_scale=cfg.gdp_key_head_dim**-0.5,
+        conv=slice(value_dim, beta_start),
+        beta=slice(beta_start, beta_start + n_h * heads),
+        decay=slice(beta_start + n_h * heads, beta_start + (n_h + 1) * heads),
+        conv_v=slice(0, n_h * value_dim),
+        conv_k=slice(n_h * value_dim, n_h * (value_dim + key_dim)),
+        conv_q=slice(n_h * (value_dim + key_dim), conv_dim),
+        top_k=cfg.num_experts_per_tok,
+        num_experts=cfg.n_routed_experts,
+        routed_scale=cfg.routed_scaling_factor,
+        clamp=cfg.activation_clamp_value,
+    )
+
+
 class Nemotron4NanoPreviewTp4ModelingV2(DecoderModel):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
@@ -242,6 +587,7 @@ class Nemotron4NanoPreviewTp4ModelingV2(DecoderModel):
         self.tp_group = list(mapping.tp_group)
         self.w = _weights.MODEL_WEIGHTS.declare(dims)
 
+        self.layer_types = dims.layer_types
         self.gdp_layers = tuple(i for i, t in enumerate(dims.layer_types) if t in _GDP_BLOCKS)
         # The trunk's attention layers. With one-model MTP the engine keeps the MTP layer's
         # KV (global layer 44) in a separate draft KV cache manager.
@@ -251,19 +597,28 @@ class Nemotron4NanoPreviewTp4ModelingV2(DecoderModel):
         self.state_shapes = _rank_state_shapes(model_config)
         self._checked_manager: weakref.ref | None = None
 
+        self.allreduce_workspace: _AllreduceWorkspace | None = None
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
 
     def post_load_weights(self) -> None:
-        """Construct the two targets, now that the weights are real.
+        """Build the all-reduce workspace and construct the two targets, now that the
+        weights are real.
 
         Must only be called after meta init is over, never from `__init__`, where the
-        shell's containers are still meta.
+        shell's containers are still meta. Every rank calls it at the same point of the
+        load, which the workspace's collective construction needs.
 
         Named for the shell hook that drives it. Not an override: that hook lives on
         DecoderModelForCausalLM, and a core derives from DecoderModel, which has no
         such method -- so there is no super() to call here.
         """
+        text = self.model_config.pretrained_config.text_config
+        # Every all-reduce is [rows, hidden], or a latent MoE's two partials packed into
+        # [rows, latent + hidden].
+        self.allreduce_workspace = _allreduce_workspace(
+            self.model_config, (text.hidden_size, text.moe_latent_size + text.hidden_size)
+        )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -312,7 +667,9 @@ class Nemotron4NanoPreviewTp4ModelingV2(DecoderModel):
         per-capture constant environment, and a predicate that reached for a second field
         would be reading one this call is not guaranteed to carry. A mixed batch -- context
         and generation rows in one step -- goes to prefill, so prefill is the general case
-        and decode the specialization that may assume it has no context rows.
+        and decode the specialization that may assume it has no context rows. Every rank
+        runs the same rows, so every rank picks the same target and issues the same
+        all-reduces.
         """
         return self._decode if attn_metadata.num_contexts == 0 else self._prefill
 
@@ -339,6 +696,16 @@ def _state_metadata(md: AttentionMetadata) -> Nemotron4StateMetadata:
     return state
 
 
+def _check_rows(num_tokens: int, workspace: _AllreduceWorkspace) -> None:
+    """A step's all-reduces carry one row per token; the workspace holds `max_num_tokens`,
+    and the op does not check what it is handed."""
+    if num_tokens > workspace.rows:
+        raise RuntimeError(
+            f"a step of {num_tokens} tokens exceeds the all-reduce workspace, sized for "
+            f"max_num_tokens={workspace.rows} rows"
+        )
+
+
 class PrefillTarget:
     """The general case: context rows, and possibly generation rows beside them."""
 
@@ -349,9 +716,11 @@ class PrefillTarget:
         # forward. Each target owns its own flag: the two `step_args` projections differ,
         # so probing one does not prove the other's fields exist.
         self._contract_pending = step_contract_enabled()
-        cfg = core.model_config.pretrained_config.text_config
-        self._hidden_size = cfg.hidden_size
-        self._dtype = core.w["final_norm"].dtype
+        self._d = _dims(core.model_config.pretrained_config.text_config, core.tp_size)
+        self._embed = core.w["embed"]
+        self._first_reads = _block_reads(core.w, core.layer_types, 0)
+        self._layers = _layer_views(core.w, core.layer_types)
+        self._ar = core.allreduce_workspace
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
@@ -446,20 +815,209 @@ class PrefillTarget:
         lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """The final normed hidden state of every token: `norm(residual_readout(streams))`."""
+        d = self._d
         self._check_step_contract(attn_metadata)
         step = self.step_args(attn_metadata)
-        num_rows = step["num_rows"]
-        _probe_log_forward(attn_metadata, step, input_ids.shape[0])
-        row_ends = step["query_start_loc"][1 : num_rows + 1].long() - 1
-        return _probe_step(
-            self.core,
-            step,
-            input_ids=input_ids,
-            num_rows=num_rows,
-            num_contexts=step["num_contexts"],
-            row_ends=row_ends,
-            hidden_size=self._hidden_size,
-            dtype=self._dtype,
+
+        h = (
+            nn.functional.embedding(input_ids, self._embed)
+            if inputs_embeds is None
+            else inputs_embeds
+        )
+        _check_rows(h.shape[0], self._ar)
+        streams = h.repeat(1, d.streams)
+        attn_out = torch.empty(h.shape[0], d.q_width, dtype=h.dtype, device=h.device)
+
+        routed, x = self._streams_step(streams, None, None, self._first_reads)
+        for L in self._layers:
+            if isinstance(L.mixer, _Gdp):
+                update = self._gdp(x, L.mixer, step)
+            elif isinstance(L.mixer, _Attention):
+                qkv = cublas_mm(x, L.mixer.qkv)
+                attn_out = thop_attention(
+                    q=qkv,
+                    output=attn_out,
+                    local_layer_idx=step["kv_layer"][L.mixer.layer],
+                    num_heads=d.heads_q,
+                    num_kv_heads=d.heads_kv,
+                    head_size=d.head_dim,
+                    **step["attention"],
+                    **_CALL_CONSTANTS,
+                )
+                update = allreduce(cublas_mm(attn_out, L.mixer.o), self._ar.buffer, self._ar.flags)
+            else:
+                update = allreduce(
+                    cublas_mm(softclamp_relu2(cublas_mm(x, L.mixer.up), d.clamp), L.mixer.down),
+                    self._ar.buffer,
+                    self._ar.flags,
+                )
+            if L.moe is None:
+                routed, x = self._streams_step(streams, update, L.write, L.next_reads)
+                continue
+            _, shared = self._streams_step(streams, update, L.write, (L.shared_read,))
+            update = self._moe(routed, shared, L.moe)
+            routed, x = self._streams_step(streams, update, L.moe_write, L.next_reads)
+        return x
+
+    def _streams_step(
+        self,
+        streams: torch.Tensor,
+        update: torch.Tensor | None,
+        write: _Write | None,
+        reads: tuple[_Read, ...],
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Write `update` into the streams in place (when given), then make one or two normed
+        reads: `(None, read)`, or `(first, second)` -- a shortcut block's routed input, then
+        its mixer input."""
+        second = reads[1] if len(reads) == 2 else None
+        _, normed, normed2 = wide_residual(
+            streams,
+            update,
+            None if write is None else write.retention,
+            None if write is None else write.write,
+            reads[0].factors,
+            reads[0].norm,
+            self._d.eps,
+            None if second is None else second.factors,
+            None if second is None else second.norm,
+        )
+        return (None, normed) if second is None else (normed, normed2)
+
+    def _gdp(self, x: torch.Tensor, g: _Gdp, step: dict) -> torch.Tensor:
+        """`Nemotron4GDPMixer` on this rank's heads over a mixed batch: the context rows'
+        tokens through the varlen conv and the chunked recurrence, each from zero or from
+        its slot; then each generation row's one token through the decode conv and
+        recurrence, from its slot. The heads' `out_proj` partials are all-reduced."""
+        d = self._d
+        num_ctx_tokens, num_contexts, num_rows = (
+            step["num_ctx_tokens"],
+            step["num_contexts"],
+            step["num_rows"],
+        )
+        ssm_states, conv_states = step["ssm_states"][g.layer], step["conv_states"][g.layer]
+        proj = cublas_mm(x, g.in_proj)  # [T, 4632] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
+        beta, decay = gdp_gates(proj[:, d.beta], proj[:, d.decay], g.neg_a, g.dt_bias)
+        num_tokens = proj.shape[0]
+        outs = []
+        if num_contexts:
+            ctx = slice(0, num_ctx_tokens)
+            slots = step["state_slots"][:num_contexts]
+            # Channel-last: the in_proj output's conv columns transposed in, and out.
+            conv_out = torch.empty(
+                num_ctx_tokens, d.conv.stop - d.conv.start, dtype=proj.dtype, device=proj.device
+            ).t()
+            causal_conv1d_varlen(
+                proj[ctx, d.conv].t(),
+                g.conv,
+                None,
+                conv_states,
+                step["query_start_loc"][: num_contexts + 1],
+                slots,
+                step["has_initial_state"],
+                True,
+                PAD_SLOT_ID,
+                conv_out,
+            )
+            vkq = conv_out.t()
+            outs.append(
+                gdp_chunk(
+                    vkq[:, d.conv_q].view(num_ctx_tokens, d.gdp_heads, d.gdp_key),
+                    vkq[:, d.conv_k].view(
+                        num_ctx_tokens, d.gdp_householder, d.gdp_heads, d.gdp_key
+                    ),
+                    vkq[:, d.conv_v].view(
+                        num_ctx_tokens, d.gdp_householder, d.gdp_heads, d.gdp_value
+                    ),
+                    decay[ctx],
+                    beta[ctx],
+                    ssm_states,
+                    slots,
+                    step["query_start_loc_long"][: num_contexts + 1],
+                    step["has_initial_state"],
+                    d.gdp_scale,
+                )
+            )
+        if num_rows > num_contexts:
+            gen = slice(num_ctx_tokens, num_tokens)
+            slots = step["state_slots"][num_contexts:num_rows]
+            num_gen = num_tokens - num_ctx_tokens
+            # In place: the conv columns of the in_proj output become the conv output.
+            causal_conv1d_update(
+                proj[gen, d.conv].unsqueeze(-1),
+                conv_states,
+                g.conv,
+                None,
+                True,
+                None,
+                slots,
+                PAD_SLOT_ID,
+            )
+            vkq = proj[gen, d.conv]
+            outs.append(
+                gdp_recurrent(
+                    vkq[:, d.conv_q].view(num_gen, d.gdp_heads, d.gdp_key),
+                    vkq[:, d.conv_k].view(num_gen, d.gdp_householder, d.gdp_heads, d.gdp_key),
+                    vkq[:, d.conv_v].view(num_gen, d.gdp_householder, d.gdp_heads, d.gdp_value),
+                    decay[gen],
+                    beta[gen],
+                    ssm_states,
+                    slots,
+                    d.gdp_scale,
+                )
+            )
+        out = outs[0] if len(outs) == 1 else torch.cat(outs)
+        y = gated_rmsnorm(
+            out.view(num_tokens, d.gdp_value_dim),
+            g.norm,
+            None,
+            d.gdp_eps,
+            z=proj[:, : d.gdp_value_dim],
+            group_size=d.gdp_value,
+            norm_before_gate=False,
+            is_rms_norm=True,
+        )
+        return allreduce(cublas_mm(y, g.out_proj), self._ar.buffer, self._ar.flags)
+
+    def _moe(self, routed: torch.Tensor, shared: torch.Tensor, m: _Moe) -> torch.Tensor:
+        """`Nemotron4MoE`: route at model width (fp32 logits), the routed experts in the
+        latent space at this rank's slice of every expert, `fc2_norm` and the projection
+        back up, plus the shared expert at this rank's slice.
+
+        The routed experts' latent partial is all-reduced before `fc2_norm`, which is not
+        linear, and the shared expert's partial joins it in one call: each element is
+        summed on its own, so the two lie end to end in one `[T, latent + hidden]`
+        message and come back as two dense blocks.
+        """
+        d = self._d
+        weights, ids = noaux_tc_op(
+            cublas_mm(routed, m.router, None, torch.float32),
+            m.router_bias,
+            1,
+            1,
+            d.top_k,
+            d.routed_scale,
+        )
+        experts = latent_moe_experts(
+            cublas_mm(routed, m.fc1_latent),
+            ids,
+            weights,
+            m.experts_up,
+            m.experts_down,
+            d.clamp,
+            0,
+            d.num_experts,
+        )
+        shared = cublas_mm(softclamp_relu2(cublas_mm(shared, m.shared_up), d.clamp), m.shared_down)
+        num_tokens, split = experts.shape[0], experts.numel()
+        summed = allreduce(
+            torch.cat((experts.view(-1), shared.view(-1))).view(num_tokens, -1),
+            self._ar.buffer,
+            self._ar.flags,
+        ).view(-1)
+        experts = flashinfer_rmsnorm(summed[:split].view(num_tokens, d.latent), m.fc2_norm, d.eps)
+        return torch.add(
+            cublas_mm(experts, m.fc2_latent), summed[split:].view(num_tokens, d.hidden)
         )
 
 
@@ -473,9 +1031,11 @@ class DecodeTarget:
         # forward. Each target owns its own flag: the two `step_args` projections differ,
         # so probing one does not prove the other's fields exist.
         self._contract_pending = step_contract_enabled()
-        cfg = core.model_config.pretrained_config.text_config
-        self._hidden_size = cfg.hidden_size
-        self._dtype = core.w["final_norm"].dtype
+        self._d = _dims(core.model_config.pretrained_config.text_config, core.tp_size)
+        self._embed = core.w["embed"]
+        self._first_reads = _block_reads(core.w, core.layer_types, 0)
+        self._layers = _layer_views(core.w, core.layer_types)
+        self._ar = core.allreduce_workspace
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
@@ -562,303 +1122,163 @@ class DecodeTarget:
         lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """The final normed hidden state of every row: `norm(residual_readout(streams))`."""
+        d = self._d
         self._check_step_contract(attn_metadata)
         step = self.step_args(attn_metadata)
-        num_rows = step["num_rows"]
-        _probe_log_forward(attn_metadata, step, input_ids.shape[0])
-        return _probe_step(
-            self.core,
-            step,
-            input_ids=input_ids,
-            num_rows=num_rows,
-            num_contexts=0,
-            row_ends=torch.arange(num_rows, device=step["state_slots"].device),
-            hidden_size=self._hidden_size,
-            dtype=self._dtype,
+
+        h = (
+            nn.functional.embedding(input_ids, self._embed)
+            if inputs_embeds is None
+            else inputs_embeds
         )
+        _check_rows(h.shape[0], self._ar)
+        streams = h.repeat(1, d.streams)
+        attn_out = torch.empty(h.shape[0], d.q_width, dtype=h.dtype, device=h.device)
 
+        routed, x = self._streams_step(streams, None, None, self._first_reads)
+        for L in self._layers:
+            if isinstance(L.mixer, _Gdp):
+                update = self._gdp(x, L.mixer, step)
+            elif isinstance(L.mixer, _Attention):
+                qkv = cublas_mm(x, L.mixer.qkv)
+                attn_out = thop_attention(
+                    q=qkv,
+                    output=attn_out,
+                    local_layer_idx=step["kv_layer"][L.mixer.layer],
+                    num_heads=d.heads_q,
+                    num_kv_heads=d.heads_kv,
+                    head_size=d.head_dim,
+                    **step["attention"],
+                    **_CALL_CONSTANTS,
+                )
+                update = allreduce(cublas_mm(attn_out, L.mixer.o), self._ar.buffer, self._ar.flags)
+            else:
+                update = allreduce(
+                    cublas_mm(softclamp_relu2(cublas_mm(x, L.mixer.up), d.clamp), L.mixer.down),
+                    self._ar.buffer,
+                    self._ar.flags,
+                )
+            if L.moe is None:
+                routed, x = self._streams_step(streams, update, L.write, L.next_reads)
+                continue
+            _, shared = self._streams_step(streams, update, L.write, (L.shared_read,))
+            update = self._moe(routed, shared, L.moe)
+            routed, x = self._streams_step(streams, update, L.moe_write, L.next_reads)
+        return x
 
-# --- Probe: stands in for the model forward and its logits ------------------------------------
-#
-# Each slot carries a step counter in element [slot, 0, 0, 0] of the first GDP
-# layer's recurrent state, and its low 7 bits in element [slot, 0, 0] of the
-# last GDP layer's conv state, on every rank's own pools; every slot starts at
-# a stale count, as a recycled slot holds its previous owner's state. A step
-# reads a row's counter the way the GDP entries read state -- a context row
-# only if it has initial state, a generation row always, a padding row never --
-# and writes the count plus one back, never for a padding row. Each rank's
-# record of the step -- per row, the count it read, the slot, whether it read,
-# whether a real slot sat on two rows, whether the conv copy agreed, the
-# step's padding rows and the row's last input token -- goes into one
-# all-gather over the tensor-parallel group, as every row-parallel block's
-# partial sums will meet in an all-reduce. Each row's last hidden state then
-# carries rank 0's record and whether every rank's record equals it, the same
-# on every rank; the shell turns it into a one-hot logit row, so the sampled
-# token is the record, through CUDA-graph replays and the overlap scheduler
-# alike, and every rank samples the same token. The token is
-# _PROBE_TOKEN_BASE + code, code = count % 32 | (slot + 1) % 64 << 5 | read << 11
-# | repeated slot in the step << 12 | conv bits agree << 13 | padding rows in
-# the step (at most 7) << 14 | every rank's record equals rank 0's << 17.
-
-_PROBE_TOKEN_BASE = 16
-_PROBE_CODE_BITS = 18
-#: Columns of a row's last hidden state that carry its record into the shell.
-_PROBE_FIELDS = 7
-#: Values per row in the all-gathered record, each an integer below 256, which bf16 holds exactly.
-_PROBE_RECORD = 7
-#: Every slot's count before a step writes it: a stale state, which a fresh row must not read
-#: and which reads back as 8 (40 % 32), not the 0 a fresh row reports.
-_PROBE_STALE = 40
-#: The all-gather's row: one bf16 row of 7168, the shape of allgather's certified decode cell.
-_PROBE_GATHER_WIDTH = 7168
-_PROBE_LOG_ENV = "NEMOTRON4_TP4_PROBE_LOG"
-_probe_records = itertools.count(1)
-
-
-def _probe_counters(
-    core: Nemotron4NanoPreviewTp4ModelingV2, step: dict
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The counter and its conv copy, as [slots] views; set stale once per manager.
-
-    The pools start as whatever the allocator left, so the probe sets its two
-    elements of every slot to `_PROBE_STALE` the first time it sees a manager
-    (an eager warmup step): every slot no request has written since holds a
-    previous owner's count, which a fresh row must neither read nor keep.
-    After that only the steps and the fresh-slot resets write them.
-    """
-    first, last = core.gdp_layers[0], core.gdp_layers[-1]
-    counter = step["ssm_states"][first][:, 0, 0, 0]
-    low_bits = step["conv_states"][last][:, 0, 0]
-    owner = core._checked_manager
-    if getattr(core, "_probe_initialized_for", None) is not owner:
-        assert not torch.cuda.is_current_stream_capturing(), "probe counters set in a capture"
-        counter.fill_(_PROBE_STALE)
-        low_bits.fill_(_PROBE_STALE)
-        core._probe_initialized_for = owner
-    return counter, low_bits
-
-
-def _probe_step(
-    core: Nemotron4NanoPreviewTp4ModelingV2,
-    step: dict,
-    *,
-    input_ids: torch.Tensor,
-    num_rows: int,
-    num_contexts: int,
-    row_ends: torch.Tensor,
-    hidden_size: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Read and advance every row's counter, compare records over the ranks; return
-    [tokens, hidden] with rank 0's record in the first `_PROBE_FIELDS` columns of each
-    row's last token."""
-    if num_rows * _PROBE_RECORD > _PROBE_GATHER_WIDTH:
-        raise NotImplementedError(f"the probe records at most {_PROBE_GATHER_WIDTH} values")
-    counter, low_bits = _probe_counters(core, step)
-    slots = step["state_slots"]
-    valid = slots >= 0
-    index = slots.clamp(min=0).long()
-    reads = valid.clone()
-    if num_contexts:
-        reads[:num_contexts] &= step["has_initial_state"]
-    zero = torch.zeros(num_rows, dtype=torch.float32, device=slots.device)
-    stale = counter[index]
-    seen = torch.where(reads, stale, zero)
-    # Writes are additions, so a padding row adds zero to slot 0 instead of racing a real row.
-    counter.scatter_add_(0, index, torch.where(valid, seen + 1 - stale, zero))
-    stale_low = low_bits[index].float()
-    low_agrees = ~reads | (stale_low == torch.remainder(seen, 128))
-    low_delta = torch.where(valid, torch.remainder(seen + 1, 128) - stale_low, zero)
-    low_bits.scatter_add_(0, index, low_delta.to(low_bits.dtype))
-    # A real slot on two rows: more equal (row, row) pairs than real rows.
-    pairs = (slots.unsqueeze(1) == slots.unsqueeze(0)) & valid.unsqueeze(1)
-    repeated = pairs.sum() > valid.sum()
-    padding = (~valid).sum()
-    # A padding row's input token is whatever its buffer row last held: no rank reads it.
-    last_tokens = torch.where(valid, torch.remainder(input_ids[row_ends], 256), 0)
-    record = torch.stack(
-        [
-            torch.remainder(seen, 256),
-            torch.remainder(slots + 1, 256).float(),
-            reads.float(),
-            repeated.float().expand(num_rows),
-            low_agrees.float(),
-            padding.float().expand(num_rows),
-            last_tokens.float(),
-        ],
-        dim=1,
-    )
-    mine = torch.zeros(1, _PROBE_GATHER_WIDTH, dtype=torch.bfloat16, device=slots.device)
-    mine[0, : num_rows * _PROBE_RECORD] = record.flatten().to(torch.bfloat16)
-    # Every rank's record, in rank order: rank 0's is the one the token reports.
-    gathered = allgather(mine, None, core.tp_group)
-    agree = (gathered == gathered[:1]).all()
-    first = gathered[0, : num_rows * _PROBE_RECORD].view(num_rows, _PROBE_RECORD).float()
-    fields = torch.stack(
-        [
-            torch.remainder(first[:, 0], 32),
-            torch.remainder(first[:, 1], 64),
-            first[:, 2],
-            first[:, 3],
-            first[:, 4],
-            first[:, 5].clamp(max=7),
-            agree.float().expand(num_rows),
-        ],
-        dim=1,
-    )
-    hidden = torch.zeros(input_ids.shape[0], hidden_size, dtype=dtype, device=slots.device)
-    hidden[row_ends, :_PROBE_FIELDS] = fields.to(dtype)
-    return hidden
-
-
-class _ProbeStateMetadata(Nemotron4StateMetadata):
-    """`Nemotron4StateMetadata` that appends every prepared step to the JSON-lines
-    file `NEMOTRON4_TP4_PROBE_LOG` names, one file per rank (`<path>.rank<r>`);
-    nothing when it is unset."""
-
-    def __init__(
+    def _streams_step(
         self,
-        max_batch_size: int,
-        chunk_size: int,
-        max_num_tokens: int | None = None,
-    ) -> None:
-        super().__init__(max_batch_size, chunk_size, max_num_tokens=max_num_tokens)
-        self._path = os.environ.get(_PROBE_LOG_ENV)
-        self._log = None
-        self._rank: int | None = None
-        self._last_step: int | None = None
-        self._managers = weakref.WeakSet()
-        self._zeroed: list = []
-
-    def prepare(self, attn_metadata: AttentionMetadata) -> None:
-        self._zeroed = []
-        super().prepare(attn_metadata)
-        if self._path is None:
-            return
-        manager = attn_metadata.kv_cache_manager
-        if self._log is None:
-            mapping = getattr(manager, "mapping", None)
-            self._rank = mapping.rank if mapping is not None else mpi_rank()
-            self._log = open(f"{self._path}.rank{self._rank}", "a", buffering=1, encoding="utf-8")
-        if manager not in self._managers:
-            self._managers.add(manager)
-            self._write(dict(kind="manager", rank=self._rank, **_describe_manager(manager)))
-        num_rows = attn_metadata.seq_lens.shape[0]
-        num_contexts = attn_metadata.num_contexts
-        cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
-        if isinstance(cached, torch.Tensor):
-            cached = cached.tolist()
-        slots = self.state_indices_cpu[:num_rows].tolist()
-        padding = self._padding_rows(attn_metadata, num_rows)
-        self._last_step = next(_probe_records)
-        self._write(
-            dict(
-                kind="step",
-                rank=self._rank,
-                step=self._last_step,
-                metadata=id(self),
-                manager=id(manager),
-                graph=bool(attn_metadata.is_cuda_graph),
-                num_contexts=num_contexts,
-                num_tokens=int(attn_metadata.num_tokens),
-                request_ids=[int(r) for r in (attn_metadata.request_ids or [])[:num_rows]],
-                seq_lens=attn_metadata.seq_lens[:num_rows].tolist(),
-                cached=[int(c) for c in cached[:num_rows]],
-                slots=slots,
-                padding=padding,
-                state_slots=[
-                    PAD_SLOT_ID if row in padding else slot for row, slot in enumerate(slots)
-                ],
-                has_initial_state=self.has_initial_states_cpu[:num_contexts].tolist(),
-                zeroed=self._zeroed,
-            )
+        streams: torch.Tensor,
+        update: torch.Tensor | None,
+        write: _Write | None,
+        reads: tuple[_Read, ...],
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Write `update` into the streams in place (when given), then make one or two normed
+        reads: `(None, read)`, or `(first, second)` -- a shortcut block's routed input, then
+        its mixer input."""
+        second = reads[1] if len(reads) == 2 else None
+        _, normed, normed2 = wide_residual(
+            streams,
+            update,
+            None if write is None else write.retention,
+            None if write is None else write.write,
+            reads[0].factors,
+            reads[0].norm,
+            self._d.eps,
+            None if second is None else second.factors,
+            None if second is None else second.norm,
         )
+        return (None, normed) if second is None else (normed, normed2)
 
-    def _zero_slots(self, kv_cache_manager: MambaHybridCacheManager, rows: list[int]) -> None:
-        if self._path is not None:
-            # Probe only: what each fresh row's slot held before the reset (a sync).
-            first = min(kv_cache_manager.mamba_layer_offsets)
-            counter = kv_cache_manager.get_ssm_states(first)[:, 0, 0, 0]
-            slots = self.state_indices_cpu[rows].tolist()
-            held = counter[torch.tensor(slots, device=counter.device)].tolist()
-            self._zeroed = [dict(row=r, slot=s, held=h) for r, s, h in zip(rows, slots, held)]
-        super()._zero_slots(kv_cache_manager, rows)
-
-    def log_forward(self, step: dict, num_tokens: int) -> None:
-        """Append what a forward on this metadata's last prepared step read. Runs wherever
-        the forward's Python runs -- eager steps, warmup and capture -- and not on a graph
-        replay."""
-        if self._log is None:
-            return
-        self._write(
-            dict(
-                kind="forward",
-                rank=self._rank,
-                after_step=self._last_step,
-                metadata=id(self),
-                capturing=torch.cuda.is_current_stream_capturing(),
-                num_tokens=num_tokens,
-                num_rows=step["num_rows"],
-            )
+    def _gdp(self, x: torch.Tensor, g: _Gdp, step: dict) -> torch.Tensor:
+        """`Nemotron4GDPMixer` on this rank's heads for one token per row, each continuing
+        from its slot; padding rows (`PAD_SLOT_ID`) read zeros and write nothing. The heads'
+        `out_proj` partials are all-reduced."""
+        d = self._d
+        slots = step["state_slots"]
+        proj = cublas_mm(x, g.in_proj)  # [B, 4632] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
+        num_rows = proj.shape[0]
+        # In place: the conv columns of the in_proj output become the conv output.
+        causal_conv1d_update(
+            proj[:, d.conv].unsqueeze(-1),
+            step["conv_states"][g.layer],
+            g.conv,
+            None,
+            True,
+            None,
+            slots,
+            PAD_SLOT_ID,
         )
+        vkq = proj[:, d.conv]
+        beta, decay = gdp_gates(proj[:, d.beta], proj[:, d.decay], g.neg_a, g.dt_bias)
+        out = gdp_recurrent(
+            vkq[:, d.conv_q].view(num_rows, d.gdp_heads, d.gdp_key),
+            vkq[:, d.conv_k].view(num_rows, d.gdp_householder, d.gdp_heads, d.gdp_key),
+            vkq[:, d.conv_v].view(num_rows, d.gdp_householder, d.gdp_heads, d.gdp_value),
+            decay,
+            beta,
+            step["ssm_states"][g.layer],
+            slots,
+            d.gdp_scale,
+        )
+        y = gated_rmsnorm(
+            out.view(num_rows, d.gdp_value_dim),
+            g.norm,
+            None,
+            d.gdp_eps,
+            z=proj[:, : d.gdp_value_dim],
+            group_size=d.gdp_value,
+            norm_before_gate=False,
+            is_rms_norm=True,
+        )
+        return allreduce(cublas_mm(y, g.out_proj), self._ar.buffer, self._ar.flags)
 
-    def _write(self, record: dict) -> None:
-        self._log.write(json.dumps(record) + "\n")
+    def _moe(self, routed: torch.Tensor, shared: torch.Tensor, m: _Moe) -> torch.Tensor:
+        """`Nemotron4MoE`: route at model width (fp32 logits), the routed experts in the
+        latent space at this rank's slice of every expert, `fc2_norm` and the projection
+        back up, plus the shared expert at this rank's slice.
 
-
-def _probe_log_forward(md: AttentionMetadata, step: dict, num_tokens: int) -> None:
-    """Hand the forward's step arguments to the probe log, when the probe metadata runs."""
-    state = md.mamba_metadata
-    if isinstance(state, _ProbeStateMetadata):
-        state.log_forward(step, num_tokens)
-
-
-def _describe_manager(manager: MambaHybridCacheManager) -> dict:
-    """What a cache manager allocated for this model on this rank: the probe's memory record."""
-    gdp = sorted(manager.mamba_layer_offsets)
-    ssm = manager.get_ssm_states(gdp[0])
-    conv = manager.get_conv_states(gdp[0])
-    attention = sorted(set(manager.layer_offsets) - set(gdp))
-    kv = manager.get_buffers(attention[0])
-    # A manager may hand every attention layer a view of one shared page pool.
-    kv_bases = sorted({manager.get_buffers(i).data_ptr() for i in attention})
-    mapping = getattr(manager, "mapping", None)
-    free, total = torch.cuda.mem_get_info()
-    return dict(
-        manager_id=id(manager),
-        cls=type(manager).__name__,
-        tp_size=None if mapping is None else mapping.tp_size,
-        tp_rank=None if mapping is None else mapping.tp_rank,
-        gdp_layers=gdp,
-        attention_layers=attention,
-        kv_layer={str(i): manager.layer_offsets[i] for i in attention},
-        kv_heads_per_layer=list(getattr(manager, "num_kv_heads_per_layer", []) or []),
-        kv_bytes_per_token=manager.get_cache_bytes_per_token(),
-        tokens_per_block=manager.tokens_per_block,
-        kv_pool=list(kv.shape),
-        kv_pool_stride=list(kv.stride()),
-        kv_pool_dtype=str(kv.dtype),
-        kv_pool_bytes_per_layer=kv.numel() * kv.element_size(),
-        kv_distinct_layer_bases=len(kv_bases),
-        kv_layer_base_span_bytes=kv_bases[-1] - kv_bases[0],
-        num_state_slots=ssm.shape[0],
-        num_reserved_dummy_slots=getattr(manager, "_num_reserved_dummy_slots", None),
-        ssm=dict(shape=list(ssm.shape), stride=list(ssm.stride()), dtype=str(ssm.dtype)),
-        conv=dict(shape=list(conv.shape), stride=list(conv.stride()), dtype=str(conv.dtype)),
-        state_bytes_per_slot=len(gdp)
-        * (ssm[0].numel() * ssm.element_size() + conv[0].numel() * conv.element_size()),
-        device_free_bytes=free,
-        device_total_bytes=total,
-        torch_allocated_bytes=torch.cuda.memory_allocated(),
-        torch_reserved_bytes=torch.cuda.memory_reserved(),
-    )
+        The routed experts' latent partial is all-reduced before `fc2_norm`, which is not
+        linear, and the shared expert's partial joins it in one call: each element is
+        summed on its own, so the two lie end to end in one `[B, latent + hidden]`
+        message and come back as two dense blocks.
+        """
+        d = self._d
+        weights, ids = noaux_tc_op(
+            cublas_mm(routed, m.router, None, torch.float32),
+            m.router_bias,
+            1,
+            1,
+            d.top_k,
+            d.routed_scale,
+        )
+        experts = latent_moe_experts(
+            cublas_mm(routed, m.fc1_latent),
+            ids,
+            weights,
+            m.experts_up,
+            m.experts_down,
+            d.clamp,
+            0,
+            d.num_experts,
+        )
+        shared = cublas_mm(softclamp_relu2(cublas_mm(shared, m.shared_up), d.clamp), m.shared_down)
+        num_rows, split = experts.shape[0], experts.numel()
+        summed = allreduce(
+            torch.cat((experts.view(-1), shared.view(-1))).view(num_rows, -1),
+            self._ar.buffer,
+            self._ar.flags,
+        ).view(-1)
+        experts = flashinfer_rmsnorm(summed[:split].view(num_rows, d.latent), m.fc2_norm, d.eps)
+        return torch.add(cublas_mm(experts, m.fc2_latent), summed[split:].view(num_rows, d.hidden))
 
 
 class ModelingV2Nemotron4NanoPreviewSm103Tp4(
     DecoderModelForCausalLM[Nemotron4NanoPreviewTp4ModelingV2, PretrainedConfig]
 ):
     #: Built by the engine for every step (`resolve_mamba_metadata_cls`).
-    mamba_metadata_cls = _ProbeStateMetadata
+    mamba_metadata_cls = Nemotron4StateMetadata
 
     def __init__(self, model_config: ModelConfig):
         # The composite config keeps the text model's widths under text_config.
@@ -868,21 +1288,22 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp4(
         # text_config derives it (a property over layer_types) and ModelConfig's mirror of
         # text_config onto the composite copies stored fields only.
         cfg.num_hidden_layers = text.num_hidden_layers
-        # Without attention DP the base class builds lm_head column-parallel: each rank
-        # holds its quarter of the vocabulary's rows.
         super().__init__(
             Nemotron4NanoPreviewTp4ModelingV2(model_config),
             config=model_config,
             hidden_size=text.hidden_size,
             vocab_size=text.vocab_size,
         )
+        # Without attention DP the base class builds lm_head split over the vocabulary.
+        # Every rank here forms every logit itself from the same hidden state, so lm_head
+        # is whole on every rank, built as the base class builds it under attention DP.
+        self.lm_head = LMHead(text.vocab_size, text.hidden_size, dtype=model_config.torch_dtype)
+        self.epilogue = [self.lm_head]
         spec_config = getattr(model_config, "spec_config", None)
         if spec_config is not None:
-            self.mamba_metadata_cls = _ProbeStateMetadata.for_draft_len(spec_config.max_draft_len)
-        self._probe_vocab = text.vocab_size
-        assert _PROBE_TOKEN_BASE + (1 << _PROBE_CODE_BITS) <= self._probe_vocab, (
-            "probe codes exceed the vocab"
-        )
+            self.mamba_metadata_cls = Nemotron4StateMetadata.for_draft_len(
+                spec_config.max_draft_len
+            )
 
     def load_weights(self, weights, *args, **kwargs):
         _weights.MODEL_WEIGHTS.load(self, weights)
@@ -902,13 +1323,17 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp4(
         lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Probe logits: one row per request (every token with `return_context_logits`),
-        1.0 at the token that encodes the row's record, 0 elsewhere -- whole-vocabulary
-        rows, the same on every rank."""
+        """fp32 logits over the whole vocabulary, one row per request (every token with
+        `return_context_logits`), the same bits on every rank.
+
+        HF's lm_head is an fp32 GEMM over the bf16 hidden state and weight
+        (`Nemotron4ForCausalLM.forward`); `cublas_mm` with an fp32 output computes the same
+        products, exact in fp32, and keeps the fp32 sum, where the default logits processor
+        would round the logits to bf16 first.
+        """
         if spec_metadata is not None:
             raise NotImplementedError(
-                "nemotron4-nano-preview / sm_103 / tp4 has no MTP forward yet: its forward "
-                "is a probe of the runtime state"
+                "nemotron4-nano-preview / sm_103 / tp4 has no MTP draft forward yet"
             )
         hidden = self.model(
             input_ids=input_ids,
@@ -921,18 +1346,4 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp4(
         if not return_context_logits:
             last = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
             hidden = hidden[last]
-        f = hidden[:, :_PROBE_FIELDS].float().long()
-        code = (
-            (f[:, 0] & 31)
-            | (f[:, 1] & 63) << 5
-            | (f[:, 2] & 1) << 11
-            | (f[:, 3] & 1) << 12
-            | (f[:, 4] & 1) << 13
-            | (f[:, 5] & 7) << 14
-            | (f[:, 6] & 1) << 17
-        )
-        logits = torch.zeros(
-            hidden.shape[0], self._probe_vocab, dtype=torch.float32, device=hidden.device
-        )
-        logits.scatter_(1, (code + _PROBE_TOKEN_BASE).unsqueeze(1), 1.0)
-        return logits
+        return cublas_mm(hidden, self.lm_head.weight.t(), None, torch.float32)

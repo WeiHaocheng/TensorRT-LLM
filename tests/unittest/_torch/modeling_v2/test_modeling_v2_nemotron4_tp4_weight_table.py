@@ -3,14 +3,16 @@
 """nemotron4's tp4 weight table declares, and maps, exactly its rank's part of the checkpoint.
 
 tp4 is tensor parallel over 4 ranks without attention DP: a rank holds a
-quarter of the GDP heads, of the query heads, of every MLP's intermediate width
-(the routed experts' included) and of lm_head's vocabulary, and everything else
-whole. Transcriptions of the HF modeling code (`modeling_nemotron4.py`) hold the
-table to account, each written from the module tree or the forward rather than
-imported from the table, so the table cannot agree with itself:
+quarter of the GDP heads, of the query heads and of every MLP's intermediate
+width (the routed experts' included), and everything else whole, lm_head
+included. Transcriptions of the HF modeling code (`modeling_nemotron4.py`) hold
+the table to account, each written from the module tree or the forward rather
+than imported from the table, so the table cannot agree with itself:
 
 * `_reference_declaration` -- every parameter a rank allocates, at the shape the
-  HF module that owns it stores, cut to the rank's part;
+  HF module that owns it stores, cut to the rank's part, or the layout the
+  target re-lays it into at load (fused qkv, bf16 residual coefficients, conv
+  taps, `-exp(A_log)`);
 * `_reference_text_keys` -- every text-model key of the checkpoint's state dict;
 * `_hf_gdp_rows` and friends -- which rows (or columns) of each checkpoint
   tensor serve which head, read off the reshapes `Nemotron4GDPMixer.forward`,
@@ -21,8 +23,9 @@ a source, every text key is consumed, the only keys left are the predicted
 non-load, each rank's parts are exactly its heads' and its width's, in the order
 a mixer of that many heads reads them, and the four ranks' parts tile every split
 tensor once. When the checkpoint itself is on disk, its safetensors headers are
-read too (headers only, no tensor data): every manifest row is compared against
-the stored shape and dtype, and a rank's weight bytes against the stored ones.
+read too (headers only, no tensor data): every manifest row's stored part, run
+through the row's transform on the meta device, must land exactly on the
+declared slice, and a rank's weight bytes are compared against the stored ones.
 
 No GPU: parameters are declared on the meta device, and `dims` reads
 `model_config` alone.
@@ -68,6 +71,7 @@ _TEXT_CONFIG = dict(
     moe_intermediate_size=4096,
     moe_shared_expert_intermediate_size=4096,
     wide_residual_num_streams=3,
+    wide_residual_retention_max_forget=0.1,
     num_nextn_predict_layers=2,
     mtp_use_repeated_layer=True,
 )
@@ -90,7 +94,7 @@ _VISION_KEYS = {
 
 # The checkpoint tensors a tp4 rank reads only part of -- the plan's slicing table --
 # by the suffix of their key, with the dimension each is cut along. Everything
-# else is read whole.
+# else is read whole, lm_head included.
 _SPLIT = {
     "mixer.in_proj.weight": 0,
     "mixer.conv1d.weight": 0,
@@ -132,10 +136,12 @@ def _core(mtp: bool, rank: int):
 def _reference_declaration(mtp: bool) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """Every parameter a rank allocates, transcribed from the HF module tree.
 
-    The fp32 entries are the ones HF keeps fp32 through load
-    (`_keep_in_fp32_modules_strict`): the router's correction bias, every
-    wide-residual logit and `A_log`. A split parameter is the HF one with the
-    split dimension divided by 4.
+    The fp32 entries are the router's correction bias, which HF keeps fp32
+    through load (`_keep_in_fp32_modules_strict`), and `-exp(A_log)`, which HF
+    forms in fp32 from its fp32 `A_log`. The wide-residual logits HF also keeps
+    fp32 become the bf16 coefficients HF rounds them into on every forward
+    (`.to(streams.dtype)`), and the attention's q, k and v one fused operand. A
+    split parameter is the HF one with the split dimension divided by 4.
     """
     c = _C
     bf16, f32 = torch.bfloat16, torch.float32
@@ -148,23 +154,21 @@ def _reference_declaration(mtp: bool) -> dict[str, tuple[tuple[int, ...], torch.
     projection = value_dim + conv_dim + (m + 1) * c.gdp_num_heads
     w = {}
 
-    def connection(i, name):  # Nemotron4WideResidualConnection
-        for logit in ("read", "write", "retain"):
-            w[f"l{i}_{name}_{logit}"] = ((streams,), f32)
+    def connection(i, name):  # Nemotron4WideResidualConnection: f, w and r
+        for coefficient in ("read", "write", "retain"):
+            w[f"l{i}_{name}_{coefficient}"] = ((streams,), bf16)
 
     def gdp(i):  # Nemotron4GDPMixer, the rank's heads
         w[f"l{i}_gdp_in"] = ((projection // _TP, hidden), bf16)
-        w[f"l{i}_gdp_conv"] = ((conv_dim // _TP, 1, c.gdp_conv_kernel), bf16)
-        w[f"l{i}_gdp_a_log"] = ((c.gdp_num_heads // _TP,), f32)
+        w[f"l{i}_gdp_conv"] = ((conv_dim // _TP, c.gdp_conv_kernel), bf16)
+        w[f"l{i}_gdp_neg_a"] = ((c.gdp_num_heads // _TP,), f32)
         w[f"l{i}_gdp_dt_bias"] = ((c.gdp_num_heads // _TP,), bf16)
         w[f"l{i}_gdp_norm"] = ((value_dim // _TP,), bf16)
         w[f"l{i}_gdp_out"] = ((hidden, value_dim // _TP), bf16)
 
-    def attention(i):  # Nemotron4Attention, the rank's query heads over the whole KV head
+    def attention(i):  # Nemotron4Attention, the rank's query heads over the whole KV head, fused
         q, kv = c.num_attention_heads * c.head_dim, c.num_key_value_heads * c.head_dim
-        w[f"l{i}_q"] = ((q // _TP, hidden), bf16)
-        w[f"l{i}_k"] = ((kv, hidden), bf16)
-        w[f"l{i}_v"] = ((kv, hidden), bf16)
+        w[f"l{i}_qkv"] = ((q // _TP + 2 * kv, hidden), bf16)
         w[f"l{i}_o"] = ((hidden, q // _TP), bf16)
 
     def moe(i):  # the shortcut block's norms and Nemotron4MoE
@@ -192,7 +196,7 @@ def _reference_declaration(mtp: bool) -> dict[str, tuple[tuple[int, ...], torch.
             w[f"l{i}_mlp_down"] = ((hidden, c.intermediate_size // _TP), bf16)
             connection(i, "res")
         else:
-            w[f"l{i}_shortcut_read"] = ((streams,), f32)
+            w[f"l{i}_shortcut_read"] = ((streams,), bf16)
             connection(i, "mix")
             connection(i, "moe")
             moe(i)
@@ -202,7 +206,7 @@ def _reference_declaration(mtp: bool) -> dict[str, tuple[tuple[int, ...], torch.
                 gdp(i)
     w["embed"] = ((c.vocab_size, hidden), bf16)
     w["final_norm"] = ((hidden,), bf16)
-    w["readout"] = ((streams,), f32)
+    w["readout"] = ((streams,), bf16)
     if mtp:
         # One repeated MTP layer, at the index HF gives its attention block. Its
         # block is a shortcut attention + MoE block on a plain residual.
@@ -354,7 +358,7 @@ def _positions(rows, full: int, dim: int, local: int) -> list[int]:
     parameter's order. Every other dimension must be read whole, and the parts
     must fill the parameter's `local` positions along `dim` once."""
     placed = {}
-    for _, dst, src in rows:
+    for _, dst, src, _ in rows:
         index = src if isinstance(src, tuple) else (src,)
         assert len(index) == dim + 1, index
         assert all(i == slice(None) for i in index[:dim]), index
@@ -374,7 +378,12 @@ def _declared(mtp: bool, rank: int) -> dict:
 
 
 def _consumed(manifest: dict) -> set[str]:
-    return {ckpt for rows in manifest.values() for ckpt, _, _ in rows}
+    return {ckpt for rows in manifest.values() for ckpt, _, _, _ in rows}
+
+
+def _query_rows(rows) -> list:
+    """A fused qkv operand's `q_proj` row: the part a rank's query heads cut out."""
+    return [row for row in rows if row[0].endswith("self_attn.q_proj.weight")]
 
 
 _MTP = pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
@@ -398,18 +407,20 @@ def test_every_declared_weight_has_exactly_its_sources(mtp, rank):
     """A declared weight with no source allocates memory nothing ever fills; a key
     feeding two parameters is read twice. Neither may happen. Exactly the tensors of
     the slicing table are read in part, along their split dimension; everything else
-    is read whole."""
+    is read whole, into the whole parameter -- or, for the KV head's `k_proj` and
+    `v_proj`, into their rows of the fused qkv operand."""
     core = _core(mtp, rank)
     manifest = W.MODEL_WEIGHTS.manifest(core)
     assert set(manifest) == set(_declared(mtp, rank).keys())
     assert all(manifest.values())
     owners = {}
     for key, rows in manifest.items():
-        for ckpt, dst, src in rows:
+        for ckpt, dst, src, _ in rows:
             assert owners.setdefault(ckpt, key) == key, (ckpt, owners[ckpt], key)
             dim = _split_dim(ckpt)
             if dim is None:
-                assert (dst, src) == (None, None), (key, dst, src)
+                fused = key.endswith("_qkv")
+                assert src is None and (dst is None) != fused, (key, dst, src)
             else:
                 index = src if isinstance(src, tuple) else (src,)
                 assert len(index) == dim + 1 and isinstance(index[dim], slice), (key, src)
@@ -453,7 +464,7 @@ def test_a_rank_reads_its_own_heads_in_the_order_a_mixer_of_that_many_reads_them
         z_local, conv_local = value_dim // _TP, conv_dim // _TP
         conv = _positions(manifest[f"l{i}_gdp_conv"], conv_dim, 0, conv_local)
         assert conv == [r - value_dim for r in rows[z_local : z_local + conv_local]], i
-        for name in ("gdp_a_log", "gdp_dt_bias"):
+        for name in ("gdp_neg_a", "gdp_dt_bias"):
             assert _positions(manifest[f"l{i}_{name}"], c.gdp_num_heads, 0, len(heads)) == heads
         channels = _hf_gdp_channels(rank)
         assert rows[:z_local] == channels
@@ -462,8 +473,30 @@ def test_a_rank_reads_its_own_heads_in_the_order_a_mixer_of_that_many_reads_them
     q = c.num_attention_heads * c.head_dim
     attention = [j for j, t in enumerate(c.layer_types) if t == "shortcut_moe_attn"]
     for i in attention + ([_NUM_LAYERS] if mtp else []):
-        assert _positions(manifest[f"l{i}_q"], q, 0, q // _TP) == _hf_query_rows(rank), i
+        query = _query_rows(manifest[f"l{i}_qkv"])
+        assert _positions(query, q, 0, q // _TP) == _hf_query_rows(rank), i
         assert _positions(manifest[f"l{i}_o"], q, 1, q // _TP) == _hf_query_rows(rank), i
+
+
+@_MTP
+@_RANK
+def test_fused_qkv_rows_tile_the_operand(mtp, rank):
+    """The rank's query heads, the KV head's k and its v land side by side in the rows of
+    one operand, in that order, covering it exactly: the fused-qkv GEMM's columns are
+    thop_attention's `[q heads | k head | v head]` at the rank's 4 query heads."""
+    c = _C
+    q = c.num_attention_heads * c.head_dim // _TP
+    kv = c.num_key_value_heads * c.head_dim
+    manifest = W.MODEL_WEIGHTS.manifest(_core(mtp, rank))
+    fused = [k for k in manifest if k.endswith("_qkv")]
+    attention = sum(t == "shortcut_moe_attn" for t in c.layer_types) + (1 if mtp else 0)
+    assert len(fused) == attention
+    for key in fused:
+        assert [(ckpt.rsplit(".", 2)[-2], dst, src) for ckpt, dst, src, _ in manifest[key]] == [
+            ("q_proj", slice(0, q), slice(rank * q, (rank + 1) * q)),
+            ("k_proj", slice(q, q + kv), None),
+            ("v_proj", slice(q + kv, q + 2 * kv), None),
+        ], key
 
 
 @_MTP
@@ -471,21 +504,28 @@ def test_the_ranks_tile_every_split_tensor_and_share_the_rest(mtp):
     """Along its split dimension every split tensor is read once over the four ranks,
     and its up and down halves (into and out of a head, or of an intermediate slice)
     agree on which positions a rank holds; every other tensor is read whole by every
-    rank. lm_head's rows tile the vocabulary."""
+    rank, the fused qkv operand's k and v rows included."""
     manifests = [W.MODEL_WEIGHTS.manifest(_core(mtp, rank)) for rank in _RANKS]
     declared = [_declared(mtp, rank) for rank in _RANKS]
     assert all(set(m) == set(manifests[0]) for m in manifests)
     split = 0
     for key in manifests[0]:
-        (ckpt, _, _), *_ = manifests[0][key]
+        (ckpt, _, _, _), *_ = manifests[0][key]
         dim = _split_dim(ckpt)
         if dim is None:
             assert all(m[key] == manifests[0][key] for m in manifests), key
             continue
         split += 1
-        local = declared[0][key].shape[dim]
+        if key.endswith("_qkv"):
+            rows = [_query_rows(m[key]) for m in manifests]
+            kv_rows = [[r for r in m[key] if r not in q] for m, q in zip(manifests, rows)]
+            assert all(r == kv_rows[0] for r in kv_rows), key
+            local = _C.num_attention_heads * _C.head_dim // _TP
+        else:
+            rows = [m[key] for m in manifests]
+            local = declared[0][key].shape[dim]
         full = local * _TP
-        held = [_positions(m[key], full, dim, local) for m in manifests]
+        held = [_positions(r, full, dim, local) for r in rows]
         assert sorted(p for ranks in held for p in ranks) == list(range(full)), key
     pairs = (
         ("mlp_up", 0, "mlp_down", 1),
@@ -505,10 +545,6 @@ def test_the_ranks_tile_every_split_tensor_and_share_the_rest(mtp):
     mlps = sum(t == "mlp" for t in _C.layer_types)
     moe = sum(t.startswith("shortcut_moe") for t in _C.layer_types) + (1 if mtp else 0)
     assert split == 6 * gdp + 2 * attention + 2 * mlps + 4 * moe
-
-    vocab = _C.vocab_size
-    rows = [W.MODEL_WEIGHTS.lm_head_rows(W.MODEL_WEIGHTS.dims(_core(mtp, r))) for r in _RANKS]
-    assert [i for r in rows for i in range(vocab)[r]] == list(range(vocab))
 
 
 def test_mtp_rows_appear_only_when_mtp_is_live():
@@ -549,32 +585,41 @@ def _nbytes(dtype: torch.dtype, shape) -> int:
 def test_the_table_matches_the_checkpoint_on_disk(mtp):
     """The transcriptions above, held to the checkpoint itself: its text keys are
     exactly the transcribed ones, and on every rank every manifest row cuts a stored
-    tensor of the declared dtype to exactly the declared part of its parameter. A
-    rank's weights are then the stored text model's bytes with every split tensor,
-    lm_head's included, at a quarter."""
+    tensor to a part that its transform -- run on a meta tensor of the stored shape
+    and dtype -- turns into exactly the declared slice of its parameter, filling the
+    parameter once. A rank's weights are then the stored text model's bytes with
+    every split tensor at a quarter, lm_head whole, and each fp32 wide-residual
+    logit at the bf16 width of the coefficient it becomes."""
     headers = _checkpoint_headers()
     vision = {k for k in headers if k.startswith(W._VISION_PREFIXES)}
     assert set(headers) - vision == _reference_text_keys(mtp=True)
 
+    def held_bytes(key: str) -> int:
+        dtype, shape = headers[key]
+        coefficient = key.endswith("_logit") or key.endswith(".logit")
+        return _nbytes(torch.bfloat16 if coefficient else _DTYPES[dtype], shape)
+
     text_keys = _reference_text_keys(mtp)
-    stored = {k: _nbytes(_DTYPES[headers[k][0]], headers[k][1]) for k in text_keys}
-    whole = sum(n for k, n in stored.items() if k != "lm_head.weight" and _split_dim(k) is None)
-    split = sum(n for k, n in stored.items() if k == "lm_head.weight" or _split_dim(k) is not None)
+    whole = sum(held_bytes(k) for k in text_keys if _split_dim(k) is None)
+    split = sum(held_bytes(k) for k in text_keys if _split_dim(k) is not None)
     lm_dtype, lm_shape = headers["lm_head.weight"]
     assert (_DTYPES[lm_dtype], lm_shape) == (torch.bfloat16, (_C.vocab_size, _C.hidden_size))
 
     for rank in _RANKS:
         core = _core(mtp, rank)
+        d = W.MODEL_WEIGHTS.dims(core)
         declared = _declared(mtp, rank)
         for param_key, rows in W.MODEL_WEIGHTS.manifest(core).items():
             filled = 0
-            for ckpt, dst, src in rows:
+            for ckpt, dst, src, transform in rows:
                 dtype, shape = headers[ckpt]
-                stored_part = torch.empty(shape, device="meta")
+                stored_part = torch.empty(shape, dtype=_DTYPES[dtype], device="meta")
                 stored_part = stored_part if src is None else stored_part[src]
+                if transform is not None:
+                    stored_part = transform(stored_part, d)
                 param = declared[param_key] if dst is None else declared[param_key][dst]
                 assert tuple(param.shape) == tuple(stored_part.shape), (param_key, ckpt, src)
-                assert declared[param_key].dtype == _DTYPES[dtype], (param_key, ckpt, dtype)
+                assert param.dtype == stored_part.dtype, (param_key, ckpt, dtype)
                 filled += param.numel()
             assert filled == declared[param_key].numel(), param_key
         leftover = set(headers) - _consumed(W.MODEL_WEIGHTS.manifest(core))
@@ -582,6 +627,5 @@ def test_the_table_matches_the_checkpoint_on_disk(mtp):
         assert leftover == W.MODEL_WEIGHTS.expected_unconsumed(core, headers)
 
         rank_bytes = sum(p.numel() * p.dtype.itemsize for p in declared.values())
-        vocab_rows = W.MODEL_WEIGHTS.lm_head_rows(W.MODEL_WEIGHTS.dims(core))
-        rank_bytes += _nbytes(torch.bfloat16, (vocab_rows.stop - vocab_rows.start, lm_shape[1]))
+        rank_bytes += _nbytes(torch.bfloat16, lm_shape)
         assert rank_bytes == whole + split // _TP, rank
