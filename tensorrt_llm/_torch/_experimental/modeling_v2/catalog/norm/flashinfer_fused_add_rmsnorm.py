@@ -31,10 +31,10 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The two hidden sizes the shipped targets normalize over, at a decode
-    # shape and a prefill shape. Both targets call this op only on the
-    # residual stream, so there is no third width to cover and no 3-D case:
-    # unlike plain rmsnorm this one never runs on a per-head view.
+    # The hidden sizes the targets normalize over, at a decode shape and a
+    # prefill shape. Every target calls this op only on a residual stream, so
+    # there is no 3-D case: unlike plain rmsnorm this one never runs on a
+    # per-head view.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode-shaped, gpt-oss-120b hidden",
@@ -48,6 +48,32 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
             why="prefill-shaped: enough rows to cross the kernel's grid tiling",
             spec=dict(shape=(2048, 7168), dtype=torch.bfloat16, eps=1e-6),
         ),
+        # nemotron4's MTP layer runs its block on an ordinary bf16 residual: the
+        # attention output is added before `pre_moe_layernorm` and the MoE output
+        # before `final_layernorm`, both at hidden 3072 (the main stack's wide
+        # residual streams are not this op). The block sees one token per request
+        # at depth 2, three per request at depth 1, and every context token of a
+        # prefill chunk.
+        Cell(
+            why="nemotron4 3072, decode: one MTP draft token",
+            spec=dict(shape=(1, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 3072 x1024: MTP depth 2 at the largest CUDA-graph batch",
+            spec=dict(shape=(1024, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 3072 x3072: MTP depth 1, 1024 requests x 3 verified tokens",
+            spec=dict(shape=(3072, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 3072 x8192: MTP layer over an 8192-token prefill chunk",
+            spec=dict(shape=(8192, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 3072 x16384: MTP layer over the 16384-token prefill budget",
+            spec=dict(shape=(16384, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
     )
 
     note = """
@@ -56,9 +82,22 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
     PDL is controlled by `TRTLLM_ENABLE_PDL` (default on) inside the trtllm
     custom op; it changes scheduling, not results, and is not a cell axis.
 
-    Both targets pass contiguous tensors here -- the residual stream is a
+    Every target passes contiguous tensors here -- the residual stream is a
     freshly allocated buffer -- so the strided-row path this kernel also has
     is not certified by this entry.
+
+    The residual it writes is a bf16 add of the two inputs, bit for bit what
+    an HF block's `hidden_states + update` writes. The normalized output is
+    not HF's: HF normalizes that rounded sum and rounds twice (`weight *
+    normed.to(input_dtype)`, as `Nemotron4RMSNorm` and `LlamaRMSNorm` do),
+    this op normalizes the fp32 sum and rounds once. The two land at most two
+    ulps apart and differ on about a third of the outputs
+    (`test_hf_order_is_two_ulps_away`); a target that has to match HF's order
+    bit for bit needs a kernel of its own.
+
+    A row's results do not depend on how many rows share the call
+    (`test_a_row_does_not_depend_on_its_batch`), so CUDA-graph padding and
+    speculative verify leave every real row's bits alone.
     """
 
     def __call__(
