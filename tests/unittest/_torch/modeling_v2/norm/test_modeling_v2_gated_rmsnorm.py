@@ -14,11 +14,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.norm.gated_rmsnorm import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm import (
     gated_rmsnorm as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "gated_rmsnorm requires a CUDA device"

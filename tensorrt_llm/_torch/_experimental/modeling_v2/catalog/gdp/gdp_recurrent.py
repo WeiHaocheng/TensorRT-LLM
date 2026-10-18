@@ -8,8 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
+from .._op import Arch, Cell, OpWrapper
 
 #: Columns of the [K, V] state one program holds. Eight 128-float columns are
 #: 4 KiB of fp32 state in one warp's registers, the tile the vendored

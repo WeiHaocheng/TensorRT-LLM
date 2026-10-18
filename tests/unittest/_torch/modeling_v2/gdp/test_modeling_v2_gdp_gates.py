@@ -14,11 +14,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.gdp.gdp_gates import (  # noqa: E501
-    gdp_gates as op,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_gates import gdp_gates as op
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "gdp_gates requires a CUDA device"

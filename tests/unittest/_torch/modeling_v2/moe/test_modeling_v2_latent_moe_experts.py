@@ -15,14 +15,14 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.moe.latent_moe_experts import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
     _clamped_relu2_weighted_kernel,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.moe.latent_moe_experts import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
     latent_moe_experts as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import (  # noqa: E402,F401 — path above; fixture by name
     assert_within_ulp,
     certifying,

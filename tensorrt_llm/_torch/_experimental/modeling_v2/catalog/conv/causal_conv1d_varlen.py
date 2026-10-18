@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 # Every GDP layer of the checkpoint (12 `linear_attention`, 20 `shortcut_moe_gdp`) builds the same
 # `Nemotron4GDPMixer`, so there is one geometry: conv_dim = 3 * 1536 (V) + 4 * 3072 (K and Q)

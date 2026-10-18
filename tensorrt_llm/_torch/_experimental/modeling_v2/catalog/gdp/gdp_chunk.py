@@ -8,13 +8,14 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_o
 from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
 from tensorrt_llm._torch.modules.fla.solve_tril import solve_tril
 from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd
+
+from .._op import Arch, Cell, OpWrapper
 
 #: The vendored chunk kernels' block length, counted in Householder sub-steps.
 _BT = 64

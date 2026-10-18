@@ -36,13 +36,32 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.softclamp_relu2 import (
+    softclamp_relu2,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_update import (
+    causal_conv1d_update,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_varlen import (
+    causal_conv1d_varlen,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_gates import gdp_gates
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import gdp_recurrent
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
+    latent_moe_experts,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm import gated_rmsnorm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.wide_residual import (
+    wide_residual,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -55,15 +74,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHyb
 from tensorrt_llm._utils import prefer_pinned
 
 from . import weights as _weights
-from .ops.activation.softclamp_relu2 import softclamp_relu2
-from .ops.conv.causal_conv1d_update import causal_conv1d_update
-from .ops.conv.causal_conv1d_varlen import causal_conv1d_varlen
-from .ops.gdp.gdp_chunk import gdp_chunk
-from .ops.gdp.gdp_gates import gdp_gates
-from .ops.gdp.gdp_recurrent import gdp_recurrent
-from .ops.moe.latent_moe_experts import latent_moe_experts
-from .ops.norm.gated_rmsnorm import gated_rmsnorm
-from .ops.residual.wide_residual import wide_residual
 
 #: Block types by what they run: a GDP mixer keeps recurrent and conv state, an
 #: attention mixer keeps paged KV, a dense MLP keeps nothing; the shortcut blocks

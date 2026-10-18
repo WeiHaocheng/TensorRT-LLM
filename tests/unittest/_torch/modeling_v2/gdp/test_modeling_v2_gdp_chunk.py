@@ -10,9 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.gdp.gdp_chunk import (  # noqa: E501
-    gdp_chunk as op,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk as op
 from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
@@ -20,7 +18,7 @@ from tensorrt_llm._torch.modules.fla.chunk_delta_h import (
 )
 from tensorrt_llm._torch.modules.fla.cumsum import chunk_local_cumsum
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "gdp_chunk requires a CUDA device"

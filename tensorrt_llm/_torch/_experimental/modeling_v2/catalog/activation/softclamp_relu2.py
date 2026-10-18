@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: Elements per program and warps per program. 8 elements per thread is one 16-byte bf16 vector;
 #: measured on every cell against 2048, 4096 and 8192 elements at 4 and 8 warps, this is the
