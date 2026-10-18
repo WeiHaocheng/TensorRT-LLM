@@ -132,7 +132,7 @@ tests/unittest/_torch/modeling_v2/
   _validating.py                 the fixtures that interpose is_valid and arm reference
   <category>/test_modeling_v2_<entry>.py                      shared entries
   models/<family>/<target>/<category>/test_modeling_v2_<entry>.py   owned entries
-  comm/_<entry>_op_matrix.py   the two collectives' 4-rank rank bodies
+  comm/_<entry>_op_matrix.py   the collectives' 4-rank rank bodies
   comm/_rank_job.py            starts one of those and asserts on its exit code
 ```
 
@@ -142,13 +142,17 @@ an in-package test is on no list. Each test is parametrized off its entry's
 and derives, so the certification is re-proved on every commit rather than
 recorded once.
 
-The two collectives' rank bodies sit in the tests tree with everything else
+The collectives' rank bodies sit in the tests tree with everything else
 that only tests run. Both halves are started by file path -- the launcher must
 not import `tensorrt_llm`, because that calls `MPI_Init` and an
 MPI-initialized process cannot start `mpirun`, and the ranks reach the catalog
 by absolute import -- so neither needs a package to live in. Neither those
 file names nor their `check_*` bodies match pytest's collection patterns:
 each is one fixed 4-rank sequence that cannot run as independent cases.
+The all-gather and reduce-scatter ranks rendezvous over torch.distributed and
+drive their ops' `_pg` symbols; the all-reduce's launcher starts its ranks
+under `mpirun`, because a tensor-parallel serving engine's workers are an MPI
+world and its workspace is built over that world's communicator.
 
 Identity is the directory name, and it carries all three segments:
 `gpt_oss_120b__sm_103__tp1`. They were three nested directories once, which
