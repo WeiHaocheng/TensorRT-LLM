@@ -165,3 +165,68 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
             f"mtp2={mtp2:.4f}); greedy MTP emits the target's own tokens, so "
             f"this is not near-tie noise"
         )
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
+    """nemotron4-nano-preview (text model) / sm_103 / dep4, identity."""
+
+    MODEL_NAME = "Nemotron4/nemotron4-nano-preview"
+    MODEL_PATH = f"{llm_models_root()}/nemotron4-nano-preview"
+
+    # The parallel topology the dep4 target implements: attention DP over the
+    # 4 GPUs of one node, the routed experts split four ways. Routing derives
+    # the target from these, and the target asserts them against the mapping
+    # the engine built.
+    DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
+
+    # The context the target serves, as on tp1: 8192 + 1024 tokens plus draft
+    # slack, stated because the config's max_position_embeddings is 1,048,576.
+    MAX_SEQ_LEN = 9344
+
+    # Per rank: under attention DP every rank schedules its own requests, and
+    # the CUDA graphs are captured per rank, with padding, for every batch size
+    # up to it. The 1319 questions, spread over the four ranks, are all in
+    # flight at once and drain through the smaller graphs.
+    MAX_BATCH_SIZE = 512
+
+    # Every step's rows per rank. The routed MoE's all-gather and
+    # reduce-scatter are certified up to 2048 rows a rank, so the gate keeps
+    # each step inside them. A 5-shot GSM8K prompt (at most ~1.5K tokens)
+    # still fits in one step, so prompts are not chunked.
+    MAX_NUM_TOKENS = 2048
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_gsm8k(self, mocker):
+        """The identity accuracy gate on 4 ranks.
+
+        It holds dep4 to the bar tp1 is held to: the anchor is a property of
+        the checkpoint, and the topology only changes where each request runs
+        and in which order the routed experts' partial sums meet. The target
+        adds the four ranks' fp32 partial sums before its one rounding to
+        bf16, which is the rounding HF makes.
+
+        The step contract is checked on every rank's first forward, as on tp1;
+        the switch travels as ``env_overrides`` because the check runs on the
+        ranks.
+        """
+        # The stock protocol, as the anchor was measured: 5-shot, no chat
+        # template, the default 256 output tokens. Only the filter is patched.
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+        task = GSM8K(self.MODEL_NAME)
+
+        with LLM(
+            self.MODEL_PATH,
+            modeling_v2="require",
+            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
+            trust_remote_code=True,
+            max_seq_len=self.MAX_SEQ_LEN,
+            max_batch_size=self.MAX_BATCH_SIZE,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=True, max_batch_size=self.MAX_BATCH_SIZE
+            ),
+            **self.DEP4,
+        ) as llm:
+            task.evaluate(llm)
