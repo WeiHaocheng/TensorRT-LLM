@@ -152,8 +152,8 @@ def is_nemotron4(config) -> bool:
     text_config). Nemotron 4 has no built-in implementation; a ModelingV2
     target serves it, and the engine owns its KV and recurrent-state cache.
     """
-    return getattr(config, "model_type", None) in ("nemotron4",
-                                                   "nemotron4_text")
+    return getattr(config, "model_type",
+                   None) in ("nemotron4", "nemotron4_text")
 
 
 def unwrap_nemotron4_text_config(config):
@@ -818,9 +818,9 @@ def extract_mamba_kv_cache_params(
         conv_kernel = text_config.gdp_conv_kernel
         num_heads = text_config.gdp_num_heads
         head_dim = text_config.gdp_head_dim
-        conv_dim = (num_householder * num_heads * head_dim +
-                    (num_householder + 1) * text_config.gdp_num_groups *
-                    state_size)
+        conv_dim = (
+            num_householder * num_heads * head_dim +
+            (num_householder + 1) * text_config.gdp_num_groups * state_size)
         n_groups, remainder = divmod(conv_dim - num_heads * head_dim,
                                      2 * state_size)
         if remainder != 0:
