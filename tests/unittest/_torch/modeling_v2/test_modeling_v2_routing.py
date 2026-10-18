@@ -46,6 +46,10 @@ _GPT_OSS_TARGET = "models.gpt_oss.gpt_oss_120b__sm_103__tp1.modeling.ModelingV2G
 _R1_TARGET = (
     "models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.modeling.ModelingV2DeepseekR10528Nvfp4Sm103Dep4"
 )
+_NEMOTRON4_TARGET = (
+    "models.nemotron4.nemotron4_nano_preview__sm_103__tp1.modeling."
+    "ModelingV2Nemotron4NanoPreviewSm103Tp1"
+)
 
 
 def _qualified(target) -> str:
@@ -85,6 +89,54 @@ def _r1_config(**overrides):
     )
     fields.update(overrides)
     return PretrainedConfig(**fields)
+
+
+#: nemotron4-nano-preview's text_config.layer_types, one letter per block.
+_NEMOTRON4_BLOCKS = dict(L="linear_attention", M="mlp", A="shortcut_moe_attn", G="shortcut_moe_gdp")
+_NEMOTRON4_LAYOUT = "LMLMLAGGLAGGGLAGGGLAGGGLAGGGLAGGGLAGGLAGLMLM"
+
+
+def _nemotron4_config(layout=_NEMOTRON4_LAYOUT, **text_overrides):
+    """The shape nemotron4-nano-preview's own config.json declares.
+
+    A vision-language composite: the fingerprint lives in its text_config, the
+    text model being what the target serves.
+    """
+    text = dict(
+        model_type="nemotron4_text",
+        hidden_size=3072,
+        layer_types=[_NEMOTRON4_BLOCKS[block] for block in layout],
+        num_attention_heads=16,
+        num_key_value_heads=1,
+        head_dim=256,
+        gdp_num_heads=24,
+        gdp_num_groups=24,
+        gdp_key_head_dim=128,
+        gdp_head_dim=64,
+        gdp_num_householder=3,
+        gdp_conv_kernel=4,
+        intermediate_size=12288,
+        mlp_hidden_act="relu2",
+        n_routed_experts=512,
+        num_experts_per_tok=10,
+        moe_latent_size=768,
+        moe_intermediate_size=4096,
+        moe_shared_expert_intermediate_size=4096,
+        moe_use_norm_before_up_proj=True,
+        moe_shortcut_post_norm=False,
+        wide_residual_num_streams=3,
+        wide_residual_learned_retention=True,
+        residual_in_fp32=False,
+        tie_word_embeddings=False,
+        num_nextn_predict_layers=2,
+        mtp_use_repeated_layer=True,
+    )
+    text.update(text_overrides)
+    return PretrainedConfig(
+        architectures=["Nemotron4ForConditionalGeneration"],
+        model_type="nemotron4",
+        text_config=PretrainedConfig(**text),
+    )
 
 
 def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
@@ -249,4 +301,91 @@ def test_r1_dep4_with_vanilla_mtp_does_not_match():
     with pytest.raises(ValueError, match="MTP"):
         modeling_v2_resolve(config, _llm_args("require"))
     with pytest.raises(ValueError, match="MTP"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+# --- nemotron4: a composite checkpoint routed on its text model ------------------
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_nemotron4_tp1_matches(mode):
+    config = _model_config(_nemotron4_config())
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _NEMOTRON4_TARGET
+
+
+def test_nemotron4_has_no_builtin_to_fall_back_to():
+    """There is no built-in Nemotron4 implementation, so ``auto`` falling back
+    finds no model class at all: ``require`` is the only mode this checkpoint
+    runs under."""
+    config = _model_config(_nemotron4_config())
+    assert modeling_v2_resolve(config, _llm_args("off")) is None
+    assert AutoModelForCausalLM._resolve_class(config) is None
+
+
+@pytest.mark.parametrize(
+    "config, mapping_kwargs, missed",
+    [
+        # another width
+        (_nemotron4_config(hidden_size=4096), {}, r"hidden_size=4096 \(target: 3072\)"),
+        # the same blocks in another order: block 5 a GDP mixer instead of attention
+        (
+            _nemotron4_config(layout=_NEMOTRON4_LAYOUT[:5] + "G" + _NEMOTRON4_LAYOUT[6:]),
+            {},
+            "layer_pattern='LMLMLGGG",
+        ),
+        # another attention head geometry
+        (_nemotron4_config(num_key_value_heads=2), {}, r"num_key_value_heads=2 \(target: 1\)"),
+        # another latent MoE
+        (_nemotron4_config(moe_latent_size=1024), {}, r"moe_latent_size=1024 \(target: 768\)"),
+        # another GDP geometry
+        (_nemotron4_config(gdp_num_householder=1), {}, r"gdp_num_householder=1 \(target: 3\)"),
+        # the right checkpoint, tensor parallel over two ranks
+        (_nemotron4_config(), dict(world_size=2, tp_size=2), "world_size=2"),
+        # the right checkpoint, attention DP with expert-parallel MoE over two ranks
+        (
+            _nemotron4_config(),
+            dict(world_size=2, tp_size=2, moe_ep_size=2, moe_tp_size=1, enable_attention_dp=True),
+            "attention_dp=True",
+        ),
+    ],
+    ids=["hidden", "layout", "kv_heads", "latent", "householder", "tp2", "dep2"],
+)
+def test_nemotron4_near_misses_do_not_match(config, mapping_kwargs, missed):
+    model_config = _model_config(config, **mapping_kwargs)
+    assert modeling_v2_resolve(model_config, _llm_args("auto")) is None
+
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(model_config, _llm_args("require"))
+
+
+def test_nemotron4_on_another_sm_names_it(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
+    config = _model_config(_nemotron4_config())
+    with pytest.raises(ValueError) as excinfo:
+        modeling_v2_resolve(config, _llm_args("require"))
+    message = str(excinfo.value)
+    assert "Nemotron4ForConditionalGeneration" in message
+    assert "compute capability (10, 0)" in message
+    assert "text config matches nemotron4-nano-preview" in message
+
+
+def test_nemotron4_without_a_text_config_does_not_match():
+    config = _model_config(PretrainedConfig(architectures=["Nemotron4ForConditionalGeneration"]))
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="text_config"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize(
+    "spec_config",
+    [MTPDecodingConfig(max_draft_len=2), _NGRAM],
+    ids=["mtp", "ngram"],
+)
+def test_nemotron4_tp1_declines_speculative_decoding(spec_config):
+    """The tp1 target carries no draft path, so every speculative mode is
+    declined, the checkpoint's own MTP module included, and the message names
+    the mode."""
+    config = _model_config(_nemotron4_config(), spec_config=spec_config)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=type(spec_config).__name__):
         modeling_v2_resolve(config, _llm_args("require"))
