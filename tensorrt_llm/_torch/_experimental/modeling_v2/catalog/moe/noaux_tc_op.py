@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 
 class NoauxTcOp(OpWrapper):
@@ -25,32 +26,86 @@ class NoauxTcOp(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # deepseek-r1's router is the only caller: 256 experts in 8 groups, 4 groups
-    # kept, 8 experts per token, scaled by 2.5. The token counts are the ones
-    # the target produces -- one per decode step, and the chunk it splits a
-    # prefill into.
+    # Two routers call this, and they take different kernels (see `note`).
+    # deepseek-r1: 256 experts in 8 groups, 4 groups kept, 8 experts per token,
+    # scaled by 2.5; its trunk's router GEMM emits bf16 logits and its MTP
+    # layer's emits fp32. nemotron4: 512 experts in one group, 10 per token,
+    # scaled by 3.16, fp32 logits -- its router (`Nemotron4TopkRouter`)
+    # computes them in fp32. The weights come back in the logits' dtype, so
+    # the fp32 cells are the ones that see the renormalization's last bit.
+    # The token counts are the ones each target routes at once: one per decode
+    # step, a decode batch, and the chunk a prefill is split into.
+    #
+    # Every bias is fp32. nemotron4's are drawn at its checkpoint's scale
+    # (per-layer std 0.025-0.064), which leaves the choice to the sigmoid
+    # scores and the top-10/11 margins thin: the 8192-token cell's narrowest
+    # is 6e-8, one fp32 ulp, against 1.4e-6 with a unit-scale bias. Exact
+    # selection has to hold there.
+    _DEEPSEEK = dict(experts=256, n_group=8, topk_group=4, topk=8, scale=2.5, bias_std=1.0)
+    _NEMOTRON4 = dict(
+        experts=512,
+        n_group=1,
+        topk_group=1,
+        topk=10,
+        scale=3.16,
+        bias_std=0.05,
+        logits_dtype=torch.float32,
+    )
+
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one token through the full 256-expert router",
-            spec=dict(tokens=1, experts=256, n_group=8, topk_group=4, topk=8, scale=2.5),
+            spec=dict(tokens=1, logits_dtype=torch.bfloat16, **_DEEPSEEK),
         ),
         Cell(
             why="prefill chunk: the batch the target routes at once",
-            spec=dict(tokens=2048, experts=256, n_group=8, topk_group=4, topk=8, scale=2.5),
+            spec=dict(tokens=2048, logits_dtype=torch.bfloat16, **_DEEPSEEK),
         ),
         Cell(
             why="a token count that is not a multiple of any tile",
-            spec=dict(tokens=37, experts=256, n_group=8, topk_group=4, topk=8, scale=2.5),
+            spec=dict(tokens=37, logits_dtype=torch.bfloat16, **_DEEPSEEK),
+        ),
+        Cell(
+            why="deepseek MTP router: fp32 logits through the grouped kernel",
+            spec=dict(tokens=2048, logits_dtype=torch.float32, **_DEEPSEEK),
+        ),
+        Cell(
+            why="nemotron4 decode: one token, 512 experts in one group, top-10, fp32",
+            spec=dict(tokens=1, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 at 37 tokens, not a multiple of any tile",
+            spec=dict(tokens=37, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 decode batch of 1024, the top of the CUDA-graph sizes",
+            spec=dict(tokens=1024, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 prefill chunk of 8192 tokens, the max_num_tokens budget",
+            spec=dict(tokens=8192, **_NEMOTRON4),
         ),
     )
 
     note = """
     The kernel evaluates sigmoid as `0.5 * tanh(x/2) + 0.5`, which saturates to
     exactly 1.0 at x >= ~17 and exactly 0.0 at x <= ~-18.5. `reference` uses the
-    same form; the 1/(1+exp(-x)) form disagrees in the tails.
+    same form; the 1/(1+exp(-x)) form disagrees in the tails. In fp32 the two
+    differ by up to 2.4e-6 relative for |x| <= 5 and 3.3e-4 for |x| <= 10, so a
+    router written with `torch.sigmoid` -- nemotron4's HF router is -- can pick
+    another expert where a top-k margin is that thin: measured, 1 row in 16384
+    random-logit rows with that checkpoint's own bias.
 
     Ties in the selection score are broken toward the lower expert id, which
     `reference` reproduces with a stable descending sort.
+
+    Two kernels sit behind the op, and the cells drive both. `n_group > 1`
+    takes the grouped one: at most 256 experts, at most 32 per group, at most
+    256 across the kept groups, `topk` at most 8. `n_group <= 1` takes the
+    single-group one: at most 1024 experts and `topk` at most 32, and
+    `topk_group` is never read. Any other configuration raises
+    ("invokeNoAuxTc: unsupported configuration"), so neither limit needs a
+    guard here.
     """
 
     def __call__(
@@ -77,10 +132,15 @@ class NoauxTcOp(OpWrapper):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Native torch, in the kernel's own arithmetic.
 
-        Two details are the kernel's rather than the obvious choice, and both
-        are load-bearing: sigmoid is the tanh form, and the renormalization is
-        evaluated in fp64. An all-fp32 normalization disagrees on a third of the
-        elements at `routed_scaling_factor = 2.5`; the fp64 one is bit-exact.
+        Three details are the kernel's rather than the obvious choice, and all
+        three are load-bearing: sigmoid is the tanh form; the picked scores are
+        summed in fp32 in the kernel's warp order; and the scale-and-divide is
+        evaluated in fp64, rounding once. Against fp32 weights (the fp32-logit
+        cells) an all-fp32 renormalization disagrees on about a third of the
+        elements, and a sum in sequential or ascending-stride order on a quarter
+        to half of the rows; this one is bit-exact on every cell. bf16 weights
+        hide the renormalization's precision almost entirely (1 element in
+        16384 for the all-fp32 one).
         """
         num_experts = router_logits.shape[-1]
         scores = 0.5 * torch.tanh(0.5 * router_logits.float()) + 0.5
@@ -98,8 +158,14 @@ class NoauxTcOp(OpWrapper):
             )
         ids = torch.sort(choice, dim=-1, descending=True, stable=True).indices[:, :topk]
         weights = torch.gather(scores, 1, ids)
-        total = weights.sum(-1, keepdim=True).double()
-        weights = weights.double() / (total + 1e-20) * routed_scaling_factor
+        # One warp sums the picked scores, lane i holding the i-th pick and the
+        # lanes past `topk` holding 0, pairing lanes at strides 16, 8, 4, 2, 1.
+        lanes = torch.nn.functional.pad(weights, (0, 32 - topk))
+        lane = torch.arange(32, device=lanes.device)
+        for stride in (16, 8, 4, 2, 1):
+            lanes = lanes + lanes[:, lane ^ stride]
+        total = lanes[:, :1].double()
+        weights = weights.double() * routed_scaling_factor / (total + 1e-20)
         return weights.to(router_logits.dtype), ids.to(torch.int32)
 
     def is_valid(
