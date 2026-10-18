@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 WORLD_SIZE = 4
-"""dep4's world size -- the topology these entries are certified for."""
+"""dep4's and tp4's world size -- the topologies these entries are certified for."""
 
 _LAUNCHER_GRACE_S = 300
 """Headroom over the entry's own deadline, so its message wins the race."""
