@@ -38,11 +38,14 @@ class _HybridManager:
     Each pool is the first half of a [slots, 2, *state] block, so its slot stride
     is twice one state, and a write that strays past a state lands in the other
     half, where `changed_slots` sees it.
+
+    Like `MambaHybridCacheManagerV2`, it does not state the draft length
+    (`speculative_num_draft_tokens`): the padding dummy of a step whose rows carry
+    `draft_len` draft tokens has id `CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len`.
     """
 
     def __init__(self, slot_of: dict[int, int], draft_len: int = 0) -> None:
         self.slot_of = {**slot_of, _PAD - draft_len: _DUMMY_SLOT}
-        self.speculative_num_draft_tokens = draft_len
         self.mamba_layer_offsets = {layer: i for i, layer in enumerate(_GDP_LAYERS)}
         g = torch.Generator(device="cuda").manual_seed(1234)
         # Every slot non-zero, so a reset is visible.
@@ -113,22 +116,49 @@ def test_padding_rows_read_pad_slot_id_and_keep_the_dummy_slot():
     assert md.state_slots[:4].tolist() == [1, 9, PAD_SLOT_ID, PAD_SLOT_ID]
 
 
-def test_padding_ids_shift_by_the_draft_length():
-    """With draft tokens the padding dummy's id is CUDA_GRAPH_DUMMY_REQUEST_ID
-    less the draft length, as `Mamba2Metadata.prepare` reads it."""
+@pytest.mark.parametrize("runtime_draft_len", [2, 1], ids=["max_draft_len", "shorter_draft"])
+def test_padding_ids_shift_by_the_draft_length(runtime_draft_len):
+    """With draft tokens the padding dummy's id is CUDA_GRAPH_DUMMY_REQUEST_ID less
+    the step's draft length, at most the target's max_draft_len, which the shell
+    binds (`for_draft_len`). A verify row carries 1 + D tokens and one slot."""
+    manager = _HybridManager({7: 4, 3: 1}, draft_len=runtime_draft_len)
+    md = Nemotron4StateMetadata.for_draft_len(2)(_MAX_BATCH, 128, max_num_tokens=8192)
+    tokens = 1 + runtime_draft_len
+    pad = _PAD - runtime_draft_len
+    md.prepare(_step(manager, [7, 3, pad, pad], [tokens] * 4, 0, [40, 41, 0, 0]))
+    torch.cuda.synchronize()
+    assert md.state_slots[:4].tolist() == [4, 1, PAD_SLOT_ID, PAD_SLOT_ID]
+    # The engine's own slots stay with the engine's commit, which writes through them.
+    assert md.state_indices[:4].tolist() == [4, 1, _DUMMY_SLOT, _DUMMY_SLOT]
+
+
+def test_without_the_draft_length_an_mtp_padding_row_writes_the_dummy_slot():
+    """The hazard the binding removes: with the draft length unknown (the V2
+    manager does not state it), the padding dummy of an MTP step reads as a real
+    row, so every padding row would carry the dummy's slot and write it."""
     manager = _HybridManager({7: 4}, draft_len=2)
     md = Nemotron4StateMetadata(_MAX_BATCH, 128, max_num_tokens=8192)
-    md.prepare(_step(manager, [7, _PAD - 2], [1, 1], 0, [40, 0]))
-    assert md.state_slots[:2].tolist() == [4, PAD_SLOT_ID]
+    md.prepare(_step(manager, [7, _PAD - 2, _PAD - 2], [3, 3, 3], 0, [40, 0, 0]))
+    assert md.state_slots[:3].tolist() == [4, _DUMMY_SLOT, _DUMMY_SLOT]
 
 
 def test_a_padding_row_between_real_rows_is_refused():
     """Only trailing padding rows are marked; a padding row ordered before a
-    real one, which the runner can produce only with draft tokens, raises."""
+    real one, a layout the runner does not produce (it appends padding after
+    every real row), raises."""
     manager = _HybridManager({7: 4, 8: 5}, draft_len=2)
-    md = Nemotron4StateMetadata(_MAX_BATCH, 128, max_num_tokens=8192)
+    md = Nemotron4StateMetadata.for_draft_len(2)(_MAX_BATCH, 128, max_num_tokens=8192)
     with pytest.raises(NotImplementedError, match="padding row precedes a real row"):
-        md.prepare(_step(manager, [7, _PAD - 2, 8], [1, 1, 1], 0, [40, 0, 41]))
+        md.prepare(_step(manager, [7, _PAD - 2, 8], [3, 3, 3], 0, [40, 0, 41]))
+
+
+def test_the_bound_class_is_the_metadata_class():
+    """The engine builds the metadata from the class the shell names and checks it
+    against `Nemotron4StateMetadata`; the binding keeps the warmup's class reads."""
+    bound = Nemotron4StateMetadata.for_draft_len(2)
+    assert issubclass(bound, Nemotron4StateMetadata)
+    assert bound.max_draft_len == 2 and Nemotron4StateMetadata.max_draft_len == 0
+    assert bound.prefill_chunk_alignment == Nemotron4StateMetadata.prefill_chunk_alignment
 
 
 def test_a_fresh_one_token_prompt_in_a_decode_batch_gets_a_zeroed_slot():

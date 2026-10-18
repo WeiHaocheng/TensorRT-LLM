@@ -491,6 +491,18 @@ nvidia/Nemotron-3.5-Lightning:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 84.42
+# nemotron4-nano-preview's text model, bf16, gated through its modeling_v2
+# target (test_modeling_v2_nemotron4.py). There is no built-in implementation of
+# the architecture to measure, so the anchor is the checkpoint's own HuggingFace
+# modeling_nemotron4.py (transformers 5.17 with fla, greedy) under the protocol
+# the gate runs -- stock 5-shot, no chat template, 256 output tokens, scored on
+# exact_match,flexible-extract -- over all 1319 samples: 56.33 (strict-match
+# 56.41, unfiltered mean 56.37). The MTP row carries the same anchor: with
+# greedy sampling, MTP emits the target model's own tokens.
+Nemotron4/nemotron4-nano-preview:
+  - accuracy: 56.33
+  - spec_dec_algo: MTP
+    accuracy: 56.33
 # MiniMax-M3 text decoder (block-sparse MoE) GSM8K, full 1319-sample split.
 # Thresholds tracked per checkpoint / quantization scheme.
 MiniMaxAI/MiniMax-M3:
