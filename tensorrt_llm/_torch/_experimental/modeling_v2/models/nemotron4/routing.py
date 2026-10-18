@@ -12,9 +12,9 @@ The checkpoint is a vision-language composite and every target here serves its
 text model alone, so the fingerprint is read off ``text_config``; the vision
 tower takes no part in the decision.
 
-Two topologies have a target: tp1 and dep4. The other layouts of one 4-GPU node
-that could serve the 8K/1K workload are named in the ``NoTarget`` message with
-the reason they have none.
+Three topologies have a target: tp1, dep4 and tp4. The other layouts of one
+4-GPU node that could serve the 8K/1K workload are named in the ``NoTarget``
+message with the reason they have none.
 """
 
 from __future__ import annotations
@@ -75,10 +75,8 @@ _NANO_PREVIEW = dict(
 _NOT_IMPLEMENTED = {
     "tp2": "on the 8K/1K performance model it never reaches the frontier the other topologies form",
     "dep2": "on the 8K/1K performance model it leads only below 25 tok/s/user, by 5-8% over dep4",
-    "tp4": "on the 8K/1K performance model it leads only at the latency end, and its gain "
-    "there over tp1 with MTP is not established with measured op times",
-    "tep4": "on the 8K/1K performance model it stays within 0.81-1.01x of tp4, which leads "
-    "only at the latency end",
+    "tep4": "on the 8K/1K performance model, from measured op times, it is below tp4 at "
+    "every concurrency measured (C = 1-16), at 0.89-0.94x of tp4's tok/s/user with MTP",
 }
 
 
@@ -87,7 +85,9 @@ def _topology(mapping: Any) -> Optional[str]:
     experts' widths split), ``tep<n>`` (heads split, whole experts per rank) or ``dep<n>``
     (attention DP, whole experts per rank). None for any other layout: pipeline or context
     parallelism, a MoE split mixing tensor, expert or cluster parallelism, a vocab-parallel
-    lm_head under attention DP, attention DP over one rank or with tensor-parallel experts."""
+    lm_head under attention DP, attention DP over one rank or with tensor-parallel experts,
+    and, without attention DP, attention split other than by heads over every rank
+    (``attn_tp_size`` short of the TP size, the rest attention context parallelism)."""
     n = mapping.tp_size
     if mapping.pp_size != 1 or mapping.cp_size != 1 or mapping.world_size != n:
         return None
@@ -95,6 +95,8 @@ def _topology(mapping: Any) -> Optional[str]:
     if mapping.enable_attention_dp:
         if n > 1 and whole_experts and not mapping.enable_lm_head_tp_in_adp:
             return f"dep{n}"
+        return None
+    if mapping.attn_tp_size != n:
         return None
     if mapping.moe_tp_size == n:
         return f"tp{n}"
@@ -110,6 +112,8 @@ def _parallel_layout(mapping: Any) -> str:
     )
     if mapping.enable_lm_head_tp_in_adp:
         layout += " lm_head_tp_in_adp=True"
+    if mapping.attn_tp_size != mapping.tp_size:
+        layout += f" attn_tp={mapping.attn_tp_size} attn_cp={mapping.attn_cp_size}"
     return layout
 
 
@@ -192,6 +196,9 @@ def route(
     #     else divided. The engine states attention DP as tensor_parallel_size=4 plus
     #     enable_attention_dp, so "nothing else" means whole experts per rank (moe_tp=1) and
     #     lm_head whole (no enable_lm_head_tp_in_adp); tep4 and tp4 split the mixers' heads.
+    #   tp4: tensor parallel over 4 ranks without attention DP. Every rank runs every
+    #     request on its quarter of the mixers' heads and of every MLP's and routed
+    #     expert's intermediate width (moe_tp=4), and on a quarter of lm_head's vocabulary.
     topology = _topology(mapping)
 
     # Speculative decoding changes the step's structure (a verify step, a draft loop, the
@@ -216,6 +223,10 @@ def route(
             from .nemotron4_nano_preview__sm_103__dep4.modeling import ModelingV2Nemotron4NanoPreviewSm103Dep4
 
             return ModelingV2Nemotron4NanoPreviewSm103Dep4
+        if topology == "tp4":
+            from .nemotron4_nano_preview__sm_103__tp4.modeling import ModelingV2Nemotron4NanoPreviewSm103Tp4
+
+            return ModelingV2Nemotron4NanoPreviewSm103Tp4
         # isort: on
         # fmt: on
 
@@ -236,8 +247,9 @@ def route(
         + (f"differs: {', '.join(differs)}" if differs else "matches nemotron4-nano-preview")
         + f", {topology or 'parallel layout'} ({_parallel_layout(mapping)}), "
         f"speculative decoding {speculation}{not_implemented}; the nemotron4 targets are "
-        "nemotron4-nano-preview's text model on sm103 at tp1 (one rank, no attention DP) "
-        "and dep4 (4 ranks, attention DP, the routed experts split four ways and nothing "
-        "else divided), each with one-model MTP-Eagle on the checkpoint's MTP layer or "
-        "without speculative decoding"
+        "nemotron4-nano-preview's text model on sm103 at tp1 (one rank, no attention DP), "
+        "dep4 (4 ranks, attention DP, the routed experts split four ways and nothing else "
+        "divided) and tp4 (4 ranks, no attention DP, the mixers' heads and every MLP's and "
+        "routed expert's intermediate width split four ways), each with one-model MTP-Eagle "
+        "on the checkpoint's MTP layer or without speculative decoding"
     )
