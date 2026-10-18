@@ -30,8 +30,8 @@ class FlashinferRmsnorm(OpWrapper):
     # The widths the shipped targets normalize over. gpt-oss reaches this op
     # only on its residual stream; deepseek reaches it there and on the two
     # lora ranks its MLA projects through, which is why the narrow cells are
-    # here at all -- a 512-wide row is one 128-bit vector per lane and takes a
-    # different path through the kernel than a 7168-wide one.
+    # here at all -- the kernel spreads a 512-wide row over fewer threads than
+    # a 7168-wide one.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode-shaped, gpt-oss-120b hidden 2880",
@@ -53,6 +53,49 @@ class FlashinferRmsnorm(OpWrapper):
             why="deepseek kv_lora rank 512, the narrowest row any target asks for",
             spec=dict(shape=(16, 512), dtype=torch.bfloat16, eps=1e-6),
         ),
+        # nemotron4 reaches this op at two widths. 3072 is its MTP layer's norms
+        # (`enorm`, `hnorm`, `final_layernorm` and the block's two input norms);
+        # the main stack's 3072-wide norms are fused into its residual reads
+        # instead. The MTP layer runs over every token the draft step is handed:
+        # one per request at depth 2, three per request (the verified tokens) at
+        # depth 1, and every context token of a prefill chunk. 768 is the latent
+        # MoE's `fc2_norm`, run on every token of every MoE block.
+        Cell(
+            why="nemotron4 3072, decode: one MTP draft token",
+            spec=dict(shape=(1, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 3072 x1024: MTP depth 2 at the largest CUDA-graph batch",
+            spec=dict(shape=(1024, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 3072 x3072: MTP depth 1, 1024 requests x 3 verified tokens",
+            spec=dict(shape=(3072, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 3072 x8192: MTP layer over an 8192-token prefill chunk",
+            spec=dict(shape=(8192, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 3072 x16384: MTP layer over the 16384-token prefill budget",
+            spec=dict(shape=(16384, 3072), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 768, decode: latent-MoE fc2_norm on one token",
+            spec=dict(shape=(1, 768), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 768 x1024: fc2_norm at the largest CUDA-graph batch",
+            spec=dict(shape=(1024, 768), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 768 x8192: fc2_norm over an 8192-token prefill chunk",
+            spec=dict(shape=(8192, 768), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron4 768 x16384: fc2_norm over the 16384-token prefill budget",
+            spec=dict(shape=(16384, 768), dtype=torch.bfloat16, eps=1e-5),
+        ),
     )
 
     note = """
@@ -71,6 +114,17 @@ class FlashinferRmsnorm(OpWrapper):
     rejects it below. The CUDA-JIT path
     (`FLASHINFER_USE_CUDA_NORM=1`) does raise, but this entry does not
     certify that path.
+
+    This op rounds once. The HF RMSNorms (`Nemotron4RMSNorm`, `LlamaRMSNorm`)
+    round the normalized value to the input dtype before scaling by the
+    weight, `weight * normed.to(input_dtype)`. The two land on the same or a
+    neighbouring bf16 value and differ on about a quarter of the outputs
+    (`test_two_rounding_order_is_one_ulp_away`); a target that has to match
+    HF's order bit for bit needs a kernel of its own.
+
+    A row's result does not depend on how many rows share the call
+    (`test_a_row_does_not_depend_on_its_batch`), so CUDA-graph padding and
+    speculative verify leave every real row's bits alone.
     """
 
     def __call__(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:

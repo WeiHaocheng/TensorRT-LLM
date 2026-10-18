@@ -164,8 +164,25 @@ exercised:
    page. Wrong batch states (the flag left off, context_lengths carrying the
    full KV length or 0, a replaced in-window cached page) are gated far
    outside the tolerance band.
+10. Single-KV-head GQA at head 256 with no positional encoding, the
+   nemotron4-nano-preview geometry (16q/1kv d256, q_scaling 1, bf16 pool of
+   32-token pages, histories up to 9344), as cells of stated batches on the
+   paged-context path that an engine with chunked prefill takes for every
+   step: an 8192-token prefill, a 2048-token chunk on 6144 cached tokens,
+   mixed steps, decode at B = 1, 64 and 1024, and MTP verify steps (3 query
+   tokens per request, linear spec-dec off as sm_103 runs it) at B = 1, 64
+   and 512, alone and beside contexts. Histories are written into scattered
+   pages; each call's appends are checked bitwise, its kernels must be
+   trtllm-gen's and never MMHA, and its writes must stay inside the workspace
+   it sized (a canary past the end). A one-hot readout pins a verify step's
+   rows causal within their own group across small and large batches and
+   short and long histories. Past 32 q heads per KV head, or on pages under 8
+   tokens, generation falls back to MMHA, which computes multi-token rows
+   wrongly without raising (NaNs, or values ~700 ulp off); `is_valid` refuses
+   them.
 """
 
+import contextlib
 import math
 import zlib
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -173,6 +190,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.profiler import ProfilerActivity, profile
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     MLA_CONTEXT,
@@ -188,9 +206,10 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 __extra_import_path__ = [".."]
-from _validating import (  # noqa: E402 — needs the path declared above
+from _validating import (  # noqa: E402,F401 — needs the path declared above; fixture by name
     ULP,
     assert_within_ulp,
+    certifying,
     validating,
 )
 
@@ -392,6 +411,8 @@ class _PagedAttnEnv:
         ctx_lens_override: Optional[List[int]] = None,
         max_seq_len_override: Optional[int] = None,
         use_paged_context_fmha: bool = False,
+        validate: bool = True,
+        output_pad_rows: int = 0,
     ) -> torch.Tensor:
         """One thop_attention call over explicitly constructed batch state.
 
@@ -404,7 +425,11 @@ class _PagedAttnEnv:
         path, where a context row's context_lengths is this call's new-token
         count rather than the registered prompt length.
         use_paged_context_fmha=True selects the paged-context execution path
-        (see the paged-context section).
+        (see the paged-context section). validate=False makes the call without
+        the entry's guard, to show what the op does with an input it refuses.
+        output_pad_rows allocates that many rows past this call's tokens, for
+        wrong batch states that make the op write more rows than it was given;
+        the returned output is this call's rows only.
         """
         ns = len(request_ids)
         kv_lens = []  # cached + new, per sequence
@@ -417,9 +442,9 @@ class _PagedAttnEnv:
             ctx_lens.append(self.prompt_lens[rid])
             # K page offset of page p is 2*p, V is 2*p + 1 (single-layer pool).
             row = self.block_offsets[0, len(kv_lens) - 1]
-            for j, p in enumerate(self.pages[rid]):
-                row[0, j] = 2 * p
-                row[1, j] = 2 * p + 1
+            pages = torch.tensor(self.pages[rid], dtype=torch.int32)
+            row[0, : len(pages)] = 2 * pages
+            row[1, : len(pages)] = 2 * pages + 1
         if seq_lens_override is not None:
             kv_lens = list(seq_lens_override)
         if ctx_lens_override is not None:
@@ -432,12 +457,12 @@ class _PagedAttnEnv:
 
         num_tokens = sum(seq_lens)
         output = torch.empty(
-            num_tokens,
+            num_tokens + output_pad_rows,
             self.num_heads * self.head_dim,
             dtype=qkv.dtype,
             device=qkv.device,
         )
-        with validating(op):
+        with validating(op) if validate else contextlib.nullcontext():
             op(
                 q=qkv,
                 k=None,  # packed QKV rides inside q
@@ -541,7 +566,7 @@ class _PagedAttnEnv:
                     rows[:, q_w + kv_w :].view(sl, self.num_kv_heads, self.head_dim)
                 )
                 start += sl
-        return output
+        return output[:num_tokens]
 
     def reference(
         self,
@@ -1216,12 +1241,12 @@ def _sink_env(**kwargs) -> _PagedAttnEnv:
     return _PagedAttnEnv(num_heads=SINK_HQ, num_kv_heads=SINK_HKV, head_dim=SINK_D, **kwargs)
 
 
-def _sinks(low: float, high: float, seed: int) -> torch.Tensor:
+def _sinks(low: float, high: float, seed: int, num_heads: int = SINK_HQ) -> torch.Tensor:
     """One fp32 sink logit per q head, spread over [low, high] so every head
     carries a different value (a kernel indexing sinks by kv head, or by a
     shifted head index, cannot match the reference)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    return torch.empty(SINK_HQ, dtype=torch.float32, device="cuda").uniform_(
+    return torch.empty(num_heads, dtype=torch.float32, device="cuda").uniform_(
         low, high, generator=gen
     )
 
@@ -2393,7 +2418,16 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
             ctx_lens_override=[cached],
             use_paged_context_fmha=True,
         )
-        return env, env.random_qkv(new)
+        # The wrong states of (3) and (4) make the kernel read q/k/v rows up to
+        # the KV length (84) from this call's 20, and (4) write that many output
+        # rows. The new rows therefore sit at the head of a buffer padded to the
+        # KV length with a loud decoy, and those calls get as many output rows
+        # of slack, which keeps every access inside owned memory: unpadded, the
+        # read faulted whenever the allocation happened to end at the buffer.
+        rows = env.random_qkv(new)
+        padded = torch.full((cached + new, rows.shape[1]), 7.0, dtype=rows.dtype, device="cuda")
+        padded[:new] = rows
+        return env, padded[:new]
 
     # The baseline is the correct answer, gated against fp32 here so every
     # separation below is measured against a result that is known right.
@@ -2421,6 +2455,7 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
             record=False,
             ctx_lens_override=[new],
             use_paged_context_fmha=False,
+            output_pad_rows=cached,
         ),
         base,
         "cached-prefix context at use_paged_context_fmha=False",
@@ -2437,6 +2472,7 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
                 record=False,
                 ctx_lens_override=[ctx_len],
                 use_paged_context_fmha=True,
+                output_pad_rows=cached,
             ),
             base,
             f"context_lengths={ctx_len}",
@@ -5306,11 +5342,289 @@ def test_mla_rejects_null_q_lora_rank() -> None:
         raise AssertionError("q_lora_rank=None was accepted on the MLA path")
 
 
+# ─── Single-KV-head GQA at head 256, NoPE: the nemotron4 geometry ───────
+#
+# The geometry's cells are in the entry's list and run through `_cell_batch`
+# below: a stated batch of context and generation rows over cached histories
+# up to max_seq_len, one call on the paged-context path, gated against
+# `op.reference`. What a cell cannot show is pinned here: that the rows of a
+# verify step are causal within their own group on every kernel the op picks
+# for them, and what the op does when a multi-token generation row reaches
+# MMHA instead of those kernels.
+
+#: The geometry the entry certifies for nemotron4, read off its own cells.
+N4 = next(c.spec for c in op.CELLS if c.why.startswith("nemotron4"))
+N4_HQ, N4_HKV, N4_D = N4["num_heads"], N4["num_kv_heads"], N4["head_size"]
+
+#: How far a rival hypothesis has to sit outside a cell's gate, in element ulp
+#: against the row scale (`_compare` admits 8). Measured: the dense-mask rival
+#: of a verify batch with histories of 1-40 tokens sits 324-454 ulp from the
+#: output, while a batch whose one short row was drawn from 1-64 tokens left
+#: it 27.7 ulp away.
+RIVAL_MIN_ELEMENT_ULP = 64.0
+
+#: A workspace view on canary-filled storage this large; the largest size the op
+#: asked for here was 233 MB (decode at B=1024).
+WORKSPACE_CANARY_BYTES = 1 << 30
+_CANARY = 0x5A
+
+
+def _launched(fn):
+    """Run fn under the CUDA profiler: (its result, the kernels it launched)."""
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        result = fn()
+        torch.cuda.synchronize()
+    kernels = sorted(
+        {
+            e.key
+            for e in prof.key_averages()
+            if e.device_type == torch.autograd.DeviceType.CUDA
+            and not e.key.startswith(("Memcpy", "Memset"))
+        }
+    )
+    return result, kernels
+
+
+def _assert_trtllm_gen(kernels: List[str], contexts: bool, generations: bool) -> None:
+    """The phases a call ran were served by trtllm-gen FMHA kernels, not MMHA."""
+    assert not any("masked_multihead_attention" in k for k in kernels), (
+        f"MMHA served this call: {kernels}"
+    )
+    fmha = [k for k in kernels if k.startswith("fmhaSm")]
+    if contexts:
+        assert any(k.endswith("Context") for k in fmha), (
+            f"no trtllm-gen context kernel ran: {kernels}"
+        )
+    if generations:
+        assert any(k.endswith("ForGen") for k in fmha), (
+            f"no trtllm-gen generation kernel ran: {kernels}"
+        )
+
+
+def _pool(rows: List[Tuple[int, int, int]], spec, **overrides) -> _PagedAttnEnv:
+    """A pool for these (cached, new, prompt_len) rows on the geometry, page
+    size and max_seq_len a cell spec states; overrides replace any of them."""
+    tpb = overrides.pop("tokens_per_block", spec["tokens_per_block"])
+    geometry = dict(
+        num_heads=spec["num_heads"], num_kv_heads=spec["num_kv_heads"], head_dim=spec["head_size"]
+    )
+    geometry.update(overrides)
+    return _PagedAttnEnv(
+        **geometry,
+        tokens_per_block=tpb,
+        num_blocks=sum(-(-c // tpb) + -(-n // tpb) + 1 for c, n, _ in rows),
+        max_batch=len(rows),
+        max_blocks_per_seq=spec["max_seq_len"] // tpb,
+    )
+
+
+def _seed_histories(
+    env: _PagedAttnEnv,
+    rows: List[Tuple[int, int, int]],
+    gen: torch.Generator,
+    zero_v: bool = False,
+) -> None:
+    """Register one request per (cached, new, prompt_len) row and write its
+    cached history straight into the pool, recorded as that request's history.
+
+    Pages come from a random permutation of the pool, so a request's pages
+    are scattered rather than consecutive and the block-offset table is what
+    finds them. zero_v=True writes V = 0, for the readouts that need the
+    history to contribute nothing to the output.
+    """
+    tpb, hkv, d = env.tokens_per_block, env.num_kv_heads, env.head_dim
+    need = [-(-cached // tpb) for cached, _, _ in rows]
+    order = torch.randperm(sum(need), generator=gen).tolist()
+    env._next_free_page = sum(need)
+    taken = 0
+    for rid, ((cached, _, prompt_len), n_pages) in enumerate(zip(rows, need)):
+        env.add_request(rid, prompt_len)
+        env.pages[rid] = order[taken : taken + n_pages]
+        taken += n_pages
+        if cached == 0:
+            continue
+        k = torch.randn(cached, hkv, d, dtype=torch.bfloat16, device="cuda")
+        v = torch.zeros_like(k) if zero_v else torch.randn_like(k)
+        slots = torch.tensor(env.pages[rid], device="cuda")
+        pad = n_pages * tpb - cached
+        for half, rows_kv in ((0, k), (1, v)):
+            paged = torch.cat([rows_kv, rows_kv.new_zeros(pad, hkv, d)])
+            env.kv_cache[slots, half] = paged.view(n_pages, tpb, hkv, d).transpose(1, 2)
+        env.k_history[rid].append(k)
+        env.v_history[rid].append(v)
+
+
+def _batch_rows(spec, gen: torch.Generator) -> List[Tuple[int, int, int]]:
+    """(cached, new, prompt_len) per request: the spec's context rows, then its
+    generation rows. One generation row sits at the longest history
+    max_seq_len admits; an eighth of the others at short histories of at most
+    8 tokens, where the keys a verify row's own siblings add are a large share
+    of its attention (see RIVAL_MIN_ELEMENT_ULP); the rest spread uniformly in
+    between."""
+    rows = [(cached, new, cached + new) for cached, new in spec["contexts"]]
+    batch, step = spec["generations"], spec["gen_tokens"]
+    if batch == 0:
+        return rows
+    top = spec["max_seq_len"] - step
+    n_short = max(1, batch // 8) if batch > 1 else 0
+    short = torch.randint(1, 9, (n_short,), generator=gen).tolist()
+    spread = torch.randint(9, top + 1, (batch - 1 - n_short,), generator=gen).tolist()
+    return rows + [(h, step, min(h, 8192)) for h in [top] + short + spread]
+
+
+def _profiled_paged_call(env, qkv, seq_lens, num_contexts, request_ids):
+    """One `_paged_ctx_call`: (output, the kernels it launched, the number of
+    bytes the op wrote past the workspace it sized).
+
+    The workspace is a view on canary-filled storage larger than anything the
+    op asks for, so the op's in-place resize stays inside that storage; a byte
+    past the size it computed that no longer holds the canary is one it wrote
+    outside its own allocation."""
+    canary = torch.full((WORKSPACE_CANARY_BYTES,), _CANARY, dtype=torch.int8, device="cuda")
+    env.workspace = torch.empty(0, dtype=torch.int8, device="cuda").set_(
+        canary.untyped_storage(), 0, (0,)
+    )
+    out, kernels = _launched(lambda: _paged_ctx_call(env, qkv, seq_lens, num_contexts, request_ids))
+    sized = env.workspace.numel()
+    assert 0 < sized < WORKSPACE_CANARY_BYTES, f"the op sized {sized} bytes of workspace"
+    touched = (canary[sized:] != _CANARY).nonzero()
+    overrun = 0 if touched.numel() == 0 else int(touched.max().item()) + 1
+    return out, kernels, overrun
+
+
+def _assert_appended(env: _PagedAttnEnv, request_id: int, start: int, count: int) -> None:
+    """Rows [start, start + count) of a request -- this call's appends -- must
+    sit in its pages bitwise."""
+    tpb = env.tokens_per_block
+    pos = torch.arange(start, start + count)
+    pages = torch.tensor(env.pages[request_id])[pos // tpb].cuda()
+    slots = (pos % tpb).cuda()
+    for half, history in ((0, env.k_history), (1, env.v_history)):
+        got = env.kv_cache[pages, half, :, slots, :]
+        want = torch.cat(history[request_id])[start : start + count]
+        assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+            f"{'KV'[half]} append mismatch: request {request_id}, rows {start}..{start + count}"
+        )
+
+
+def _element_ulp(out: torch.Tensor, ref: torch.Tensor) -> float:
+    """Largest |out - ref| against its row's scale, in bf16 ulp."""
+    o = out.float().reshape(-1, out.shape[-1])
+    r = ref.float().reshape(-1, ref.shape[-1])
+    scale = r.abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
+    return ((o - r).abs() / scale).max().item() / ULP[torch.bfloat16]
+
+
+@pytest.mark.parametrize(
+    "batch, histories",
+    [
+        (1, (1,)),
+        (1, (N4["max_seq_len"] - 3,)),
+        (6, (1, 30, 1000, N4["max_seq_len"] - 3)),
+        (64, (1, 5, 13)),
+        (64, (N4["max_seq_len"] - 3,)),
+        (512, (1, 30, 1000, N4["max_seq_len"] - 3)),
+    ],
+    ids=["b1-short", "b1-longest", "b6-mixed", "b64-short", "b64-longest", "b512-mixed"],
+)
+def test_nemotron4_verify_rows_are_causal_within_their_group(batch, histories) -> None:
+    """Read a 3-token verify step's attention weights out of its output.
+
+    The cached histories carry V = 0 and the step's three tokens carry one-hot
+    V rows (dims 0, 1, 2), so output row t of a request, in every head, is the
+    weight that row put on each token of its own group. Causal within the
+    group: row t reads exactly zero at dims t+1.. and a positive weight at
+    0..t. The kernel the op picks changes with batch and history -- SwapsAb at
+    small batches, named with a dense mask because causality inside the group
+    is a separate compiled option, GroupedKeepsAb with a causal mask at larger
+    ones -- and the parameters span both. A cell alone is a weak witness at
+    long histories: at a 9341-token history the dense-mask rival sits 16
+    element ulp from the output, two gate-widths, where short histories put it
+    hundreds away.
+    """
+    step = 3
+    gen = torch.Generator().manual_seed(batch)
+    torch.manual_seed(batch)
+    rows = [(histories[i % len(histories)], step, 1) for i in range(batch)]
+    env = _pool(rows, N4)
+    _seed_histories(env, rows, gen, zero_v=True)
+    qkv = env.random_qkv(batch * step)
+    v_col = (N4_HQ + N4_HKV) * N4_D
+    qkv[:, v_col:] = 0
+    qkv[torch.arange(batch * step), v_col + torch.arange(step).repeat(batch)] = 1.0
+    out, kernels, overrun = _profiled_paged_call(env, qkv, [step] * batch, 0, list(range(batch)))
+    assert overrun == 0, f"the op wrote {overrun} bytes past the workspace it sized"
+    _assert_trtllm_gen(kernels, contexts=False, generations=True)
+
+    weights = out.float().view(batch, step, N4_HQ, N4_D)
+    for row in range(step):
+        assert (weights[:, row, :, row + 1 : step] == 0).all(), (
+            f"verify row {row} attends to a later token of its own group ({kernels})"
+        )
+        assert (weights[:, row, :, : row + 1] > 0).all(), (
+            f"verify row {row} does not attend to itself and the tokens before it ({kernels})"
+        )
+    assert (weights[..., step:] == 0).all(), "the zero-V history reached the output"
+
+
+@pytest.mark.parametrize(
+    "num_heads, num_kv_heads, head_dim, tokens_per_block",
+    [(64, 1, 128, 32), (16, 1, 256, 4)],
+    ids=["64-q-heads-per-kv-head", "4-token-pages"],
+)
+def test_guard_refuses_multi_token_generation_rows_mmha_would_serve(
+    num_heads, num_kv_heads, head_dim, tokens_per_block
+) -> None:
+    """The hazard `is_valid` exists for: past 32 q heads per KV head, or on
+    pages under 8 tokens, XqaDispatcher hands generation to MMHA, which runs
+    3-token rows anyway and answers wrongly without raising -- NaNs at
+    64q/1kv d128, finite values ~700 ulp off at 4-token pages. One token per
+    row on the same path is right: the control that the hazard is the row
+    count, not the geometry."""
+    torch.manual_seed(5)
+    gen = torch.Generator().manual_seed(5)
+    rows = [(5, 4, 5), (9, 4, 9)]
+    env = _pool(
+        rows,
+        N4,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+    )
+    _seed_histories(env, rows, gen)
+
+    cached = [env.cached_len(rid) for rid in (0, 1)]
+    qkv = env.random_qkv(2)
+    one, kernels = _launched(lambda: env.call_op(qkv, [1, 1], 0, [0, 1], MASK_CAUSAL))
+    assert any("masked_multihead_attention" in k for k in kernels), (
+        f"MMHA no longer serves {num_heads}q/{num_kv_heads}kv generation at "
+        f"tokens_per_block {tokens_per_block}: {kernels}"
+    )
+    torch.testing.assert_close(
+        one, env.reference(qkv, [1, 1], [0, 1], cached, MASK_CAUSAL), rtol=RTOL, atol=ATOL
+    )
+
+    qkv = env.random_qkv(6)
+    with pytest.raises(AssertionError, match="fall back to MMHA"):
+        env.call_op(qkv, [3, 3], 0, [0, 1], MASK_CAUSAL, record=False)
+    cached = [env.cached_len(rid) for rid in (0, 1)]
+    three = env.call_op(qkv, [3, 3], 0, [0, 1], MASK_CAUSAL, validate=False)
+    correct = env.reference(qkv, [3, 3], [0, 1], cached, MASK_CAUSAL)
+    assert not bool(torch.isfinite(three).all()) or _element_ulp(three, correct) > 64.0, (
+        "the hazard this guard covers is gone: MMHA now answers 3-token generation rows"
+    )
+
+
 # ─── The entry's own cell list ──────────────────────────────────────────
 
 
 def _cell_standard(cell) -> None:
-    """A gpt-oss cell: GQA with sinks, with or without a sliding window.
+    """A standard-path cell, on the geometry its spec states.
+
+    A cell that states its batch (`contexts`, `generations`) runs through
+    `_cell_batch`. The others are one context: gpt-oss's, GQA with sinks, with
+    or without a sliding window.
 
     Driven against `op.reference` rather than this file's `_sink_reference`,
     which is the point of the cell list: the entry states what the op computes
@@ -5319,15 +5633,27 @@ def _cell_standard(cell) -> None:
     failure from a kernel that moved.
     """
     spec = cell.spec
+    if "contexts" in spec:
+        _cell_batch(cell)
+        return
     torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     window = spec["window"]
+    geometry = dict(
+        num_heads=spec["num_heads"], num_kv_heads=spec["num_kv_heads"], head_dim=spec["head_size"]
+    )
     env = (
-        _sink_env(attention_window_size=window, num_blocks=96, max_blocks_per_seq=16)
+        _PagedAttnEnv(
+            **geometry, attention_window_size=window, num_blocks=96, max_blocks_per_seq=16
+        )
         if window
-        else _sink_env()
+        else _PagedAttnEnv(**geometry)
     )
     n_tokens = 200 if window else 48
-    sink = _sinks(-2.0, 4.0, seed=zlib.crc32(cell.why.encode()) % 1000)
+    sink = (
+        _sinks(-2.0, 4.0, seed=zlib.crc32(cell.why.encode()) % 1000, num_heads=spec["num_heads"])
+        if spec["sinks"]
+        else None
+    )
     env.add_request(0, n_tokens)
     qkv = env.random_qkv(n_tokens)
     out = _paged_ctx_call(env, qkv, [n_tokens], 1, [0], attention_sinks=sink)
@@ -5360,6 +5686,67 @@ def _cell_standard(cell) -> None:
         msg=lambda m: f"op.reference disagrees with _sink_reference\n{m}",
     )
     _compare(out, ref)
+
+
+def _cell_batch(cell) -> None:
+    """A cell that states its batch: context rows of (cached, new) tokens, then
+    generation rows of `gen_tokens` each over histories drawn by `_batch_rows`.
+
+    Cached histories are written into scattered pages first; then one call on
+    the paged-context path, which an engine running chunked prefill takes for
+    every step, decode and verify included. Gated against `op.reference` over
+    each request's whole history; this call's appends are checked bitwise; the
+    phases it ran must have been served by trtllm-gen kernels; and no byte past
+    the workspace the op sized may have been written. A verify batch with
+    short histories also has to sit far from the dense-mask rival, which is
+    what shows the gate can see the mask inside a verify group at all.
+    """
+    spec = cell.spec
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    torch.manual_seed(seed)
+    gen = torch.Generator().manual_seed(seed)
+    rows = _batch_rows(spec, gen)
+    hq, hkv, dim = spec["num_heads"], spec["num_kv_heads"], spec["head_size"]
+    env = _pool(rows, spec)
+    _seed_histories(env, rows, gen)
+    num_contexts = len(spec["contexts"])
+    seq_lens = [new for _, new, _ in rows]
+    kv_lens = [cached + new for cached, new, _ in rows]
+    qkv = env.random_qkv(sum(seq_lens))
+
+    request_ids = list(range(len(rows)))
+    out, kernels, overrun = _profiled_paged_call(env, qkv, seq_lens, num_contexts, request_ids)
+    assert overrun == 0, f"the op wrote {overrun} bytes past the workspace it sized"
+    _assert_trtllm_gen(kernels, contexts=num_contexts > 0, generations=spec["generations"] > 0)
+    for rid, (cached, new, _) in enumerate(rows):
+        _assert_appended(env, rid, cached, new)
+
+    k = torch.cat([part for rid in request_ids for part in env.k_history[rid]])
+    v = torch.cat([part for rid in request_ids for part in env.v_history[rid]])
+    args = (
+        qkv[:, : hq * dim],
+        k.reshape(-1, hkv * dim),
+        v.reshape(-1, hkv * dim),
+        seq_lens,
+        kv_lens,
+    )
+    geometry = dict(
+        num_heads=hq,
+        num_kv_heads=hkv,
+        qk_head_dim=dim,
+        v_head_dim=spec["v_head_dim"],
+        softmax_scale=1.0 / math.sqrt(dim),
+    )
+    _compare(out, op.reference(*args, **geometry, causal=True))
+
+    if spec["gen_tokens"] > 1 and spec["generations"] > 1:
+        gen_rows = slice(sum(seq_lens[:num_contexts]), None)
+        dense = op.reference(*args, **geometry, causal=False)
+        separation = _element_ulp(out[gen_rows], dense[gen_rows])
+        assert separation > RIVAL_MIN_ELEMENT_ULP, (
+            f"the dense-mask rival is only {separation:.1f} ulp from the verify rows: "
+            "this batch cannot tell a causal group from a dense one"
+        )
 
 
 def _cell_mla_context(cell) -> None:
@@ -5412,8 +5799,11 @@ def _cell_mla_context(cell) -> None:
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell) -> None:
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     """Drive every configuration the entry claims.
+
+    A cell compared against `reference` is armed with `certifying`, so it fails
+    unless the op call and the entry's own `reference` both ran.
 
     The MLA generation cell is driven by the tests above rather than here: its
     output lives in latent space, reconstructed from the paged cache, and the
@@ -5424,8 +5814,10 @@ def test_certified_cells(cell) -> None:
     """
     kind = cell.spec["input_type"]
     if kind == STANDARD:
+        certifying(op)
         _cell_standard(cell)
     elif kind == MLA_CONTEXT:
+        certifying(op)
         _cell_mla_context(cell)
     else:
         with validating(op):
