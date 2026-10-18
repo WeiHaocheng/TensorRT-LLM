@@ -81,10 +81,10 @@ def run(entry: str) -> None:
 
     # Read the budget off the entry rather than restating it: an entry that
     # raises its own deadline would otherwise be killed by this one first,
-    # and the message a reader needs ("wedged") would be lost. reducescatter
-    # runs a second, separately capped job after the main one.
+    # and the message a reader needs ("wedged") would be lost. A launcher that
+    # runs an MPI-session job after its main one caps that job separately.
     constants = _load_launcher_constants(launcher)
-    timeout = constants.DEADLINE_S + getattr(constants, "WEDGE_CAP_S", 0) + _LAUNCHER_GRACE_S
+    timeout = constants.DEADLINE_S + getattr(constants, "MPI_DEADLINE_S", 0) + _LAUNCHER_GRACE_S
 
     completed = subprocess.run(
         [sys.executable, str(launcher)],
