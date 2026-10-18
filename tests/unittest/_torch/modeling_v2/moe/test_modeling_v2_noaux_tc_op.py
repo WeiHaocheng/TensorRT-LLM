@@ -7,12 +7,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.ops.moe.noaux_tc_op import (  # noqa: E501
-    noaux_tc_op as op,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op as op
 
-__extra_import_path__ = ["../../../.."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+__extra_import_path__ = [".."]
+from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "noaux_tc_op requires a CUDA device"
 
@@ -21,23 +19,63 @@ def _build(spec, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     logits = torch.randn(
         spec["tokens"], spec["experts"], generator=g, device="cuda", dtype=torch.float32
-    ).to(torch.bfloat16)
+    ).to(spec["logits_dtype"])
     bias = torch.randn(spec["experts"], generator=g, device="cuda", dtype=torch.float32)
+    bias = bias * spec["bias_std"]
     return logits, bias, spec["n_group"], spec["topk_group"], spec["topk"], spec["scale"]
 
 
+def _cell_args(cell):
+    return _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell) -> None:
-    args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
-    with validating(op):
-        weights, ids = op(*args)
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
+    certifying(op)
+    args = _cell_args(cell)
+    weights, ids = op(*args)
     ref_weights, ref_ids = op.reference(*args)
 
     # Ids are an exact claim: routing either picks the same experts or it does
     # not, and a near-miss here is a different set of experts, not a rounding.
     assert torch.equal(ids, ref_ids), "selected experts differ from the reference"
     assert ids.dtype is torch.int32
-    torch.testing.assert_close(weights, ref_weights)
+    # So are the weights, and the band is zero by construction: `reference`
+    # repeats every rounding the kernel makes -- the tanh-form sigmoid, the
+    # fp32 bias add, the fp32 warp-order sum, the fp64 scale-and-divide, one
+    # rounding to the logits' dtype -- so any difference is a change in the
+    # kernel's arithmetic. Measured on every cell: none.
+    assert weights.dtype is args[0].dtype
+    assert torch.equal(weights, ref_weights), "combine weights differ from the reference"
+
+
+def test_the_fp32_cells_see_the_renormalization() -> None:
+    """The fp64 scale-and-divide shows only in fp32 weights; hold that it does.
+
+    An all-fp32 renormalization moves bf16 weights almost never, so the
+    exactness above would hold it to fp64 only through the fp32 cells -- and
+    only if they can see the difference. This drives the rival on nemotron4's
+    prefill cell: it has to miss the op's weights where `reference` meets them
+    (measured: about a third of the elements, by 1-2 ulp).
+    """
+    cell = next(c for c in op.CELLS if c.spec["experts"] == 512 and c.spec["tokens"] == 8192)
+    logits, bias, n_group, topk_group, topk, scale = _cell_args(cell)
+    weights, ids = op(logits, bias, n_group, topk_group, topk, scale)
+    picked = torch.gather(0.5 * torch.tanh(0.5 * logits) + 0.5, 1, ids.long())
+    rival = picked / (picked.sum(-1, keepdim=True) + 1e-20) * scale
+    missed = (rival != weights).float().mean().item()
+    assert missed > 0.1, f"an all-fp32 renormalization reproduced {1 - missed:.1%} of the weights"
+
+
+def test_topk_group_is_not_read_with_one_group() -> None:
+    """The note's claim about the single-group kernel, held: nemotron4 passes
+    `topk_group=1`, and any other value routes identically."""
+    cell = next(c for c in op.CELLS if c.spec["experts"] == 512 and c.spec["tokens"] == 37)
+    logits, bias, n_group, _, topk, scale = _cell_args(cell)
+    want_weights, want_ids = op(logits, bias, n_group, 1, topk, scale)
+    for topk_group in (0, 4, 32):
+        weights, ids = op(logits, bias, n_group, topk_group, topk, scale)
+        assert torch.equal(ids, want_ids) and torch.equal(weights, want_weights), topk_group
 
 
 def test_the_sigmoid_is_the_tanh_form() -> None:
