@@ -1819,6 +1819,87 @@ def test_mtp_moe_backend_allowed_for_internal_mtp_eagle() -> None:
     assert spec_config.moe_backend == "CUTLASS"
 
 
+def _repeated_mtp_layer_config(num_nextn_predict_layers=2, mtp_use_repeated_layer=True):
+    """A checkpoint config that predicts ``num_nextn_predict_layers`` depths with
+    one trained MTP layer repeated for each (``mtp_use_repeated_layer``), as
+    nemotron4-nano-preview's text config declares it."""
+    return SimpleNamespace(
+        architectures=["Nemotron4ForConditionalGeneration"],
+        num_nextn_predict_layers=num_nextn_predict_layers,
+        mtp_use_repeated_layer=mtp_use_repeated_layer,
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_draft_len", "resolved_draft_len"),
+    [(2, 2), (3, 3), (None, 1)],
+    ids=["trained_depth", "longer", "default"],
+)
+def test_mtp_repeated_layer_resolves_mtp_eagle_with_one_layer(max_draft_len, resolved_draft_len):
+    """Two depths declared, one layer stored: the checkpoint's MTP layer count
+    is one, so the mode is one-model MTP-Eagle with one draft KV layer, and an
+    explicit draft length is kept rather than clamped to the declared depths.
+    Without one, Eagle's default of a single draft token applies."""
+    spec_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+    model_config = _repeated_mtp_layer_config()
+
+    update_spec_config_from_model_config(spec_config, model_config)
+
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert spec_config.num_nextn_predict_layers == 1
+    assert get_num_spec_layers(spec_config) == 1
+    assert spec_config.max_draft_len == resolved_draft_len
+    assert spec_config.max_total_draft_tokens == resolved_draft_len
+    assert spec_config.tokens_per_gen_step == 1 + resolved_draft_len
+    # The published config keeps its depth count; only the layer count is read as one.
+    assert model_config.num_nextn_predict_layers == 2
+
+    # The model loader resolves the config before routing and the model engine
+    # again on the loaded model; the second pass changes nothing.
+    update_spec_config_from_model_config(spec_config, model_config)
+
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert spec_config.num_nextn_predict_layers == 1
+    assert spec_config.max_draft_len == resolved_draft_len
+
+
+def test_mtp_repeated_layer_under_use_mtp_vanilla_has_one_layer_to_run():
+    """``use_mtp_vanilla`` still forces vanilla MTP, which runs each stored layer
+    once: with one stored layer that is one draft token."""
+    spec_config = MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True)
+
+    update_spec_config_from_model_config(spec_config, _repeated_mtp_layer_config())
+
+    assert spec_config.spec_dec_mode.is_mtp_vanilla()
+    assert spec_config.num_nextn_predict_layers == 1
+    assert get_num_spec_layers(spec_config) == 1
+    assert spec_config.max_draft_len == 1
+
+
+@pytest.mark.parametrize(
+    ("num_nextn_predict_layers", "mtp_use_repeated_layer", "vanilla"),
+    [(2, False, True), (1, True, False)],
+    ids=["two_distinct_layers", "one_repeated_depth"],
+)
+def test_mtp_layer_count_is_the_declared_one_unless_a_layer_repeats(
+    num_nextn_predict_layers, mtp_use_repeated_layer, vanilla
+):
+    """The rule reads one layer only where depths share a layer: distinct
+    layers keep their count (vanilla MTP, one layer per draft token), and a
+    repeated layer serving a single depth already is one."""
+    spec_config = MTPDecodingConfig(max_draft_len=num_nextn_predict_layers)
+
+    update_spec_config_from_model_config(
+        spec_config,
+        _repeated_mtp_layer_config(num_nextn_predict_layers, mtp_use_repeated_layer),
+    )
+
+    assert spec_config.spec_dec_mode.is_mtp_vanilla() is vanilla
+    assert spec_config.num_nextn_predict_layers == num_nextn_predict_layers
+    assert get_num_spec_layers(spec_config) == num_nextn_predict_layers
+    assert spec_config.max_draft_len == num_nextn_predict_layers
+
+
 @pytest.mark.parametrize(
     ("architecture", "uses_shared_kv_cache"),
     [("Gemma4ForCausalLM", True), ("LlamaForCausalLM", False)],

@@ -873,6 +873,13 @@ def update_spec_config_from_model_config(spec_config,
                                                "mtp_num_hidden_layers", None)
         if num_nextn_predict_layers is None:
             num_nextn_predict_layers = 1
+        # `mtp_use_repeated_layer`: the checkpoint trains one MTP layer and
+        # repeats it for every predicted depth, so the depth count above is not
+        # its layer count. It stores that one layer, which the one-model
+        # MTP-Eagle loop replays once per draft token.
+        if (num_nextn_predict_layers > 1
+                and getattr(model_config, "mtp_use_repeated_layer", False)):
+            num_nextn_predict_layers = 1
     if (draft_nextn is None and num_nextn_predict_layers == 0
             and spec_config.uses_replacement_heads):
         # A target without embedded MTP does not declare the replacement's count.
