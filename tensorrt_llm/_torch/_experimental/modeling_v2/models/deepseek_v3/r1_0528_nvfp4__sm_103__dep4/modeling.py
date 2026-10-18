@@ -27,6 +27,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
     flashinfer_fused_add_rmsnorm,
 )
@@ -48,7 +49,6 @@ from .ops.attention.mla_rope_generation import mla_rope_generation
 from .ops.gemm.bmm_out import bmm_out
 from .ops.moe.fp4_block_scale_moe_runner import fp4_block_scale_moe_runner  # noqa: E501
 from .ops.moe.fused_moe import fused_moe
-from .ops.moe.noaux_tc_op import noaux_tc_op
 from .ops.quantization.fp4_quantize import fp4_quantize
 
 _CACHED_CTX_FIELDS = (

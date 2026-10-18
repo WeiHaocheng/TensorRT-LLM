@@ -10,9 +10,10 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as op
 
 __extra_import_path__ = [".."]
-from _validating import (  # noqa: E402 — needs the path declared above
+from _validating import (  # noqa: E402,F401 — needs the path declared above; fixture by name
     ULP,
     assert_within_ulp,
+    certifying,
     validating,
 )
 
@@ -20,25 +21,32 @@ assert torch.cuda.is_available(), "cublas_mm requires a CUDA device"
 
 
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
-    """One GEMM's worth of accumulation-order difference.
+    """One GEMM's worth of accumulation-order difference, in the output's own precision.
 
-    Kernel and reference consume bit-identical operands and differ only in
-    the order cuBLAS and torch sum over K. Over random operands a few
-    outputs land near zero, where that reordering shows up as a relative
-    difference of 10 on an absolute difference of 1.5e-4 -- which is what
-    torch's default band rejects, and what no bf16 result could represent
-    anyway: one ulp at these rows' scale is about 6e-1.
+    Kernel and reference consume bit-identical operands, and the product of
+    two bf16 values is exact in fp32, so the two differ only in how they sum
+    over K: cuBLAS's tensor-core fp32 accumulation against torch's IEEE fp32
+    one. Over random operands a few outputs land near zero, where any
+    reordering reads as a large relative difference, so both gates are scaled
+    by the row rather than by the element.
 
-    So: 4 ulp element-wise against the row scale, 2 ulp of relative RMS.
-    Measured worst case across this entry's cells is 1.5e-4 absolute, or
-    roughly 3e-4 ulp -- four orders of margin, and a band that a genuinely
-    wrong product would miss by orders rather than squeak past.
+    bf16 out: 4 ulp (2^-8) element-wise against the row scale, 2 of relative
+    RMS. The two fp32 sums agree to ~1e-6 relative, so what remains visible
+    is a rounding flip -- one bf16 spacing, at most 2 of these ulps at the top
+    binade of a row. Measured worst across the cells: 1.94 element (that
+    flip), 0.068 RMS. A wrong product misses by orders.
+
+    fp32 out (the routers and the lm_head): 1024 ulp (2^-23) element-wise,
+    512 of relative RMS. Here the fp32 sums are the output. Measured worst:
+    62 element and 28 RMS at k 3072 and 7168, with the kernel the less
+    accurate side (33-39 ulp from a float64 product, the reference within
+    21). A result rounded to bf16 and widened scores at least 16484 and 13819,
+    so this gate refuses it by 16x; a band in bf16 ulp would let it through.
     """
-    # Scored in bf16 ulp even when the output is fp32: every cell's
-    # operands are bf16, so the fp32 out_dtype the router asks for is a
-    # wider container for a bf16-limited product, not a more precise one.
-    # Against fp32's own ulp the same 2.4e-6 difference reads as 5x over.
-    assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0, ulp=ULP[torch.bfloat16])
+    if out.dtype is torch.float32:
+        assert_within_ulp(out, ref, element_ulp=1024.0, rms_ulp=512.0, ulp=ULP[torch.float32])
+    else:
+        assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0, ulp=ULP[torch.bfloat16])
 
 
 def _build(spec, seed):
@@ -60,13 +68,30 @@ def _build(spec, seed):
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell) -> None:
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
+    certifying(op)
     mat_a, mat_b, bias, out_dtype = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
-    with validating(op):
-        out = op(mat_a, mat_b, bias, out_dtype)
+    out = op(mat_a, mat_b, bias, out_dtype)
     assert out.shape == (mat_a.shape[0], mat_b.shape[1])
     assert out.dtype is (out_dtype or mat_a.dtype)
     _compare(out, op.reference(mat_a, mat_b, bias, out_dtype))
+
+
+def test_fp32_out_refuses_a_bf16_rounded_result() -> None:
+    """fp32 out has to carry fp32's precision, and the gate has to see it.
+
+    A product rounded to bf16 and widened is an fp32 tensor of the right shape
+    whose every value sits within half a bf16 ulp of the truth: inside any band
+    scored in bf16 ulp. The router and lm_head cells ask for fp32 out because
+    the checkpoint computes them in fp32, so the gate is in fp32 ulp, and this
+    is the control that it separates the two.
+    """
+    cell = next(c for c in op.CELLS if c.why.startswith("nemotron4 MoE router m=1024"))
+    mat_a, mat_b, bias, out_dtype = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
+    ref = op.reference(mat_a, mat_b, bias, out_dtype)
+    _compare(op(mat_a, mat_b, bias, out_dtype), ref)
+    with pytest.raises(AssertionError, match="not close"):
+        _compare(ref.to(torch.bfloat16).float(), ref)
 
 
 def _ok(dtype=torch.bfloat16):
