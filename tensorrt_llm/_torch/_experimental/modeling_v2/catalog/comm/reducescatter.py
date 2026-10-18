@@ -30,6 +30,31 @@ _SUMMABLE_DTYPES = frozenset(
     }
 )
 
+#: nemotron4-nano-preview's MoE combine: per-rank token counts its dep4 step reduces, as
+#: (busiest rank's slice, every rank's slice in rank order or None for an even split, what the
+#: height covers). They are the heights its all-gather is certified at, because one step's
+#: gather and reduce-scatter carry the same per-rank counts.
+_NEMOTRON4_COMBINE_SPLITS = (
+    (1, None, "decode, one token per rank"),
+    (32, None, "32 tokens per rank"),
+    (256, None, "256 tokens per rank"),
+    (1024, None, "1024 tokens per rank"),
+    (2048, None, "prefill chunk, 2048 tokens per rank"),
+    (32, [32, 17, 1, 5], "ragged decode, busiest rank 0"),
+    (256, [1, 256, 129, 33], "ragged at 256 tokens, busiest rank 1"),
+    (1024, [513, 65, 1024, 1], "ragged at 1024 tokens, busiest rank 2"),
+    (2048, [1, 3, 1, 2048], "mixed step, rank 3 prefills 2048 tokens"),
+)
+
+
+def _nemotron4_combine(
+    why: str, rows_per_rank: int, dtype: torch.dtype, sizes: Optional[List[int]] = None
+) -> Cell:
+    return Cell(
+        why=why,
+        spec=dict(rows_per_rank=rows_per_rank, trailing=(768,), dtype=dtype, sizes=sizes),
+    )
+
 
 class Reducescatter(OpWrapper):
     """Sum `input` across every rank in `group`, then keep this rank's slice.
@@ -43,9 +68,20 @@ class Reducescatter(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # deepseek-r1 at dep4 is the only caller and always passes `sizes=None`:
-    # it pads to a common height first. The row counts are the full heights an
-    # attention-DP step reduces, which is the rank count times a slice.
+    # A cell's `rows_per_rank` is its busiest rank's slice. `sizes` is None for
+    # an even split, or lists every rank's slice height in rank order (the ragged
+    # form, which the op serves by a different path); the input holds their sum.
+    #
+    # deepseek-r1 at dep4 pads to a common height first and always passes
+    # `sizes=None`. Its row counts are the full heights an attention-DP step
+    # reduces, which is the rank count times a slice.
+    #
+    # nemotron4-nano-preview at dep4 reduce-scatters each MoE block's partial
+    # expert sums. Every rank applies its 128-expert window to every rank's
+    # tokens in the 768-wide latent space, and each token's sum goes back to the
+    # rank that owns the token. bf16 and fp32 partials are both certified at
+    # every height, so the target can round once after the sum rather than
+    # before it.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one row per rank after the split, hidden 7168",
@@ -59,13 +95,27 @@ class Reducescatter(OpWrapper):
             why="prefill chunk height",
             spec=dict(rows_per_rank=2048, trailing=(7168,), dtype=torch.bfloat16, sizes=None),
         ),
+        *(
+            _nemotron4_combine(f"nemotron4 dep4 {what}, {name} partials", rows, dtype, sizes)
+            for rows, sizes, what in _NEMOTRON4_COMBINE_SPLITS
+            for name, dtype in (("bf16", torch.bfloat16), ("fp32", torch.float32))
+        ),
     )
 
     note = """
-    The ragged form and dtypes other than bf16 work and are exercised by the op
-    matrix, but no shipped target reaches them, so they are not cells. CUDA
-    graph behaviour is carried by the matrix's own named checks rather than as
-    a cell axis.
+    Certified dtypes: bf16 and fp32. fp16 and the integer dtypes in
+    `_SUMMABLE_DTYPES` reduce correctly in the op matrix, but no target passes
+    them, so they are not cells.
+
+    The cells' payloads make every partial sum exact, so they are gated
+    bitwise. On general inputs the op sums in the input dtype, in the order
+    NCCL picks. For bf16 the matrix pins that order as a sequential chain in
+    ring order (`check_reduction_is_deterministic_and_accumulates_in_the_input_dtype`).
+    A bf16 call therefore rounds to bf16 after every partial, and an fp32 call
+    stays in fp32 until the caller casts.
+
+    CUDA graph behaviour is carried by the matrix's own named checks rather
+    than as a cell axis.
     """
 
     def __call__(

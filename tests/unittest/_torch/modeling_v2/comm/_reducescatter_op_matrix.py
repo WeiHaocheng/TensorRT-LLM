@@ -430,13 +430,16 @@ def check_certified_cells() -> None:
     for i, cell in enumerate(entry.reducescatter.CELLS):
         spec = cell.spec
         rows, trailing, dtype = spec["rows_per_rank"], spec["trailing"], spec["dtype"]
+        # `rows_per_rank` is the busiest rank's slice; a ragged cell's `sizes`
+        # names every rank's, so it is certified at its own world size only.
+        split = [rows] * WORLD if spec["sizes"] is None else list(spec["sizes"])
+        assert len(split) == WORLD and max(split) == rows, (cell.why, split, WORLD)
         seed = 9000 + 13 * i
-        sizes = [rows] * WORLD
-        x = _input(RANK, sizes, seed, dtype, trailing)
+        x = _input(RANK, split, seed, dtype, trailing)
         with validating(entry.reducescatter):
             out = reducescatter(x, spec["sizes"], GROUP)
-        assert out.shape == (rows, *trailing), (cell.why, out.shape)
-        _assert_bitwise(out, _ref(sizes, RANK, seed, dtype, trailing), cell.why)
+        assert out.shape == (split[RANK], *trailing), (cell.why, out.shape)
+        _assert_bitwise(out, _ref(split, RANK, seed, dtype, trailing), cell.why)
         dist.barrier()
 
 

@@ -361,13 +361,17 @@ def check_certified_cells() -> None:
     """
     for i, cell in enumerate(entry.allgather.CELLS):
         spec = cell.spec
-        rows, trailing, dtype = spec["rows"], spec["trailing"], spec["dtype"]
+        rows, trailing, dtype, sizes = spec["rows"], spec["trailing"], spec["dtype"], spec["sizes"]
+        # `rows` is the busiest rank's height; a ragged cell's `sizes` names
+        # every rank's, so it is certified at its own world size only.
+        split = [rows] * WORLD if sizes is None else list(sizes)
+        assert len(split) == WORLD and max(split) == rows, (cell.why, split, WORLD)
         seed = 9000 + 13 * i
-        x = _payload(RANK, rows, seed, dtype, trailing)
+        x = _payload(RANK, split[RANK], seed, dtype, trailing)
         with validating(entry.allgather):
-            out = allgather(x, spec["sizes"], GROUP)
-        assert out.shape == (rows * WORLD, *trailing), (cell.why, out.shape)
-        _assert_bitwise(out, _gather_ref([rows] * WORLD, seed, dtype, trailing), cell.why)
+            out = allgather(x, sizes, GROUP)
+        assert out.shape == (sum(split), *trailing), (cell.why, out.shape)
+        _assert_bitwise(out, _gather_ref(split, seed, dtype, trailing), cell.why)
         dist.barrier()
 
 
@@ -473,6 +477,42 @@ def check_dtypes_move_bitwise() -> None:
         outr = allgather(xr, sizes, GROUP)
         assert outr.dtype is dtype and outr.shape == (sum(sizes), HIDDEN)
         _assert_bitwise(outr, _gather_ref(sizes, seed, dtype), f"ragged {dtype}")
+        dist.barrier()
+
+
+def check_a_packed_dispatch_row_comes_back_through_views() -> None:
+    """nemotron4's packed dispatch row survives the gather field by field.
+
+    The cells gate the packed rows as bytes. This takes the fields back the
+    way the entry's note says a caller does -- strided dtype views of the
+    gathered rows -- and checks each one against what every rank packed: bf16
+    latents, int32 expert ids and fp32 routing weights, padded and ragged.
+    """
+    latent, topk = 768, 10
+    for i, sizes in enumerate(([3] * WORLD, [1 + 4 * r for r in range(WORLD)])):
+        fields = []
+        for r in range(WORLD):
+            gen = torch.Generator(device="cuda").manual_seed(7700 + 31 * i + r)
+            fields.append(
+                (
+                    torch.randn(sizes[r], latent, generator=gen, device="cuda").to(torch.bfloat16),
+                    torch.randint(
+                        0, 512, (sizes[r], topk), generator=gen, device="cuda", dtype=torch.int32
+                    ),
+                    torch.rand(sizes[r], topk, generator=gen, device="cuda", dtype=torch.float32),
+                )
+            )
+        mine = torch.cat([f.view(torch.uint8) for f in fields[RANK]], dim=1)
+        assert mine.shape == (sizes[RANK], entry._NEMOTRON4_DISPATCH_ROW_BYTES), mine.shape
+        rows = allgather(mine, None if len(set(sizes)) == 1 else sizes, GROUP)
+        got = (
+            rows[:, : 2 * latent].view(torch.bfloat16),
+            rows[:, 2 * latent : 2 * latent + 4 * topk].view(torch.int32),
+            rows[:, 2 * latent + 4 * topk :].view(torch.float32),
+        )
+        for k, name in enumerate(("latents", "expert ids", "routing weights")):
+            want = torch.cat([f[k] for f in fields], dim=0)
+            _assert_bitwise(got[k], want, f"packed {name}, sizes={sizes}")
         dist.barrier()
 
 
@@ -912,6 +952,7 @@ CHECKS = (
     check_output_is_fresh_and_input_is_untouched,
     check_trailing_dims_are_preserved,
     check_dtypes_move_bitwise,
+    check_a_packed_dispatch_row_comes_back_through_views,
     check_group_selects_a_rank_subset,
     check_group_order_does_not_change_the_output_order,
     check_cuda_graph_at_every_engine_batch_size,
