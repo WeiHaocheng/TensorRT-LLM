@@ -17,7 +17,7 @@ import torch
 
 from tensorrt_llm.bindings.internal import thop
 
-from .._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 #: attention_input_type. 0 is the standard append-and-attend path; 1 and 2 are
 #: MLA's context and generation phases.
@@ -42,10 +42,38 @@ class ThopAttention(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The four shapes the shipped targets reach, which is four different code
-    # paths rather than four sizes. gpt-oss alternates its two window classes
+    # nemotron4-nano-preview: 16 query heads over one 256-wide KV head, no
+    # positional encoding (the op's rope off), q_scaling 1 (scale 1/16), a bf16
+    # pool of 32-token pages, histories up to its max_seq_len of 9344. Its
+    # engine runs chunked prefill, which turns use_paged_context_fmha on for
+    # every call, decode and verify included. An MTP verify step is plain
+    # generation with three query tokens per request: sm_103 runs linear-tree
+    # spec-dec with is_spec_decoding_enabled off, and the op splits the
+    # generation tokens evenly among the generation rows.
+    #
+    # Each of its cells states its rows: `contexts` as (cached, new) per
+    # context row, then `generations` rows of `gen_tokens` each, whose
+    # histories the test draws below max_seq_len (one at the limit, a few short
+    # enough that a verify row's own siblings carry visible weight).
+    _NEMOTRON4 = dict(
+        input_type=STANDARD,
+        num_heads=16,
+        num_kv_heads=1,
+        head_size=256,
+        v_head_dim=256,
+        sinks=False,
+        window=None,
+        quant_mode=0,
+        tokens_per_block=32,
+        max_seq_len=9344,
+    )
+
+    # The shapes the shipped targets reach, which are different code paths
+    # rather than different sizes. gpt-oss alternates its two window classes
     # inside one engine, so both of its cells are live every step; deepseek runs
-    # context and generation against the same pool.
+    # context and generation against the same pool; nemotron4 is single-KV-head
+    # GQA, decoded at batches of 1 to 1024 and verified at 1 to 512, where the
+    # kernel the op picks changes with batch size and history length.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="gpt-oss sliding layer: GQA 64q/8kv d64, sinks, window 128",
@@ -99,6 +127,50 @@ class ThopAttention(OpWrapper):
                 quant_mode=QM_FP8_KV_CACHE,
             ),
         ),
+        Cell(
+            why="nemotron4 prefill: one fresh 8192-token prompt",
+            spec=dict(contexts=((0, 8192),), generations=0, gen_tokens=1, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 chunk: 2048 new tokens on 6144 cached",
+            spec=dict(contexts=((6144, 2048),), generations=0, gen_tokens=1, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 mixed: a fresh and a chunked context beside 6 decodes",
+            spec=dict(
+                contexts=((0, 1000), (4096, 2048)), generations=6, gen_tokens=1, **_NEMOTRON4
+            ),
+        ),
+        Cell(
+            why="nemotron4 decode B=1: one request at the longest history",
+            spec=dict(contexts=(), generations=1, gen_tokens=1, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 decode B=64: histories spread up to max_seq_len",
+            spec=dict(contexts=(), generations=64, gen_tokens=1, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 decode B=1024: the largest batch a DP rank decodes",
+            spec=dict(contexts=(), generations=1024, gen_tokens=1, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 verify B=1: 3 query tokens per request",
+            spec=dict(contexts=(), generations=1, gen_tokens=3, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 verify B=64: 3 query tokens per request",
+            spec=dict(contexts=(), generations=64, gen_tokens=3, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 verify B=512: 3 query tokens per request",
+            spec=dict(contexts=(), generations=512, gen_tokens=3, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 mixed verify: two contexts beside 6 three-token rows",
+            spec=dict(
+                contexts=((0, 1000), (4096, 2048)), generations=6, gen_tokens=3, **_NEMOTRON4
+            ),
+        ),
     )
 
     note = """
@@ -116,6 +188,20 @@ class ThopAttention(OpWrapper):
     The softmax statistics the MLA chunked-prefill path writes are a second
     output; `softmax_stats` states them separately so `reference` stays one
     thing.
+
+    nemotron4's decode and verify rows run on trtllm-gen generation kernels
+    (XqaDispatcher), whose variant changes with batch size and history
+    length: SwapsAb kernels, compiled through NVRTC on first use in every
+    process (6-12 s each), and precompiled GroupedKeepsAb ones. A shape the
+    engine has not warmed (`trtllm_gen_jit_warmup`) stalls its first step by
+    that much. Its context rows run the paged-KV context kernel, which exists
+    for head 256 at 32-token pages only. The packed-QKV context path runs the
+    geometry too, but no nemotron4 call takes it and it is not certified.
+
+    Speculative decoding is certified as the linear chain sm_103 runs: verify
+    rows with is_spec_decoding_enabled off, causal within their group. Tree
+    and dynamic-tree masks (is_spec_decoding_enabled on, the packed mask
+    arguments) are not driven here.
     """
 
     def __call__(
@@ -379,7 +465,8 @@ class ThopAttention(OpWrapper):
         e4m3_inputs: bool = False,
         out_scale: float = 1.0,
     ) -> torch.Tensor:
-        """Masked softmax attention over explicit per-sequence K/V, in fp32.
+        """Masked softmax attention over explicit per-sequence K/V, in fp32
+        with TF32 off (`true_fp32_matmul`).
 
         The paged-cache exception to mirroring `__call__`, and the largest one:
         this op's output is a function of what the pool holds, and its 115
@@ -410,42 +497,43 @@ class ThopAttention(OpWrapper):
         out = torch.full(
             (total_q, num_heads * v_head_dim), float("nan"), dtype=torch.float32, device=q.device
         )
-        q_start = kv_start = 0
-        for q_len, kv_len in zip(q_lens, kv_lens):
-            if kv_len == 0:
-                # The op leaves these rows undefined and the merge plans skip
-                # them; saying so here keeps a caller from reading them.
+        with true_fp32_matmul():
+            q_start = kv_start = 0
+            for q_len, kv_len in zip(q_lens, kv_lens):
+                if kv_len == 0:
+                    # The op leaves these rows undefined and the merge plans skip
+                    # them; saying so here keeps a caller from reading them.
+                    q_start += q_len
+                    continue
+                q_seq = q[q_start : q_start + q_len].reshape(q_len, num_heads, qk_head_dim).float()
+                k_seq = k[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, qk_head_dim)
+                v_seq = v[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, v_head_dim)
+                k_seq, v_seq = k_seq.float(), v_seq.float()
+                if rep > 1:
+                    k_seq = k_seq.repeat_interleave(rep, dim=1)
+                    v_seq = v_seq.repeat_interleave(rep, dim=1)
+                if e4m3_inputs:
+                    q_seq = q_seq.to(torch.float8_e4m3fn).float()
+                    k_seq = k_seq.to(torch.float8_e4m3fn).float()
+                    v_seq = v_seq.to(torch.float8_e4m3fn).float()
+
+                scores = torch.einsum("ihd,jhd->hij", q_seq, k_seq) * softmax_scale
+                keep = self._mask(q_len, kv_len, causal, window, q.device)
+                scores = scores.masked_fill(~keep.unsqueeze(0), float("-inf"))
+
+                if attention_sinks is None:
+                    probs = torch.softmax(scores, dim=-1)
+                else:
+                    sink = attention_sinks.float().view(num_heads, 1)
+                    peak = torch.maximum(scores.max(dim=-1).values, sink)
+                    weights = torch.exp(scores - peak.unsqueeze(-1))
+                    probs = weights / (weights.sum(-1) + torch.exp(sink - peak)).unsqueeze(-1)
+
+                out[q_start : q_start + q_len] = (
+                    torch.einsum("hij,jhd->ihd", probs, v_seq).reshape(q_len, -1) * out_scale
+                )
                 q_start += q_len
-                continue
-            q_seq = q[q_start : q_start + q_len].reshape(q_len, num_heads, qk_head_dim).float()
-            k_seq = k[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, qk_head_dim)
-            v_seq = v[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, v_head_dim)
-            k_seq, v_seq = k_seq.float(), v_seq.float()
-            if rep > 1:
-                k_seq = k_seq.repeat_interleave(rep, dim=1)
-                v_seq = v_seq.repeat_interleave(rep, dim=1)
-            if e4m3_inputs:
-                q_seq = q_seq.to(torch.float8_e4m3fn).float()
-                k_seq = k_seq.to(torch.float8_e4m3fn).float()
-                v_seq = v_seq.to(torch.float8_e4m3fn).float()
-
-            scores = torch.einsum("ihd,jhd->hij", q_seq, k_seq) * softmax_scale
-            keep = self._mask(q_len, kv_len, causal, window, q.device)
-            scores = scores.masked_fill(~keep.unsqueeze(0), float("-inf"))
-
-            if attention_sinks is None:
-                probs = torch.softmax(scores, dim=-1)
-            else:
-                sink = attention_sinks.float().view(num_heads, 1)
-                peak = torch.maximum(scores.max(dim=-1).values, sink)
-                weights = torch.exp(scores - peak.unsqueeze(-1))
-                probs = weights / (weights.sum(-1) + torch.exp(sink - peak)).unsqueeze(-1)
-
-            out[q_start : q_start + q_len] = (
-                torch.einsum("hij,jhd->ihd", probs, v_seq).reshape(q_len, -1) * out_scale
-            )
-            q_start += q_len
-            kv_start += kv_len
+                kv_start += kv_len
         return out.to(q.dtype)
 
     def softmax_stats(
@@ -476,25 +564,26 @@ class ThopAttention(OpWrapper):
         stats = torch.full(
             (total_q, num_heads, 2), float("nan"), dtype=torch.float32, device=q.device
         )
-        q_start = kv_start = 0
-        for q_len, kv_len in zip(q_lens, kv_lens):
-            if kv_len == 0:
+        with true_fp32_matmul():
+            q_start = kv_start = 0
+            for q_len, kv_len in zip(q_lens, kv_lens):
+                if kv_len == 0:
+                    q_start += q_len
+                    continue
+                q_seq = q[q_start : q_start + q_len].reshape(q_len, num_heads, qk_head_dim).float()
+                k_seq = k[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, qk_head_dim)
+                k_seq = k_seq.float()
+                if rep > 1:
+                    k_seq = k_seq.repeat_interleave(rep, dim=1)
+                scores = torch.einsum("ihd,jhd->hij", q_seq, k_seq) * softmax_scale
+                keep = self._mask(q_len, kv_len, causal, window, q.device)
+                scores = scores.masked_fill(~keep.unsqueeze(0), float("-inf"))
+                row_max = scores.max(dim=-1).values
+                row_sum = torch.exp(scores - row_max.unsqueeze(-1)).sum(dim=-1)
+                stats[q_start : q_start + q_len, :, 0] = row_max.transpose(0, 1)
+                stats[q_start : q_start + q_len, :, 1] = row_sum.transpose(0, 1)
                 q_start += q_len
-                continue
-            q_seq = q[q_start : q_start + q_len].reshape(q_len, num_heads, qk_head_dim).float()
-            k_seq = k[kv_start : kv_start + kv_len].reshape(kv_len, num_kv_heads, qk_head_dim)
-            k_seq = k_seq.float()
-            if rep > 1:
-                k_seq = k_seq.repeat_interleave(rep, dim=1)
-            scores = torch.einsum("ihd,jhd->hij", q_seq, k_seq) * softmax_scale
-            keep = self._mask(q_len, kv_len, causal, window, q.device)
-            scores = scores.masked_fill(~keep.unsqueeze(0), float("-inf"))
-            row_max = scores.max(dim=-1).values
-            row_sum = torch.exp(scores - row_max.unsqueeze(-1)).sum(dim=-1)
-            stats[q_start : q_start + q_len, :, 0] = row_max.transpose(0, 1)
-            stats[q_start : q_start + q_len, :, 1] = row_sum.transpose(0, 1)
-            q_start += q_len
-            kv_start += kv_len
+                kv_start += kv_len
         return stats
 
     @staticmethod
@@ -516,6 +605,12 @@ class ThopAttention(OpWrapper):
         num_heads: int,
         num_kv_heads: int,
         attention_sinks: Optional[torch.Tensor] = None,
+        q: Optional[torch.Tensor] = None,
+        host_context_lengths: Optional[torch.Tensor] = None,
+        num_contexts: int = 0,
+        num_ctx_tokens: int = 0,
+        tokens_per_block: Optional[int] = None,
+        is_mla_enable: bool = False,
         **unused_kwargs: object,
     ) -> None:
         """Keyword-only, because every call site passes keywords.
@@ -524,8 +619,9 @@ class ThopAttention(OpWrapper):
         arguments; naming all of them here would restate the signature without
         adding a claim, and `reference` cannot mirror it either -- it is the
         paged-cache exception and takes gathered K/V -- so there is no shared
-        argument list left for the mirroring to preserve. `**unused_kwargs`
-        absorbs the rest.
+        argument list left for the mirroring to preserve. It names the
+        arguments it reads, defaulted so that one claim can be probed at a
+        time, and `**unused_kwargs` absorbs the rest.
         """
         # A context-only call with a non-multiple returns without raising:
         # measured at 6q/4kv d128, only the first
@@ -549,6 +645,25 @@ class ThopAttention(OpWrapper):
                 f"{tuple(attention_sinks.shape)} contiguous="
                 f"{attention_sinks.is_contiguous()}"
             )
+        # Generation rows carrying several query tokens each (an MTP verify
+        # step) come out right only from the trtllm-gen generation kernels.
+        # Where XqaDispatcher hands generation to MMHA instead -- more than 32
+        # q heads per KV head, pages under 8 tokens -- the op still runs them and
+        # answers wrongly without raising. Measured with 3 tokens per row: NaNs
+        # at 64q/1kv d128, finite values 630-700 ulp off at 4-token pages
+        # (16q/1kv d256 and 32q/8kv d128); 1 token per row is right on the same
+        # path. Beam search falls back to MMHA as well; nothing here drives it.
+        # MLA generation serves its draft rows through its own kernels and is
+        # not this case.
+        if q is not None and host_context_lengths is not None and not is_mla_enable:
+            num_generations = host_context_lengths.shape[0] - num_contexts
+            if num_generations > 0 and q.shape[0] - num_ctx_tokens > num_generations:
+                small_pages = tokens_per_block is not None and tokens_per_block < 8
+                assert num_heads <= 32 * num_kv_heads and not small_pages, (
+                    f"generation rows of several query tokens need the trtllm-gen "
+                    f"kernels; {num_heads}q/{num_kv_heads}kv heads at tokens_per_block "
+                    f"{tokens_per_block} fall back to MMHA, which computes them wrongly"
+                )
 
 
 thop_attention = ThopAttention()
