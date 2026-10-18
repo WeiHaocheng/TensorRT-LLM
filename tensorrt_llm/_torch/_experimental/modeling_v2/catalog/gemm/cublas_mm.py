@@ -10,6 +10,56 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 
 from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
+#: nemotron4-nano-preview's dense GEMMs, one row per distinct shape:
+#: (call sites, k, n, out_dtype). All are bias-free on bf16 operands. The router
+#: and the lm_head ask for fp32 out because the checkpoint's own code runs both
+#: as fp32 GEMMs on bf16 values; their products are exact in fp32, so fp32
+#: accumulation with fp32 out is the same math up to summation order. Attention's
+#: o_proj and the shared expert's down projection are both 4096 -> 3072.
+_NEMOTRON4_GEMMS: tuple[tuple[str, int, int, torch.dtype | None], ...] = (
+    ("GDP in_proj", 3072, 18528, None),
+    ("GDP out_proj", 1536, 3072, None),
+    ("attention qkv", 3072, 4608, None),
+    ("o_proj and shared down", 4096, 3072, None),
+    ("dense MLP up", 3072, 12288, None),
+    ("dense MLP down", 12288, 3072, None),
+    ("MoE router", 3072, 512, torch.float32),
+    ("fc1_latent_proj", 3072, 768, None),
+    ("fc2_latent_proj", 768, 3072, None),
+    ("shared expert up", 3072, 4096, None),
+    ("MTP eh_proj", 6144, 3072, None),
+)
+
+#: The row counts every GEMM above runs at. cuBLASLt picks its kernel per
+#: (m, n, k), so each row count is a claim of its own rather than a size.
+_NEMOTRON4_LAYER_ROWS = (
+    (1, "decode, one token"),
+    (1024, "decode, the largest CUDA-graph batch"),
+    (8192, "prefill, an 8192-token chunk"),
+)
+
+#: The lm_head only sees each request's last token plus its draft tokens.
+_NEMOTRON4_LM_HEAD = ("lm_head", 3072, 262272, torch.float32)
+_NEMOTRON4_LM_HEAD_ROWS = (
+    (1, "one request"),
+    (1024, "1024 requests"),
+    (3072, "1024 requests verifying two drafts each"),
+)
+
+
+def _nemotron4_cells() -> tuple[Cell, ...]:
+    """One cell per (GEMM, row count) that nemotron4's forward runs."""
+    plan = [(gemm, _NEMOTRON4_LAYER_ROWS) for gemm in _NEMOTRON4_GEMMS]
+    plan.append((_NEMOTRON4_LM_HEAD, _NEMOTRON4_LM_HEAD_ROWS))
+    return tuple(
+        Cell(
+            why=f"nemotron4 {site} m={m}: {k} -> {n}{', fp32 out' if out_dtype else ''}, {rows}",
+            spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+        )
+        for (site, k, n, out_dtype), row_counts in plan
+        for m, rows in row_counts
+    )
+
 
 class CublasMm(OpWrapper):
     """`mat_a @ mat_b (+ bias)`, fp32-accumulated, one cublas_mm call.
@@ -20,11 +70,12 @@ class CublasMm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # Both targets use this for every dense projection, so the cells are the
-    # three argument shapes that differ in kind rather than in size: fused bias
+    # Every target uses this for every dense projection. The first four cells
+    # are the argument shapes that differ in kind rather than in size: fused bias
     # (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
     # projections), and an out_dtype that is not the input's (deepseek's router
-    # asks for fp32 logits).
+    # asks for fp32 logits). The nemotron4 cells after them differ in size: each
+    # of its distinct GEMMs at each row count its forward runs.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="gpt-oss qkv with fused bias: hidden 2880 -> (64 + 8 + 8) * 64",
@@ -44,6 +95,7 @@ class CublasMm(OpWrapper):
             why="decode-shaped: one token, the shape every projection sees per step",
             spec=dict(m=1, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
         ),
+        *_nemotron4_cells(),
     )
 
     note = """
