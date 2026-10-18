@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Weight table: nemotron4-nano-preview (text model) / sm_103 / dep4.
 
-One `W` per weight role, carrying its shape, checkpoint source, dtype and the
-rows of the source a rank reads. Every rank is handed the whole checkpoint
-dict, so the split is entirely this table's, and under attention DP there is
-only one:
+One `W` per weight role, carrying its shape, checkpoint source, dtype, the
+rows of the source a rank reads and its load-time transform. Every rank is
+handed the whole checkpoint dict, so the split is entirely this table's, and
+under attention DP there is only one:
 
 * **expert windows** -- the checkpoint stores each MoE block's routed experts
   fused, one `[E, out, in]` tensor per stack (`moe.experts.up_proj` and
@@ -17,18 +17,30 @@ only one:
   stack key, for its own rows;
 * **replicated** -- everything else, whole on every rank: the topology divides
   the requests, not the weights. The embedding, the norms and wide-residual
-  logits, the GDP mixers, the attention projections (one KV head is not split),
-  the dense MLPs, the router and its correction bias over all 512 experts, the
-  latent projections, the shared experts, the MTP layer's own weights, and the
-  shell's `lm_head`, which the base class builds whole under attention DP.
+  coefficients, the GDP mixers, the attention projections (one KV head is not
+  split), the dense MLPs, the router and its correction bias over all 512
+  experts, the latent projections, the shared experts, the MTP layer's own
+  weights, and the shell's `lm_head`, which the base class builds whole under
+  attention DP.
 
-Every tensor keeps the checkpoint's own layout and dtype: HF `[out, in]`
-row-major for every projection, `[E, out, in]` for the routed-expert stacks,
-`[channels, 1, kernel]` for the GDP short conv, and fp32 for the tensors the
-checkpoint keeps fp32: `A_log`, the router's correction bias and every
-wide-residual logit. `dt_bias` is bf16 in the checkpoint and stays bf16 here.
-No row carries a transform: a kernel that wants another layout adds it to its
-row.
+Most weights keep the checkpoint's own layout and dtype: HF `[out, in]`
+row-major for every projection (the forward hands `cublas_mm` their `.t()`
+views), `[E, out, in]` for the routed-expert stacks, fp32 for the router's
+correction bias. Four kinds are laid out at load for the entries that read
+them, so the forward does no per-step arithmetic on weights:
+
+* `qkv`: the attention's q, k and v projections side by side, `[q | k | v]`
+  rows, one `[4608, hidden]` operand for the fused-qkv GEMM `thop_attention`
+  reads;
+* the wide-residual coefficients, each formed from its fp32 logit exactly as
+  HF forms it on every forward and rounded to bf16 as HF's
+  `.to(streams.dtype)` rounds it: `f = sigmoid(read logit)` for every read,
+  `w = 2 sigmoid(write_logit)` and `r = 1 - max_forget * sigmoid(-retention_logit)`
+  for every write -- the `[n]` vectors `wide_residual` takes;
+* `gdp_conv`: the short conv's `[channels, 1, kernel]` as the `[channels,
+  kernel]` the conv entries take;
+* `gdp_neg_a`: HF's `-A_log.float().exp()`, the fp32 factor of the decay
+  `gdp_gates` computes. `dt_bias` stays the checkpoint's bf16.
 
 Which weights a block has is decided by `text_config.layer_types`:
 
@@ -57,9 +69,9 @@ families:
   With `mtp_use_repeated_layer` the checkpoint stores one layer that serves
   every draft depth. Its block is the trunk's shortcut attention + MoE block
   built on a plain residual -- no wide-residual logits -- so it shares those
-  rows, its expert window included, addressed as layer `len(layer_types)`, the
-  index the HF code gives it; its four own weights (`enorm`, `hnorm`,
-  `eh_proj`, `final_layernorm`) sit outside the block.
+  rows, its fused qkv and expert window included, addressed as layer
+  `len(layer_types)`, the index the HF code gives it; its four own weights
+  (`enorm`, `hnorm`, `eh_proj`, `final_layernorm`) sit outside the block.
 
 Loading contract: `load(model, weights)` consumes the engine-provided
 checkpoint dict, fills every declared parameter exactly once, and asserts
@@ -86,7 +98,8 @@ _MTP_PREFIX = f"{_TEXT}.mtp."
 
 @dataclass(frozen=True)
 class W:
-    """One weight role: what it is, where its bytes come from, and which of them this rank reads.
+    """One weight role: what it is, where its bytes come from, which of them this rank reads,
+    and what happens on the way.
 
     `shape` takes the dimension bundle and returns the declared shape; every
     shape is derived from configuration rather than constant.
@@ -96,7 +109,8 @@ class W:
     dimension bundle and the layer index -- the checkpoint prefix differs
     between the trunk's blocks and the MTP layer's, which is why it is
     computed rather than templated. `index` is an index into the destination,
-    or None for the whole parameter.
+    or None for the whole parameter; several sources with disjoint indices
+    assemble one parameter side by side.
 
     `layers` says which layers carry this weight: None for a weight that is
     not per-layer at all, or a callable `d -> iterable[int]`.
@@ -104,6 +118,10 @@ class W:
     `rows` says which rows of each source tensor this rank reads, as a callable
     `d -> slice` over the source's first dimension -- the rank's expert window
     for the routed-expert stacks -- or None for the whole tensor.
+
+    `transform` runs on each source tensor (its rows, when `rows` cuts them)
+    before the copy, on the destination's device, as `transform(tensor, d)`.
+    None means the checkpoint tensor is already the declared layout.
     """
 
     name: str
@@ -112,6 +130,7 @@ class W:
     dtype: torch.dtype | None = None
     layers: Callable | None = None
     rows: Callable | None = None
+    transform: Callable | None = None
 
     def layer_indices(self, d: SimpleNamespace) -> list[int] | None:
         """The layers this weight exists on, or None if it is not per-layer."""
@@ -188,18 +207,60 @@ def _moe_blocks(d: SimpleNamespace) -> list[int]:
     return _shortcut_blocks(d) + _mtp_layers(d)
 
 
-def _logits(prefix: str, suffix: str, layers: Callable) -> tuple[W, ...]:
-    """A wide-residual connection's fp32 logits: read, write and learned retention."""
+def _read_factors(logit: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`f = sigmoid(logit)`: a read's stream factors (`Nemotron4WideResidualRead.forward`,
+    `Nemotron4WideResidualConnection.read`), formed in fp32 and rounded to the streams' dtype."""
+    return torch.sigmoid(logit.float()).to(d.dtype)
+
+
+def _write_factors(logit: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`w = 2 sigmoid(write_logit)` (`Nemotron4WideResidualConnection.write`), fp32, rounded."""
+    return (2.0 * torch.sigmoid(logit.float())).to(d.dtype)
+
+
+def _retention_factors(logit: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`r = 1 - max_forget * sigmoid(-retention_logit)` (`Nemotron4WideResidualConnection.write`),
+    fp32, rounded."""
+    return (1.0 - d.retention_max_forget * torch.sigmoid(-logit.float())).to(d.dtype)
+
+
+def _conv_taps(weight: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`nn.Conv1d`'s depthwise `[channels, 1, kernel]` as the conv entries' `[channels, kernel]`."""
+    return weight.reshape(weight.shape[0], weight.shape[-1])
+
+
+def _neg_a(a_log: torch.Tensor, d: SimpleNamespace) -> torch.Tensor:
+    """`-A_log.float().exp()`, the decay's factor as `Nemotron4GDPMixer.forward` forms it."""
+    return -a_log.float().exp()
+
+
+def _connection(prefix: str, suffix: str, layers: Callable) -> tuple[W, ...]:
+    """A wide-residual connection's coefficients, each from its fp32 logit: the read
+    factors `f`, the write factors `w` and the retention `r`."""
     return tuple(
         W(
             f"{prefix}_{name}",
             shape=lambda d: (d.streams,),
             src=_block(f"{suffix}.{key}_logit"),
-            dtype=torch.float32,
             layers=layers,
+            transform=transform,
         )
-        for name, key in (("read", "read"), ("write", "write"), ("retain", "retention"))
+        for name, key, transform in (
+            ("read", "read", _read_factors),
+            ("write", "write", _write_factors),
+            ("retain", "retention", _retention_factors),
+        )
     )
+
+
+def _qkv(d: SimpleNamespace, i: int) -> list[tuple[str, tuple]]:
+    """Layer `i`'s q, k and v projections, side by side in the rows of one operand."""
+    p, q, kv = _block_prefix(d, i), d.q_width, d.kv_width
+    return [
+        (f"{p}.self_attn.q_proj.weight", (slice(0, q),)),
+        (f"{p}.self_attn.k_proj.weight", (slice(q, q + kv),)),
+        (f"{p}.self_attn.v_proj.weight", (slice(q + kv, q + 2 * kv),)),
+    ]
 
 
 class Nemotron4NanoPreviewDep4Weights:
@@ -220,16 +281,16 @@ class Nemotron4NanoPreviewDep4Weights:
             layers=_every_block,
         ),
         # --- the wide residual: one connection per plain block, three per shortcut block ---
-        *_logits("res", "residual_connection", _plain_blocks),
+        *_connection("res", "residual_connection", _plain_blocks),
         W(
             "shortcut_read",
             shape=lambda d: (d.streams,),
             src=_block("shortcut_read.logit"),
-            dtype=torch.float32,
             layers=_shortcut_blocks,
+            transform=_read_factors,
         ),
-        *_logits("mix", "mixer_residual_connection", _shortcut_blocks),
-        *_logits("moe", "moe_residual_connection", _shortcut_blocks),
+        *_connection("mix", "mixer_residual_connection", _shortcut_blocks),
+        *_connection("moe", "moe_residual_connection", _shortcut_blocks),
         # --- the GDP mixer ---
         W(
             "gdp_in",
@@ -239,16 +300,18 @@ class Nemotron4NanoPreviewDep4Weights:
         ),
         W(
             "gdp_conv",
-            shape=lambda d: (d.gdp_conv, 1, d.gdp_conv_kernel),
+            shape=lambda d: (d.gdp_conv, d.gdp_conv_kernel),
             src=_block("mixer.conv1d.weight"),
             layers=_gdp_mixers,
+            transform=_conv_taps,
         ),
         W(
-            "gdp_a_log",
+            "gdp_neg_a",
             shape=lambda d: (d.gdp_heads,),
             src=_block("mixer.A_log"),
             dtype=torch.float32,
             layers=_gdp_mixers,
+            transform=_neg_a,
         ),
         W(
             "gdp_dt_bias",
@@ -270,21 +333,9 @@ class Nemotron4NanoPreviewDep4Weights:
         ),
         # --- the attention mixer: 16 query heads, one KV head ---
         W(
-            "q",
-            shape=lambda d: (d.q_width, d.hidden),
-            src=_block("self_attn.q_proj.weight"),
-            layers=_attention_mixers,
-        ),
-        W(
-            "k",
-            shape=lambda d: (d.kv_width, d.hidden),
-            src=_block("self_attn.k_proj.weight"),
-            layers=_attention_mixers,
-        ),
-        W(
-            "v",
-            shape=lambda d: (d.kv_width, d.hidden),
-            src=_block("self_attn.v_proj.weight"),
+            "qkv",
+            shape=lambda d: (d.q_width + 2 * d.kv_width, d.hidden),
+            src=_qkv,
             layers=_attention_mixers,
         ),
         W(
@@ -399,7 +450,7 @@ class Nemotron4NanoPreviewDep4Weights:
             "readout",
             shape=lambda d: (d.streams,),
             src=f"{_TEXT}.residual_readout.logit",
-            dtype=torch.float32,
+            transform=_read_factors,
         ),
     )
 
@@ -436,6 +487,7 @@ class Nemotron4NanoPreviewDep4Weights:
             latent=cfg.moe_latent_size,
             moe_inter=cfg.moe_intermediate_size,
             shared_inter=cfg.moe_shared_expert_intermediate_size,
+            retention_max_forget=cfg.wide_residual_retention_max_forget,
             mtp_enabled=mtp_enabled,
             mtp_layers=mtp_layers if mtp_enabled else 0,
             dtype=core.model_config.torch_dtype,
@@ -467,11 +519,14 @@ class Nemotron4NanoPreviewDep4Weights:
             return [(entry.name, None)]
         return [(f"l{i}_{entry.name}", i) for i in layers]
 
-    def manifest(self, core) -> dict[str, list[tuple[str, Any, slice | None]]]:
-        """param key -> [(checkpoint key, index into the param | None, source rows | None)]."""
+    def manifest(self, core) -> dict[str, list[tuple[str, Any, slice | None, Callable | None]]]:
+        """param key -> [(checkpoint key, index into the param | None, source rows | None,
+        transform | None)]."""
         d = self.dims(core)
         return {
-            key: entry.sources(d, i) for entry in self.WEIGHTS for key, i in self._targets(entry, d)
+            key: [(ckpt, index, rows, entry.transform) for ckpt, index, rows in entry.sources(d, i)]
+            for entry in self.WEIGHTS
+            for key, i in self._targets(entry, d)
         }
 
     def expected_unconsumed(self, core, weights) -> set:
@@ -494,12 +549,14 @@ class Nemotron4NanoPreviewDep4Weights:
         consumed: set = set()
         windowed: set = set()
 
-        def fill(param: nn.Parameter, ckpt_key: str, index, rows) -> None:
+        def fill(param: nn.Parameter, ckpt_key: str, index, rows, transform) -> None:
             assert ckpt_key in weights, f"checkpoint key missing: {ckpt_key}"
             # Index before materializing: a lazy safetensors slice then reads only these
             # rows, and an in-memory tensor copies only this view of itself.
             src = weights[ckpt_key][slice(None) if rows is None else rows]
             dst = param.data if index is None else param.data[index]
+            if transform is not None:
+                src = transform(src.to(dst.device, non_blocking=True), d)
             assert dst.shape == src.shape, (ckpt_key, tuple(dst.shape), tuple(src.shape))
             assert dst.dtype == src.dtype, (ckpt_key, dst.dtype, src.dtype)
             dst.copy_(src, non_blocking=True)
@@ -513,14 +570,14 @@ class Nemotron4NanoPreviewDep4Weights:
         )
         for param_key, sources in manifest.items():
             assert sources, f"declared weight with no checkpoint source: {param_key}"
-            for ckpt_key, index, rows in sources:
-                fill(core.w[param_key], ckpt_key, index, rows)
+            for ckpt_key, index, rows, transform in sources:
+                fill(core.w[param_key], ckpt_key, index, rows, transform)
 
         # Shell-registered exception: the base class owns lm_head (untied). Under attention
         # DP it is whole on every rank, so the fill's shape check refuses a vocab-parallel
         # shard. Name every registered parameter outside the target's own ParameterDict
         # rather than assuming lm_head is the only one.
-        fill(model.lm_head.weight, "lm_head.weight", None, None)
+        fill(model.lm_head.weight, "lm_head.weight", None, None, None)
         shell = {n for n, _ in model.named_parameters() if not n.startswith("model.w.")}
         assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
 

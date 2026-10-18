@@ -8,8 +8,8 @@ this model's state shapes, with a slot stride wider than one state (the
 managers pack state in blocks). The placeholder rows are the two kinds an
 attention-DP rank runs: CUDA-graph padding up to the ranks' common graph batch,
 and the dummy request a rank with no request of its own runs. The engine path
-itself (LLM API on 4 ranks, CUDA graphs, overlap scheduler) is exercised by the
-target's probe, not here.
+itself (LLM API on 4 ranks, CUDA graphs, overlap scheduler) is exercised through
+the target's forward, not here.
 """
 
 from types import SimpleNamespace

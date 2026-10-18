@@ -10,8 +10,9 @@ to account, each written from the module tree rather than imported from the
 table, so the table cannot agree with itself:
 
 * `_reference_declaration` -- every parameter a rank allocates, with the shape
-  and dtype the HF module that owns it stores, the expert stacks cut to the
-  rank's window;
+  and dtype the HF module that owns it stores, or the layout the target
+  re-lays it into at load (fused qkv, bf16 residual coefficients, conv taps,
+  `-exp(A_log)`), the expert stacks cut to the rank's window;
 * `_reference_text_keys` -- every text-model key of the checkpoint's state
   dict, the MTP layer's included.
 
@@ -20,8 +21,9 @@ a source, every text key is consumed, and the only keys left are the predicted
 non-load; the four ranks' windows tile each stack's 512 experts exactly once and
 nothing else differs between ranks. When the checkpoint itself is on disk, its
 index and safetensors headers are read too (headers only, no tensor data): every
-manifest row is compared against the stored shape and dtype, and a rank's
-weight bytes against the stored ones.
+manifest row's stored shape and dtype, cut to the row's window and run through
+the row's transform on the meta device, must land exactly on the declared
+slice, and a rank's weight bytes are held to the stored ones.
 
 No GPU: parameters are declared on the meta device, and `dims` reads
 `model_config` alone.
@@ -67,6 +69,7 @@ _TEXT_CONFIG = dict(
     moe_intermediate_size=4096,
     moe_shared_expert_intermediate_size=4096,
     wide_residual_num_streams=3,
+    wide_residual_retention_max_forget=0.1,
     num_nextn_predict_layers=2,
     mtp_use_repeated_layer=True,
 )
@@ -119,10 +122,13 @@ def _window(rank: int) -> slice:
 def _reference_declaration(mtp: bool) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """Every parameter a rank allocates, transcribed from the HF module tree.
 
-    The fp32 entries are the ones HF keeps fp32 through load
-    (`_keep_in_fp32_modules_strict`): the router's correction bias, every
-    wide-residual logit and `A_log`. The two expert stacks hold the rank's
-    window of `Nemotron4Experts`' `[num_experts, out, in]` parameters.
+    The fp32 entries are the router's correction bias, which HF keeps fp32
+    through load (`_keep_in_fp32_modules_strict`), and `-exp(A_log)`, which HF
+    forms in fp32 from its fp32 `A_log`. The wide-residual logits HF also keeps
+    fp32 become the bf16 coefficients HF rounds them into on every forward
+    (`.to(streams.dtype)`), and the attention's q, k and v one fused operand.
+    The two expert stacks hold the rank's window of `Nemotron4Experts`'
+    `[num_experts, out, in]` parameters.
     """
     c = SimpleNamespace(**_TEXT_CONFIG)
     bf16, f32 = torch.bfloat16, torch.float32
@@ -135,23 +141,21 @@ def _reference_declaration(mtp: bool) -> dict[str, tuple[tuple[int, ...], torch.
     projection = value_dim + conv_dim + (m + 1) * c.gdp_num_heads
     w = {}
 
-    def connection(i, name):  # Nemotron4WideResidualConnection
-        for logit in ("read", "write", "retain"):
-            w[f"l{i}_{name}_{logit}"] = ((streams,), f32)
+    def connection(i, name):  # Nemotron4WideResidualConnection: f, w and r
+        for coefficient in ("read", "write", "retain"):
+            w[f"l{i}_{name}_{coefficient}"] = ((streams,), bf16)
 
     def gdp(i):  # Nemotron4GDPMixer
         w[f"l{i}_gdp_in"] = ((projection, hidden), bf16)
-        w[f"l{i}_gdp_conv"] = ((conv_dim, 1, c.gdp_conv_kernel), bf16)
-        w[f"l{i}_gdp_a_log"] = ((c.gdp_num_heads,), f32)
+        w[f"l{i}_gdp_conv"] = ((conv_dim, c.gdp_conv_kernel), bf16)
+        w[f"l{i}_gdp_neg_a"] = ((c.gdp_num_heads,), f32)
         w[f"l{i}_gdp_dt_bias"] = ((c.gdp_num_heads,), bf16)
         w[f"l{i}_gdp_norm"] = ((value_dim,), bf16)
         w[f"l{i}_gdp_out"] = ((hidden, value_dim), bf16)
 
-    def attention(i):  # Nemotron4Attention
+    def attention(i):  # Nemotron4Attention, q, k and v fused
         q, kv = c.num_attention_heads * c.head_dim, c.num_key_value_heads * c.head_dim
-        w[f"l{i}_q"] = ((q, hidden), bf16)
-        w[f"l{i}_k"] = ((kv, hidden), bf16)
-        w[f"l{i}_v"] = ((kv, hidden), bf16)
+        w[f"l{i}_qkv"] = ((q + 2 * kv, hidden), bf16)
         w[f"l{i}_o"] = ((hidden, q), bf16)
 
     def moe(i):  # the shortcut block's norms and Nemotron4MoE
@@ -179,7 +183,7 @@ def _reference_declaration(mtp: bool) -> dict[str, tuple[tuple[int, ...], torch.
             w[f"l{i}_mlp_down"] = ((hidden, c.intermediate_size), bf16)
             connection(i, "res")
         else:
-            w[f"l{i}_shortcut_read"] = ((streams,), f32)
+            w[f"l{i}_shortcut_read"] = ((streams,), bf16)
             connection(i, "mix")
             connection(i, "moe")
             moe(i)
@@ -189,7 +193,7 @@ def _reference_declaration(mtp: bool) -> dict[str, tuple[tuple[int, ...], torch.
                 gdp(i)
     w["embed"] = ((c.vocab_size, hidden), bf16)
     w["final_norm"] = ((hidden,), bf16)
-    w["readout"] = ((streams,), f32)
+    w["readout"] = ((streams,), bf16)
     if mtp:
         # One repeated MTP layer, at the index HF gives its attention block. Its
         # block is a shortcut attention + MoE block on a plain residual.
@@ -288,7 +292,7 @@ def _declared(mtp: bool, rank: int) -> dict:
 
 
 def _consumed(manifest: dict) -> set[str]:
-    return {ckpt for rows in manifest.values() for ckpt, _, _ in rows}
+    return {ckpt for rows in manifest.values() for ckpt, _, _, _ in rows}
 
 
 _MTP = pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
@@ -311,16 +315,17 @@ def test_the_table_declares_what_the_hf_modules_store(mtp, rank):
 def test_every_declared_weight_has_exactly_its_sources(mtp, rank):
     """A declared weight with no source allocates memory nothing ever fills; a key
     mapped twice is filled twice. Neither may happen. Only the expert stacks are
-    read in part, at the rank's window; everything else is read whole."""
+    read in part, at the rank's window; everything else is read whole, and only
+    the fused qkv assembles one parameter from several sources."""
     core = _core(mtp, rank)
     manifest = W.MODEL_WEIGHTS.manifest(core)
     assert set(manifest) == set(_declared(mtp, rank).keys())
     assert all(manifest.values())
-    sources = [ckpt for rows in manifest.values() for ckpt, _, _ in rows]
+    sources = [ckpt for rows in manifest.values() for ckpt, _, _, _ in rows]
     assert len(sources) == len(set(sources))
     for key, rows in manifest.items():
-        for ckpt, index, src_rows in rows:
-            assert index is None, (key, index)
+        for ckpt, index, src_rows, _ in rows:
+            assert (index is None) == (not key.endswith("_qkv")), (key, index)
             if key.endswith(_EXPERT_STACKS):
                 assert ckpt.endswith((".moe.experts.up_proj", ".moe.experts.down_proj")), key
                 assert src_rows == _window(rank), (key, src_rows)
@@ -360,10 +365,10 @@ def test_the_ranks_split_the_experts_and_nothing_else(mtp):
             assert all(r == rows[0] for r in rows), key
             continue
         stacks += 1
-        windows = [src_rows for r in rows for _, _, src_rows in r]
+        windows = [src_rows for r in rows for _, _, src_rows, _ in r]
         covered = [e for window in windows for e in range(num_experts)[window]]
         assert covered == list(range(num_experts)), key
-        assert len({ckpt for r in rows for ckpt, _, _ in r}) == 1, key
+        assert len({ckpt for r in rows for ckpt, _, _, _ in r}) == 1, key
     moe_blocks = sum(t.startswith("shortcut_moe") for t in _TEXT_CONFIG["layer_types"])
     assert stacks == 2 * (moe_blocks + (1 if mtp else 0))
 
@@ -375,6 +380,26 @@ def test_mtp_rows_appear_only_when_mtp_is_live():
     assert not {k for k in off if k.startswith(f"l{_NUM_LAYERS}_")}
     assert {k for k in on if k.startswith(f"l{_NUM_LAYERS}_")}
     assert off < on
+
+
+def test_fused_qkv_rows_tile_the_operand():
+    """q, k and v land side by side in the rows of one operand, in that order,
+    covering it exactly: the fused-qkv GEMM's columns are thop_attention's
+    `[q heads | k head | v head]`."""
+    manifest = W.MODEL_WEIGHTS.manifest(_core(True, 0))
+    q = _TEXT_CONFIG["num_attention_heads"] * _TEXT_CONFIG["head_dim"]
+    kv = _TEXT_CONFIG["num_key_value_heads"] * _TEXT_CONFIG["head_dim"]
+    fused = 0
+    for key, rows in manifest.items():
+        if not key.endswith("_qkv"):
+            continue
+        fused += 1
+        assert [(ckpt.rsplit(".", 2)[-2], index) for ckpt, index, _, _ in rows] == [
+            ("q_proj", (slice(0, q),)),
+            ("k_proj", (slice(q, q + kv),)),
+            ("v_proj", (slice(q + kv, q + 2 * kv),)),
+        ], key
+    assert fused == sum(t == "shortcut_moe_attn" for t in _TEXT_CONFIG["layer_types"]) + 1
 
 
 def _checkpoint_headers() -> dict[str, tuple[str, tuple[int, ...]]]:
@@ -406,10 +431,12 @@ def _nbytes(dtype: torch.dtype, shape) -> int:
 def test_the_table_matches_the_checkpoint_on_disk(mtp):
     """The transcriptions above, held to the checkpoint itself: its text keys are
     exactly the transcribed ones, and on every rank every manifest row names a
-    tensor of the declared dtype whose rows, cut to the row's window, have exactly
-    the declared shape. A rank's weights are then the stored text model's bytes
-    less three quarters of the routed experts': the replicated weights whole and
-    one window of every stack."""
+    tensor whose rows, cut to the row's window and run through the row's
+    transform on a meta tensor of the stored shape and dtype, land exactly on
+    the declared slice. A rank's weights are then the stored text model's bytes
+    less three quarters of the routed experts' -- the replicated weights whole
+    and one window of every stack -- and less half of every wide-residual logit,
+    stored fp32 and kept as its bf16 coefficient."""
     headers = _checkpoint_headers()
     vision = {k for k in headers if k.startswith(W._VISION_PREFIXES)}
     assert set(headers) - vision == _reference_text_keys(mtp=True)
@@ -421,25 +448,33 @@ def test_the_table_matches_the_checkpoint_on_disk(mtp):
         for k in text_keys
         if k.endswith((".moe.experts.up_proj", ".moe.experts.down_proj"))
     )
+    logits = [k for k in text_keys if k.endswith("logit")]
+    assert all(headers[k][0] == "F32" for k in logits)
+    halved = sum(_nbytes(torch.float32, headers[k][1]) // 2 for k in logits)
     lm_dtype, lm_shape = headers["lm_head.weight"]
     vocab, hidden = _TEXT_CONFIG["vocab_size"], _TEXT_CONFIG["hidden_size"]
     assert (_DTYPES[lm_dtype], lm_shape) == (torch.bfloat16, (vocab, hidden))
 
     for rank in _RANKS:
         core = _core(mtp, rank)
+        d = W.MODEL_WEIGHTS.dims(core)
         declared = _declared(mtp, rank)
         for param_key, rows in W.MODEL_WEIGHTS.manifest(core).items():
-            for ckpt, _, src_rows in rows:
+            for ckpt, index, src_rows, transform in rows:
                 dtype, shape = headers[ckpt]
                 if src_rows is not None:
                     assert 0 <= src_rows.start < src_rows.stop <= shape[0], (ckpt, src_rows)
                     shape = (src_rows.stop - src_rows.start, *shape[1:])
-                assert tuple(declared[param_key].shape) == shape, (param_key, ckpt, shape)
-                assert declared[param_key].dtype == _DTYPES[dtype], (param_key, ckpt, dtype)
+                src = torch.empty(shape, dtype=_DTYPES[dtype], device="meta")
+                if transform is not None:
+                    src = transform(src, d)
+                dst = declared[param_key] if index is None else declared[param_key][index]
+                assert tuple(dst.shape) == tuple(src.shape), (param_key, ckpt, shape)
+                assert dst.dtype == src.dtype, (param_key, ckpt, dtype)
         leftover = set(headers) - _consumed(W.MODEL_WEIGHTS.manifest(core))
         leftover.discard("lm_head.weight")
         assert leftover == W.MODEL_WEIGHTS.expected_unconsumed(core, headers)
 
         rank_bytes = sum(p.numel() * p.dtype.itemsize for p in declared.values())
         rank_bytes += _nbytes(torch.bfloat16, lm_shape)
-        assert rank_bytes == stored - stacks + stacks // _EP, rank
+        assert rank_bytes == stored - stacks + stacks // _EP - halved, rank
