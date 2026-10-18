@@ -111,7 +111,12 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp1(
 ):
     def __init__(self, model_config: ModelConfig):
         # The composite config keeps the text model's widths under text_config.
-        text = model_config.pretrained_config.text_config
+        cfg = model_config.pretrained_config
+        text = cfg.text_config
+        # The engine reads the depth off the composite config when it sizes its caches, but
+        # text_config derives it (a property over layer_types) and ModelConfig's mirror of
+        # text_config onto the composite copies stored fields only.
+        cfg.num_hidden_layers = text.num_hidden_layers
         super().__init__(
             Nemotron4NanoPreviewTp1ModelingV2(model_config),
             config=model_config,
