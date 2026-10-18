@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the causal_conv1d_update entry of nemotron4_nano_preview__sm_103__tp1.
+"""GPU test for the causal_conv1d_update catalog entry, at nemotron4-nano-preview's tp1 and
+tp4-rank shapes.
 
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into the buffers a target hands the op -- the conv columns of an
@@ -38,6 +39,9 @@ MAX_MISMATCH_FRACTION = 1e-3
 
 GRAPH_CELLS = [c for c in op.CELLS if c.spec["graph"]]
 
+#: The conv widths the cells certify: tp1's 16896 channels and a tp4 rank's 4224.
+DIMS = sorted({c.spec["dim"] for c in op.CELLS}, reverse=True)
+
 
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     """The final rounding may differ, and nothing else.
@@ -50,16 +54,19 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     over every cell, five seeds each: only batch 2 bit-identical; at most 6e-5 of the outputs
     differ (one of batch 1's 16896), each by exactly one ulp of its own magnitude; the worst
     element 0.74 ulp at its row's scale, the relative RMS 0.011 ulp. With the checkpoint's own
-    taps (all 32 GDP layers, batch 64) the three measure 0.41, 0.0054 and 1.1e-5.
+    taps (all 32 GDP layers, batch 64) the three measure 0.41, 0.0054 and 1.1e-5. On a tp4
+    rank's 4224 channels, five seeds of each cell: batches 1, 2, 4 and 8 bit-identical, at most
+    7.9e-5 of the outputs differ (one of batch 3's 12672), the worst element 0.52 ulp, the
+    relative RMS 0.012 ulp.
 
     Three gates:
       * element, 2 ulp at the row scale: one ulp of an element's own magnitude reads as up to two
         of the nominal 2**-8 at the row's largest magnitude. A step that ignores the saved state
         misses by 167 ulp or more, one that reads it newest first by 203, one that reads it as a
         ring buffer rotated by one (`cache_seqlens_` 1) by 206.
-      * relative RMS, 0.1 ulp: 9x the worst measured. Rounding the conv output to bf16 before
+      * relative RMS, 0.1 ulp: 8x the worst measured. Rounding the conv output to bf16 before
         SiLU, as the checkpoint's HF module does, sits at 0.70 or more.
-      * the fraction of outputs not bit-identical, 1e-3: 17x the worst measured. That double
+      * the fraction of outputs not bit-identical, 1e-3: 12x the worst measured. That double
         rounding changes a quarter of them while staying inside the element gate (1.985 ulp at
         most), so this gate and the RMS one are what tell it apart from the op.
     """
@@ -205,7 +212,8 @@ def test_cuda_graph_replays_on_new_inputs(cell) -> None:
         _check(proj, raw, kwargs, ref_out, ref_states, proj_before, raw_before, spec)
 
 
-def test_decode_steps_reproduce_the_hf_whole_sequence_conv() -> None:
+@pytest.mark.parametrize("dim", DIMS)
+def test_decode_steps_reproduce_the_hf_whole_sequence_conv(dim: int) -> None:
     """Eight decode steps from an empty state give the checkpoint module's whole-sequence conv.
 
     `Nemotron4GDPMixer` runs `nn.Conv1d(conv_dim, conv_dim, 4, padding=3, groups=conv_dim)` over
@@ -216,9 +224,9 @@ def test_decode_steps_reproduce_the_hf_whole_sequence_conv() -> None:
     its slot. That pins the state's order and the taps' orientation against torch's own
     convolution rather than against `reference`.
     """
-    spec = next(c.spec for c in op.CELLS if c.spec["batch"] == 8)
+    spec = next(c.spec for c in op.CELLS if c.spec["dim"] == dim and c.spec["batch"] == 8)
     proj, raw, kwargs = _build(spec, seed=8)
-    dim, width, dtype = spec["dim"], spec["width"], spec["dtype"]
+    width, dtype = spec["width"], spec["dtype"]
     slots = kwargs["conv_state_indices"]
     live = slots != PAD_SLOT_ID
     kwargs["conv_state"][slots[live].long()] = 0  # the module's zero padding before the sequence
@@ -244,16 +252,17 @@ def test_decode_steps_reproduce_the_hf_whole_sequence_conv() -> None:
     )
 
 
-def test_a_decode_step_rounds_as_the_prefill_kernels_do() -> None:
+@pytest.mark.parametrize("dim", DIMS)
+def test_a_decode_step_rounds_as_the_prefill_kernels_do(dim: int) -> None:
     """A decode row and a one-token context give the same bits, output and state.
 
     The same token can reach the GDP conv either way: as a decode row here, or as a one-token
     sequence of a context batch through `causal_conv1d_fwd`'s channel-last kernel, the path
     `causal_conv1d_varlen` certifies. Greedy identity across batch compositions needs the two to
     agree exactly; both are fma chains over the same four products with the same SiLU. Pinned on
-    the largest cell.
+    each width's largest cell.
     """
-    cell = max(op.CELLS, key=lambda c: c.spec["batch"])
+    cell = max((c for c in op.CELLS if c.spec["dim"] == dim), key=lambda c: c.spec["batch"])
     spec = cell.spec
     proj, raw, kwargs = _build(spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     slots = kwargs["conv_state_indices"]

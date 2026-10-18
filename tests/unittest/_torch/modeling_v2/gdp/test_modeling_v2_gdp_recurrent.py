@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the gdp_recurrent entry of nemotron4-nano-preview's tp1 target."""
+"""GPU test for the gdp_recurrent catalog entry, at nemotron4-nano-preview's tp1 and tp4-rank shapes."""
 
 import math
 import zlib
@@ -19,9 +19,26 @@ from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: 
 
 assert torch.cuda.is_available(), "gdp_recurrent requires a CUDA device"
 
-#: What a slot of the hybrid cache manager's packed pool carries after its ssm
-#: state: the GDP conv state, conv_dim 16896 x (kernel 4 - 1) bf16 values.
-_CONV_STATE_FLOATS = 16896 * 3 * 2 // 4
+#: The head counts the cells certify: tp1's 24 and a tp4 rank's 6.
+HEADS = sorted({c.spec["heads"] for c in op.CELLS}, reverse=True)
+
+
+def _conv_dim(spec) -> int:
+    """The GDP conv's channels at a cell's geometry, [V0..V2 | K0..K2 | Q]: 16896 at
+    24 heads, 4224 at 6."""
+    h, nh, dk, dv = spec["heads"], spec["householder"], spec["key_dim"], spec["value_dim"]
+    return nh * h * dv + (nh + 1) * h * dk
+
+
+def _conv_state_floats(spec) -> int:
+    """What a slot of the hybrid cache manager's packed pool carries after its ssm
+    state: the GDP conv state, conv_dim x (kernel 4 - 1) bf16 values, in floats."""
+    return _conv_dim(spec) * 3 * 2 // 4
+
+
+def _cell_spec(heads: int, batch: int):
+    """The spec of the cell at this head count and batch."""
+    return next(c.spec for c in op.CELLS if c.spec["heads"] == heads and c.spec["batch"] == batch)
 
 
 def _compare_out(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -33,6 +50,9 @@ def _compare_out(out: torch.Tensor, ref: torch.Tensor) -> None:
     rounding boundary goes: one bf16 step at most, which is up to 2 ulp of the
     element's own magnitude and so of its row's. Measured: 1.47 ulp
     element-wise, 0.022 of relative RMS (0.065% of the outputs differ at all).
+    On a tp4 rank's 6 heads, over 8 seeds of each of its cells: 1.87 ulp
+    element-wise, a flip on an element in its row's top binade; 0.016 of
+    relative RMS; at most 0.26% of the outputs differ, one of batch 1's 384.
 
     So: 2 ulp element-wise, the bound itself, and 0.25 of relative RMS, 10x
     the measured worst case. The mistake only this gate can see -- the output
@@ -47,7 +67,9 @@ def _compare_state(state: torch.Tensor, ref: torch.Tensor) -> None:
     rounds one token: the decay, then per Householder step a 128-term dot
     product, the delta and the rank-one update. Each side sits ~3 fp32 ulp of
     its row's scale from an fp64 transcription (kernel 3.10, `reference` 3.16
-    element-wise; 0.56 / 0.55 of relative RMS) and 3.74 / 0.575 from the other.
+    element-wise; 0.56 / 0.55 of relative RMS) and 3.74 / 0.575 from the other;
+    on a tp4 rank's 6 heads, 3.84 / 0.62 from the other at worst over 8 seeds of
+    each cell.
 
     So: 8 ulp element-wise and 1 of relative RMS, about 2x the worst case of
     every comparison here, the vendored FLA kernel's included (5.29 / 0.608;
@@ -65,7 +87,7 @@ def _raw_pool(spec, num_slots: int, g: torch.Generator) -> torch.Tensor:
     owns it. A packed block is ssm state followed by conv state, the hybrid
     cache manager's per-layer layout; a dense block is the ssm state alone."""
     ssm = spec["heads"] * spec["value_dim"] * spec["key_dim"]
-    block = ssm + (_CONV_STATE_FLOATS if spec["pool"] == "packed" else 0)
+    block = ssm + (_conv_state_floats(spec) if spec["pool"] == "packed" else 0)
     return torch.randn(num_slots + 1, block, generator=g, device="cuda") * 0.5
 
 
@@ -76,18 +98,26 @@ def _pool_view(raw: torch.Tensor, spec) -> torch.Tensor:
 
 
 def _inputs(spec, batch: int, g: torch.Generator):
-    """(q, k, v, g, beta) as the target holds them after the conv: q, k and v
-    are views of one post-SiLU conv-output row per token, packed [V0..V2 |
-    K0..K2 | Q] as `Nemotron4GDPMixer` splits it; beta is the bf16 sigmoid of an
-    in_proj slice; g is HF's fp32 decay over the checkpoint's parameter ranges
+    """(q, k, v, g, beta) as the target holds them after the decode conv, which
+    writes its post-SiLU output in place into the in_proj output's conv columns:
+    q, k and v are views of those columns, one in_proj row per request, packed
+    [V0..V2 | K0..K2 | Q] as `Nemotron4GDPMixer` splits it, so their row stride
+    is the in_proj width. The rest of each row is NaN, which a read outside the
+    views would carry into the result. beta is the bf16 sigmoid of an in_proj
+    slice; g is HF's fp32 decay over the checkpoint's parameter ranges
     (exp(A_log) in [0.0061, 18.3], dt_bias in [-7.03, -1.94] across its 32
     GDP layers), so some heads forget within a step and others barely at all."""
     h, nh, dk, dv = spec["heads"], spec["householder"], spec["key_dim"], spec["value_dim"]
-    conv_dim = nh * h * dv + (nh + 1) * h * dk
+    conv_dim = _conv_dim(spec)
     mixed = F.silu(torch.randn(batch, conv_dim, generator=g, device="cuda")).to(torch.bfloat16)
-    v = mixed[:, : nh * h * dv].view(batch, nh, h, dv)
-    k = mixed[:, nh * h * dv : nh * h * (dv + dk)].view(batch, nh, h, dk)
-    q = mixed[:, nh * h * (dv + dk) :].view(batch, h, dk)
+    proj = torch.full(
+        (batch, spec["proj_width"]), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    conv = proj[:, spec["conv_offset"] : spec["conv_offset"] + conv_dim]
+    conv.copy_(mixed)
+    v = conv[:, : nh * h * dv].view(batch, nh, h, dv)
+    k = conv[:, nh * h * dv : nh * h * (dv + dk)].view(batch, nh, h, dk)
+    q = conv[:, nh * h * (dv + dk) :].view(batch, h, dk)
     b = torch.randn(batch, nh * h, generator=g, device="cuda").to(torch.bfloat16)
     beta = b.sigmoid().view(batch, nh, h)
     a_log = torch.empty(h, device="cuda").uniform_(math.log(0.0061), math.log(18.3), generator=g)
@@ -153,11 +183,12 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     _check(out, ref_out, ref_pool, args, raw, raw_before, cell.spec)
 
 
-def test_cuda_graph_replays_on_new_inputs() -> None:
+@pytest.mark.parametrize("heads", HEADS)
+def test_cuda_graph_replays_on_new_inputs(heads: int) -> None:
     """One capture, two replays: each replay reads whatever the input buffers,
     the slot list and the pool hold at replay time, and the second continues
     the states the first wrote -- the same slots in another row order."""
-    spec = next(c.spec for c in op.CELLS if c.spec["batch"] == 64)
+    spec = _cell_spec(heads, 64)
     args, raw = _build(spec, seed=64)
     g = torch.Generator(device="cuda").manual_seed(65)
 
@@ -184,13 +215,14 @@ def test_cuda_graph_replays_on_new_inputs() -> None:
         _check(out, ref_out, ref_pool, args, raw, raw_before, spec)
 
 
-def test_a_row_does_not_depend_on_its_batch() -> None:
+@pytest.mark.parametrize("heads", HEADS)
+def test_a_row_does_not_depend_on_its_batch(heads: int) -> None:
     """Bit-identical output and state for a request whether it runs alone, in a
     batch of three or in the padded graph batch of 1024: a row's arithmetic is
     fixed by the kernel's tile, never by the batch around it. That is what lets
     a request decode to the same bits with CUDA graphs on (padded batches) and
     off (eager batches of whatever is running)."""
-    spec = next(c.spec for c in op.CELLS if c.spec["batch"] == 1024)
+    spec = _cell_spec(heads, 1024)
     args, raw = _build(spec, seed=1024)
     raw_before = raw.clone()
     full_out = op(**args)
@@ -215,8 +247,7 @@ def test_reference_agrees_with_the_vendored_fla_kernel() -> None:
         fused_recurrent_gated_delta_rule_update,
     )
 
-    spec = next(c.spec for c in op.CELLS if c.spec["batch"] == 16)
-    spec = dict(spec, pool="dense")
+    spec = dict(_cell_spec(24, 16), pool="dense")
     args, _ = _build(spec, seed=16)
     ref_out, ref_pool = op.reference(**args)
 
@@ -243,8 +274,8 @@ def test_reference_agrees_with_the_vendored_fla_kernel() -> None:
 
 
 def _ok(**over):
-    """The batch-4 cell's arguments with one of them replaced."""
-    spec = next(c.spec for c in op.CELLS if c.spec["batch"] == 4)
+    """The tp1 batch-4 cell's arguments with one of them replaced."""
+    spec = _cell_spec(24, 4)
     args, _ = _build(spec, seed=4)
     args.update(over)
     return args

@@ -31,12 +31,20 @@ _GDP = dict(
     pool_ssm_bytes=24 * 64 * 128 * 4,
     silu_activation=True,
 )
+# A tp4 rank convolves the channels of its 6 GDP heads, a quarter of every segment: 4224 channels,
+# the conv columns of its in_proj output [batch, 4632] = [z 384 | conv 4224 | b 18 | a 6], and
+# pool slots whose recurrent state is 6 x 64 x 128 fp32. Every rank keeps all 32 GDP layers.
+_GDP_TP4 = dict(_GDP, dim=4224, proj_width=4632, proj_offset=384, pool_ssm_bytes=6 * 64 * 128 * 4)
 
 
-def _cell(why: str, batch: int, pad_rows: int, pool: str, graph: bool = False) -> Cell:
+def _cell(
+    why: str, batch: int, pad_rows: int, pool: str, graph: bool = False, geometry: dict = _GDP
+) -> Cell:
     """`batch` rows of one token each, the last `pad_rows` of them CUDA-graph padding; `pool` is
     "v1" or "v2" (above); `graph` also captures the call in a CUDA graph and replays it."""
-    return Cell(why=why, spec=dict(batch=batch, pad_rows=pad_rows, pool=pool, graph=graph, **_GDP))
+    return Cell(
+        why=why, spec=dict(batch=batch, pad_rows=pad_rows, pool=pool, graph=graph, **geometry)
+    )
 
 
 class CausalConv1dUpdate(OpWrapper):
@@ -62,7 +70,8 @@ class CausalConv1dUpdate(OpWrapper):
     # for a DP rank's batch -- each with its padding rows at the end, plus 3, a size no graph is
     # captured at, which runs eagerly without padding. A partly filled graph batch (8 holding 5,
     # 256 holding 129) puts many padding rows next to live ones. "v2" is the default manager's
-    # pool; the cells alternate the two forms over the sizes.
+    # pool; the cells alternate the two forms over the sizes. The same twelve batches run at a
+    # tp4 rank's width: tensor parallelism splits the channels, not the requests.
     CELLS: tuple[Cell, ...] = (
         _cell("graph batch 1: one request, no padding row", 1, 0, "v1"),
         _cell("graph batch 2: one request and one padding row", 2, 1, "v2"),
@@ -76,6 +85,25 @@ class CausalConv1dUpdate(OpWrapper):
         _cell("graph batch 256 holding 129 requests: 127 padding rows", 256, 127, "v2"),
         _cell("graph batch 512: around tp1's max_batch_size", 512, 1, "v1"),
         _cell("graph batch 1024: a DP rank's largest batch", 1024, 1, "v1"),
+        _cell("tp4 rank, graph batch 1: no padding row", 1, 0, "v1", geometry=_GDP_TP4),
+        _cell("tp4 rank, graph batch 2: one padding row", 2, 1, "v2", geometry=_GDP_TP4),
+        _cell("tp4 rank, eager batch 3", 3, 0, "v2", geometry=_GDP_TP4),
+        _cell("tp4 rank, graph batch 4: a padding row", 4, 1, "v1", geometry=_GDP_TP4),
+        _cell("tp4 rank, graph batch 8 holding 5 requests", 8, 3, "v2", geometry=_GDP_TP4),
+        _cell("tp4 rank, graph batch 16: a padding row", 16, 1, "v1", geometry=_GDP_TP4),
+        _cell("tp4 rank, graph batch 32: a padding row", 32, 1, "v2", geometry=_GDP_TP4),
+        _cell(
+            "tp4 rank, graph batch 64, captured and replayed",
+            64,
+            1,
+            "v2",
+            graph=True,
+            geometry=_GDP_TP4,
+        ),
+        _cell("tp4 rank, graph batch 128: a padding row", 128, 1, "v1", geometry=_GDP_TP4),
+        _cell("tp4 rank, graph batch 256 holding 129 requests", 256, 127, "v2", geometry=_GDP_TP4),
+        _cell("tp4 rank, graph batch 512: a padding row", 512, 1, "v1", geometry=_GDP_TP4),
+        _cell("tp4 rank, graph batch 1024: a padding row", 1024, 1, "v1", geometry=_GDP_TP4),
     )
 
     note = """
@@ -96,7 +124,8 @@ class CausalConv1dUpdate(OpWrapper):
 
     Certified: the decode kernel `causal_conv1d_update_kernel_sl1`, which the op picks when T is
     1, `cache_seqlens_` is None, SiLU is on and `state_len == W - 1`; x as the in_proj output's
-    conv columns, `[batch, 16896, 1]` with row stride 18528; no bias; `conv_state_indices` with
+    conv columns, `[batch, 16896, 1]` with row stride 18528, or a tp4 rank's `[batch, 4224, 1]`
+    with row stride 4632; no bias; `conv_state_indices` with
     the padding rows at the end; both pool forms; one call captured in a CUDA graph and replayed
     on new inputs, slots and states. Not certified, because no target here reaches it yet: T > 1
     (an MTP verify step) runs the general kernel, whose states match T one-token steps bit for

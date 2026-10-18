@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the gdp_chunk entry of nemotron4-nano-preview's tp1 target."""
+"""GPU test for the gdp_chunk catalog entry, at nemotron4-nano-preview's tp1 and tp4-rank shapes."""
 
 import itertools
 import math
@@ -23,9 +23,21 @@ from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: 
 
 assert torch.cuda.is_available(), "gdp_chunk requires a CUDA device"
 
-#: What a slot of the hybrid cache manager's packed pool carries after its ssm
-#: state: the GDP conv state, conv_dim 16896 x (kernel 4 - 1) bf16 values.
-_CONV_STATE_FLOATS = 16896 * 3 * 2 // 4
+#: The head counts the cells certify: tp1's 24 and a tp4 rank's 6.
+HEADS = sorted({c.spec["heads"] for c in op.CELLS}, reverse=True)
+
+
+def _conv_dim(spec) -> int:
+    """The GDP conv's channels at a cell's geometry, [V0..V2 | K0..K2 | Q]: 16896 at
+    24 heads, 4224 at 6."""
+    h, nh, dk, dv = spec["heads"], spec["householder"], spec["key_dim"], spec["value_dim"]
+    return nh * h * dv + (nh + 1) * h * dk
+
+
+def _conv_state_floats(spec) -> int:
+    """What a slot of the hybrid cache manager's packed pool carries after its ssm
+    state: the GDP conv state, conv_dim x (kernel 4 - 1) bf16 values, in floats."""
+    return _conv_dim(spec) * 3 * 2 // 4
 
 
 _OUT_ELEMENT_ULP, _OUT_RMS_ULP = 32.0, 2.0
@@ -43,11 +55,12 @@ def _compare_out(out: torch.Tensor, ref: torch.Tensor) -> None:
 
     Measured over every cell at six seeds (the cell's own and five more, 108
     runs): relative RMS 0.80 to 1.32 ulp; element-wise at most 7.9 ulp against
-    the row scale at the cells' own seeds and 12.3 at any seed. The large ones
-    sit on rows 1% to 8% of the median row's size: a strong decay has just
-    wiped the state, the row is what is left of the token's own three updates
-    after they cancel, and its error scales with those updates rather than
-    with the row.
+    the row scale at the cells' own seeds and 12.3 at any seed. A tp4 rank's
+    cells, six seeds each: relative RMS 0.90 to 1.34 ulp, element-wise at most
+    8.9. The large ones sit on rows 1% to 8% of the median row's size: a strong
+    decay has just wiped the state, the row is what is left of the token's own
+    three updates after they cancel, and its error scales with those updates
+    rather than with the row.
 
     So: 32 ulp element-wise, 2 of relative RMS. The vendored wrapper, which
     drops the coupling of a token's Householder steps, misses by 234 to 288 ulp
@@ -63,8 +76,9 @@ def _compare_state(state: torch.Tensor, ref: torch.Tensor) -> None:
     entries.
 
     Measured over the same 108 runs: element-wise at most 3.6 ulp against the
-    row scale, relative RMS at most 1.16; the fp32 reference's states sit
-    within 30 fp32 ulps (about 0.001 bf16 ulp) of fp64's.
+    row scale, relative RMS at most 1.16 (3.1 and 1.18 over a tp4 rank's 108);
+    the fp32 reference's states sit within 30 fp32 ulps (about 0.001 bf16 ulp)
+    of fp64's.
 
     So: 8 ulp element-wise, 2 of RMS. The vendored wrapper misses by 108 to 272
     ulp element-wise and 9 to 33 of RMS.
@@ -85,7 +99,8 @@ def _raw_pool(spec, num_slots: int, g: torch.Generator) -> torch.Tensor:
     leave alone everywhere else. A block is ssm state followed by conv state,
     the hybrid cache manager's per-layer layout."""
     ssm = spec["heads"] * spec["value_dim"] * spec["key_dim"]
-    return torch.randn(num_slots + 1, ssm + _CONV_STATE_FLOATS, generator=g, device="cuda") * 0.5
+    block = ssm + _conv_state_floats(spec)
+    return torch.randn(num_slots + 1, block, generator=g, device="cuda") * 0.5
 
 
 def _pool_view(raw: torch.Tensor, spec) -> torch.Tensor:
@@ -102,7 +117,7 @@ def _inputs(spec, num_tokens: int, g: torch.Generator):
     (exp(A_log) in [0.0061, 18.3], dt_bias in [-7.03, -1.94] across its 32
     GDP layers), so some heads forget within a token and others barely at all."""
     h, nh, dk, dv = spec["heads"], spec["householder"], spec["key_dim"], spec["value_dim"]
-    conv_dim = nh * h * dv + (nh + 1) * h * dk
+    conv_dim = _conv_dim(spec)
     mixed = F.silu(torch.randn(num_tokens, conv_dim, generator=g, device="cuda")).to(torch.bfloat16)
     v = mixed[:, : nh * h * dv].view(num_tokens, nh, h, dv)
     k = mixed[:, nh * h * dv : nh * h * (dv + dk)].view(num_tokens, nh, h, dk)
@@ -320,7 +335,8 @@ def test_a_cold_autotune_cache_leaves_the_states_right() -> None:
     it, so a re-tune changes nothing. Both halves: the vendored path, cold and
     warm, disagrees with itself (measured: cold, the slot comes back NaN, the
     repeated updates having blown it up; warm, it repeats bit for bit); the
-    entry, cold, matches the reference."""
+    entry, cold, matches the reference -- at every certified head count, since a tp4
+    rank's first prefill tunes the kernel afresh for its 6 heads."""
     kernel = chunk_gated_delta_rule_fwd_kernel_h_blockdim64
     while not hasattr(kernel, "cache"):  # the autotuner sits under the heuristics wrapper
         kernel = kernel.fn
@@ -353,12 +369,17 @@ def test_a_cold_autotune_cache_leaves_the_states_right() -> None:
         "it may no longer advance the state while it autotunes"
     )
 
-    cell = next(
-        c for c in op.CELLS if c.spec["seq_lens"] == (512,) and c.spec["init"] == "continued"
-    )
-    args, raw = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
-    raw_before = raw.clone()
-    ref_out, ref_pool = op.reference(**args)
-    kernel.cache.clear()
-    out = op(**args)
-    _check(out, ref_out, ref_pool, args, raw, raw_before, cell.spec)
+    for heads in HEADS:
+        cell = next(
+            c
+            for c in op.CELLS
+            if c.spec["heads"] == heads
+            and c.spec["seq_lens"] == (512,)
+            and c.spec["init"] == "continued"
+        )
+        args, raw = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
+        raw_before = raw.clone()
+        ref_out, ref_pool = op.reference(**args)
+        kernel.cache.clear()
+        out = op(**args)
+        _check(out, ref_out, ref_pool, args, raw, raw_before, cell.spec)
