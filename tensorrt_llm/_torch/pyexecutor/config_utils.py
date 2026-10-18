@@ -140,7 +140,58 @@ def is_gemma4_hybrid(config):
 
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config) or \
-        is_kimi_linear(config) or is_qwen4_exp(config) or is_glm5_next(config)
+        is_kimi_linear(config) or is_qwen4_exp(config) or \
+        is_glm5_next(config) or is_nemotron4(config)
+
+
+def is_nemotron4(config) -> bool:
+    """True for Nemotron 4 hybrid GDP + attention text models.
+
+    Handles both the flattened text config (model_type "nemotron4_text") and
+    the composite VLM config (model_type "nemotron4" with a nested
+    text_config). Nemotron 4 has no built-in implementation; a ModelingV2
+    target serves it, and the engine owns its KV and recurrent-state cache.
+    """
+    return getattr(config, "model_type", None) in ("nemotron4",
+                                                   "nemotron4_text")
+
+
+def unwrap_nemotron4_text_config(config):
+    """Return the Nemotron 4 text config, from either config form."""
+    if getattr(config, "model_type", None) == "nemotron4":
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            return text_config
+    return config
+
+
+_NEMOTRON4_GDP_LAYER_TYPES = ("linear_attention", "shortcut_moe_gdp")
+_NEMOTRON4_ATTENTION_LAYER_TYPES = ("shortcut_moe_attn", )
+_NEMOTRON4_STATELESS_LAYER_TYPES = ("mlp", )
+
+
+def get_nemotron4_layer_masks(config) -> tuple[list[bool], list[bool]]:
+    """Return (full_attention_layer_mask, gdp_layer_mask) for Nemotron 4.
+
+    ``layer_types`` names every decoder block: ``shortcut_moe_attn`` blocks
+    keep paged KV, ``linear_attention`` and ``shortcut_moe_gdp`` blocks keep
+    the gated-delta-product conv and recurrent state, and ``mlp`` blocks keep
+    neither.
+    """
+    layer_types = getattr(unwrap_nemotron4_text_config(config), "layer_types",
+                          None)
+    if not layer_types:
+        raise ValueError("Nemotron 4 configs must define layer_types")
+    known = (_NEMOTRON4_GDP_LAYER_TYPES + _NEMOTRON4_ATTENTION_LAYER_TYPES +
+             _NEMOTRON4_STATELESS_LAYER_TYPES)
+    unknown = sorted(set(layer_types) - set(known))
+    if unknown:
+        raise ValueError(
+            f"Unsupported Nemotron 4 layer types {unknown}; expected the "
+            f"normalized block names {list(known)}")
+    full_mask = [t in _NEMOTRON4_ATTENTION_LAYER_TYPES for t in layer_types]
+    gdp_mask = [t in _NEMOTRON4_GDP_LAYER_TYPES for t in layer_types]
+    return full_mask, gdp_mask
 
 
 def is_kimi_linear(config):
@@ -352,6 +403,9 @@ def resolve_auto_ssm_cache_dtype(config, fallback):
                 f"mamba_ssm_cache_dtype={declared}; keeping the fp32 "
                 "recurrent-state pool (kv_cache_config.mamba_ssm_cache_dtype "
                 "opts in to bfloat16).")
+        return torch.float32
+    if is_nemotron4(config):
+        # The HF reference runs the gated delta product with an fp32 state.
         return torch.float32
     return (resolve_ssm_cache_dtype(config) or resolve_hf_torch_dtype(config)
             or fallback)
@@ -748,6 +802,32 @@ def extract_mamba_kv_cache_params(
         n_groups = lin["num_heads"]
         head_dim = lin["head_dim"]
         target_full_attn_mask, mamba_mask = get_glm5_next_layer_masks(config)
+    elif is_nemotron4(config):
+        # Nemotron 4 GDP (gated delta product) state: an [H, V, K] fp32
+        # delta-rule recurrent state per head and a depthwise short conv over
+        # the packed [V_0..V_m | K_0..K_m | Q] projection, m + 1 =
+        # gdp_num_householder. The managers size the conv state as
+        # head_dim * num_heads + 2 * n_groups * state_size channels, which is
+        # the Mamba2 / GDN packing; n_groups is the value that gives the GDP
+        # conv width, not gdp_num_groups. Only the replay kernels and the
+        # disaggregated TP-mismatch transfer read n_groups beyond that width,
+        # and Nemotron 4 uses neither.
+        text_config = unwrap_nemotron4_text_config(config)
+        num_householder = text_config.gdp_num_householder
+        state_size = text_config.gdp_key_head_dim
+        conv_kernel = text_config.gdp_conv_kernel
+        num_heads = text_config.gdp_num_heads
+        head_dim = text_config.gdp_head_dim
+        conv_dim = (num_householder * num_heads * head_dim +
+                    (num_householder + 1) * text_config.gdp_num_groups *
+                    state_size)
+        n_groups, remainder = divmod(conv_dim - num_heads * head_dim,
+                                     2 * state_size)
+        if remainder != 0:
+            raise ValueError(
+                f"Nemotron 4 GDP conv width {conv_dim} is not expressible as "
+                f"{num_heads * head_dim} + 2 * n_groups * {state_size}")
+        target_full_attn_mask, mamba_mask = get_nemotron4_layer_masks(config)
     else:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
@@ -769,6 +849,10 @@ def extract_mamba_kv_cache_params(
     validate_kimi_kda_state_dtype(config, mamba_ssm_cache_dtype)
     if is_glm5_next(config) and mamba_ssm_cache_dtype != torch.float32:
         logger.info(f"glm5_next KDA: overriding mamba_ssm_cache_dtype "
+                    f"{mamba_ssm_cache_dtype} -> torch.float32")
+        mamba_ssm_cache_dtype = torch.float32
+    if is_nemotron4(config) and mamba_ssm_cache_dtype != torch.float32:
+        logger.info(f"Nemotron 4 GDP: overriding mamba_ssm_cache_dtype "
                     f"{mamba_ssm_cache_dtype} -> torch.float32")
         mamba_ssm_cache_dtype = torch.float32
 

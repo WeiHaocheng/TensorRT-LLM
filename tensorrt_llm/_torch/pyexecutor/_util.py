@@ -58,7 +58,8 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
+                           is_nemotron4, is_nemotron_hybrid, is_qwen3_hybrid,
+                           is_qwen4_exp,
                            resolve_vocab_size, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -3526,7 +3527,8 @@ def _create_kv_cache_manager(
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             **mamba_manager_extra_kwargs,
         )
-    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
+    elif is_qwen3_hybrid(config) or is_qwen4_exp(config) or is_nemotron4(
+            config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -3582,6 +3584,13 @@ def _create_kv_cache_manager(
 
         # Replay is enabled by default for eligible GDN MTP workloads.
         if not is_gdn_replay_enabled():
+            use_replay = False
+
+        # The GDN replay kernels re-apply one delta step per accepted token;
+        # a Nemotron 4 GDP token takes gdp_num_householder steps.
+        if is_nemotron4(config) and use_replay:
+            logger.info("GDN replay does not model Nemotron 4 GDP tokens; "
+                        "using the non-replay MTP path")
             use_replay = False
 
         # GDN replay supports the contiguous C++ V1 state pool and the indirect
