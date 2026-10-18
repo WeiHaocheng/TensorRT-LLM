@@ -8,17 +8,101 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modules.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_o
-from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
-from tensorrt_llm._torch.modules.fla.solve_tril import solve_tril
-from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd
+from tensorrt_llm._torch.modules.fla.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
+)
+from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_kernel_o
+from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
+from tensorrt_llm._torch.modules.fla.solve_tril import (
+    merge_16x16_to_64x64_inverse_kernel,
+    solve_tril_16x16_kernel,
+)
+from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd_kernel
 
 from .._op import Arch, Cell, OpWrapper
 
 #: The vendored chunk kernels' block length, counted in Householder sub-steps.
 _BT = 64
+#: `solve_tril`'s diagonal blocks, inverted before they are merged into a chunk's.
+_BT_DIAG = 16
+
+
+@triton.jit
+def _chunk_list_kernel(
+    cu_steps,
+    chunk_indices,
+    chunk_offsets,
+    num_seqs,
+    num_chunks,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BN: tl.constexpr,
+):
+    """`prepare_chunk_indices` and `prepare_chunk_offsets` on the device.
+
+    Entry `c` of `chunk_indices` is `(sequence, chunk within it)` for the batch's
+    `c`-th BT-sub-step chunk, sequences in order; `chunk_offsets[n]` is sequence
+    n's first chunk. Each program covers BC chunk ids and walks the sequences BN
+    at a time: a chunk's sequence is the number of sequences that end at or
+    before it, its first chunk the last sequence start at or before it.
+
+    `num_chunks` is a bound, not the count. The ids past the real chunks get the
+    last sequence and a chunk past its end, which every stage masks out.
+    """
+    i_c = tl.program_id(0)
+    o_c = i_c * BC + tl.arange(0, BC)
+    seq = tl.zeros([BC], dtype=tl.int32)
+    first = tl.zeros([BC], dtype=tl.int32)
+    carry = tl.sum(tl.zeros([BN], dtype=tl.int32), axis=0)
+    for n0 in range(0, num_seqs, BN):
+        o_n = n0 + tl.arange(0, BN)
+        m_n = o_n < num_seqs
+        bos = tl.load(cu_steps + o_n, mask=m_n, other=0).to(tl.int32)
+        eos = tl.load(cu_steps + o_n + 1, mask=m_n, other=0).to(tl.int32)
+        count = tl.cdiv(eos - bos, BT)
+        end = carry + tl.cumsum(count, axis=0)
+        start = end - count
+        if i_c == 0:
+            tl.store(chunk_offsets + o_n, start, mask=m_n)
+            tl.store(chunk_offsets + o_n + 1, end, mask=m_n)
+        ended = m_n[None, :] & (end[None, :] <= o_c[:, None])
+        seq += tl.sum(ended.to(tl.int32), axis=1)
+        started = m_n[None, :] & (start[None, :] <= o_c[:, None])
+        first = tl.maximum(first, tl.max(tl.where(started, start[None, :], 0), axis=1))
+        carry += tl.sum(count, axis=0)
+    seq = tl.minimum(seq, num_seqs - 1)
+    m_c = o_c < num_chunks
+    tl.store(chunk_indices + o_c * 2, seq, mask=m_c)
+    tl.store(chunk_indices + o_c * 2 + 1, o_c - first, mask=m_c)
+
+
+def _chunk_list(
+    cu_steps: torch.Tensor, steps: int, chunk_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`(chunk_indices, chunk_offsets)` for `chunk_size`-sub-step chunks, built on the device.
+
+    The list has `cdiv(steps, chunk_size) + num_seqs - 1` entries, a bound the
+    shapes give: rounding up, each sequence after the first adds at most one chunk
+    to `cdiv(steps, chunk_size)`. So no batch has more chunks, and one sequence has
+    exactly that many.
+    """
+    num_seqs = cu_steps.shape[0] - 1
+    num_chunks = triton.cdiv(steps, chunk_size) + num_seqs - 1
+    chunk_indices = cu_steps.new_empty((num_chunks, 2))
+    chunk_offsets = cu_steps.new_empty((num_seqs + 1,))
+    block = 64
+    _chunk_list_kernel[(triton.cdiv(num_chunks, block),)](
+        cu_steps,
+        chunk_indices,
+        chunk_offsets,
+        num_seqs,
+        num_chunks,
+        BT=chunk_size,
+        BC=block,
+        BN=block,
+        num_warps=4,
+    )
+    return chunk_indices, chunk_offsets
 
 
 @triton.jit
@@ -142,13 +226,16 @@ def _gdp_chunk_fwd(
     """Expand each token into its NH Householder sub-steps and run the vendored
     gated-delta-rule chunk stages over the expanded sequences.
 
-    The stages are called one by one rather than through the vendored wrapper
-    for two reasons, both measured: its `chunk_local_cumsum` is the parallel scan
-    `_decay_cumsum_kernel` replaces, and its indexed in-place state path is
-    autotuned without restoring the state, so the first call per shape advances
-    the pool on every benchmark run of every config it tries. Here the states are
-    gathered into a buffer the kernel only reads, and the final states are
-    scattered back after it.
+    The stages' kernels are launched one by one rather than through the vendored
+    wrapper for three reasons, all measured: its `chunk_local_cumsum` is the
+    parallel scan `_decay_cumsum_kernel` replaces; its indexed in-place state path
+    is autotuned without restoring the state, so the first call per shape
+    advances the pool on every benchmark run of every config it tries; and each
+    stage's wrapper builds its chunk list on the host, two device round trips
+    per list. Here the states are gathered into a buffer the kernel only reads
+    and the final states scattered back after it, and the chunk lists come from
+    `_chunk_list`: each kernel is launched exactly as its wrapper launches it,
+    with the same constants, over a grid sized from a bound instead of the count.
     """
     num_tokens, num_householder, num_heads, value_dim = v.shape
     key_dim = k.shape[-1]
@@ -156,7 +243,11 @@ def _gdp_chunk_fwd(
     if num_tokens == 0:
         return out
     steps = num_tokens * num_householder
+    num_seqs = cu_seqlens.shape[0] - 1
     cu_steps = cu_seqlens.to(torch.long) * num_householder
+    chunks, chunk_offsets = _chunk_list(cu_steps, steps, _BT)
+    diag_blocks, _ = _chunk_list(cu_steps, steps, _BT_DIAG)
+    num_chunks = chunks.shape[0]
 
     q_steps = torch.empty((1, steps, num_heads, key_dim), dtype=q.dtype, device=q.device)
     k_steps = torch.empty_like(q_steps)
@@ -177,14 +268,12 @@ def _gdp_chunk_fwd(
     v_steps = v.contiguous().view(1, steps, num_heads, value_dim)
     beta_steps = beta.contiguous().view(1, steps, num_heads)
 
-    # Host sync: the vendored stages size their grids from the chunk list.
-    chunk_indices = prepare_chunk_indices(cu_steps, _BT)
     g_cumsum = torch.empty((1, steps, num_heads), dtype=torch.float32, device=q.device)
-    _decay_cumsum_kernel[(chunk_indices.shape[0],)](
+    _decay_cumsum_kernel[(num_chunks,)](
         g,
         g_cumsum,
         cu_steps,
-        chunk_indices,
+        chunks,
         *g.stride(),
         H=num_heads,
         NH=num_householder,
@@ -193,40 +282,134 @@ def _gdp_chunk_fwd(
         num_warps=4,
     )
 
-    a = chunk_scaled_dot_kkt_fwd(
+    # chunk_scaled_dot_kkt_fwd: beta * K K^T within each chunk, strictly lower.
+    a = torch.empty((1, steps, num_heads, _BT), dtype=torch.float32, device=q.device)
+    chunk_scaled_dot_kkt_fwd_kernel[(num_chunks, num_heads)](
         k=k_steps,
         beta=beta_steps,
         g_cumsum=g_cumsum,
+        A=a,
         cu_seqlens=cu_steps,
-        chunk_size=_BT,
-        output_dtype=torch.float32,
+        chunk_indices=chunks,
+        T=steps,
+        H=num_heads,
+        Hg=num_heads,
+        K=key_dim,
+        BT=_BT,
+        BK=64,
+        num_warps=8,
+        num_stages=3,
     )
-    a = solve_tril(A=a, cu_seqlens=cu_steps, output_dtype=k_steps.dtype)
-    w, u = recompute_w_u_fwd(
-        k=k_steps, v=v_steps, beta=beta_steps, g_cumsum=g_cumsum, A=a, cu_seqlens=cu_steps
+    # solve_tril: (I + A)^-1, the 16-sub-step diagonal blocks first, then merged.
+    a_diag = torch.empty((1, steps, num_heads, _BT_DIAG), dtype=torch.float32, device=q.device)
+    solve_tril_16x16_kernel[(diag_blocks.shape[0], num_heads)](
+        A=a,
+        Ad=a_diag,
+        cu_seqlens=cu_steps,
+        chunk_indices=diag_blocks,
+        T=steps,
+        H=num_heads,
+        BT=_BT,
+        num_warps=1,
+        num_stages=4,
+    )
+    a_inv = torch.empty((1, steps, num_heads, _BT), dtype=k_steps.dtype, device=q.device)
+    merge_16x16_to_64x64_inverse_kernel[(num_chunks, num_heads)](
+        A=a,
+        Ad=a_diag,
+        Ai=a_inv,
+        cu_seqlens=cu_steps,
+        chunk_indices=chunks,
+        T=steps,
+        H=num_heads,
+        BT=_BT,
+        num_warps=4,
+        num_stages=3,
+    )
+    # recompute_w_u_fwd: the WY factors.
+    u = torch.empty_like(v_steps)
+    w = k_steps.new_empty(1, steps, num_heads, key_dim)
+    recompute_w_u_fwd_kernel[(num_chunks, num_heads)](
+        k=k_steps,
+        v=v_steps,
+        beta=beta_steps,
+        w=w,
+        u=u,
+        A=a_inv,
+        g=g_cumsum,
+        cu_seqlens=cu_steps,
+        chunk_indices=chunks,
+        T=steps,
+        H=num_heads,
+        Hg=num_heads,
+        K=key_dim,
+        V=value_dim,
+        BT=_BT,
+        BK=64,
+        BV=64,
+        num_warps=4,
+        num_stages=3,
     )
     rows = slots.to(torch.long)
     # A fresh sequence's slot holds whatever its previous owner left there.
     initial = torch.where(has_initial_state[:, None, None, None], state_pool[rows], 0.0)
-    h, v_new, final = chunk_gated_delta_rule_fwd_h(
-        k=k_steps,
-        w=w,
-        u=u,
-        g=g_cumsum,
-        initial_state=initial,
-        output_final_state=True,
-        chunk_size=_BT,
-        cu_seqlens=cu_steps,
+    # chunk_gated_delta_rule_fwd_h: the state entering each chunk, one program per
+    # sequence and head, so its grid needs only the sequence count.
+    h = k_steps.new_empty(1, num_chunks, num_heads, key_dim, value_dim)
+    v_new = torch.empty_like(u)
+    final = torch.empty(
+        (num_seqs, num_heads, value_dim, key_dim), dtype=torch.float32, device=q.device
     )
-    o = chunk_fwd_o(
-        q=q_steps,
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[
+        lambda meta: (triton.cdiv(value_dim, meta["BV"]), num_seqs * num_heads)
+    ](
         k=k_steps,
-        v=v_new,
-        h=h,
+        v=u,
+        w=w,
+        v_new=v_new,
         g=g_cumsum,
-        scale=scale,
+        h=h,
+        h0=initial,
+        h0_i=None,
+        ht=final,
         cu_seqlens=cu_steps,
-        chunk_size=_BT,
+        chunk_offsets=chunk_offsets,
+        T=steps,
+        stride_h0=initial.stride(0),
+        H=num_heads,
+        Hg=num_heads,
+        K=key_dim,
+        V=value_dim,
+        BT=_BT,
+    )
+    # chunk_fwd_o: its block shrinks to 16 or 32 sub-steps when the whole batch is
+    # that short, and every sequence is then one chunk at either size.
+    out_block = min(_BT, max(16, triton.next_power_of_2(steps)))
+    if out_block == _BT:
+        out_chunks = chunks
+    elif out_block == _BT_DIAG:
+        out_chunks = diag_blocks
+    else:
+        out_chunks, _ = _chunk_list(cu_steps, steps, out_block)
+    o = torch.empty_like(v_new)
+    chunk_fwd_kernel_o[
+        lambda meta: (triton.cdiv(value_dim, meta["BV"]), out_chunks.shape[0], num_heads)
+    ](
+        q_steps,
+        k_steps,
+        v_new,
+        h,
+        g_cumsum,
+        o,
+        cu_steps,
+        out_chunks,
+        scale,
+        T=steps,
+        H=num_heads,
+        Hg=num_heads,
+        K=key_dim,
+        V=value_dim,
+        BT=out_block,
     )
     out.copy_(o.view(num_tokens, num_householder, num_heads, value_dim)[:, -1])
     state_pool[rows] = final.to(state_pool.dtype)
@@ -377,10 +560,13 @@ class GdpChunk(OpWrapper):
     autotuned without `restore_value`, so its first call per shape advances
     the pool on every benchmark run.
 
-    Host syncs: `prepare_chunk_indices` reads the sequence lengths on the host,
-    once for the 64-step chunks and once for `solve_tril`'s 16-step blocks, on
-    offsets this call derives -- so every call syncs, every layer. Not
-    CUDA-graph capturable; prefill only.
+    No host syncs: the chunk lists the vendored stages index are built on the
+    device (`_chunk_list`) and every grid is sized from the token and sequence
+    counts, never from the lengths, where each stage's wrapper reads the lengths
+    on the host with `prepare_chunk_indices` (every call, every layer). So the
+    call can be captured in a CUDA graph once its kernels are compiled and
+    autotuned, and one capture serves any split of the same token count into the
+    same number of sequences; the test replays one. Prefill only.
 
     Uncertified: any other head count, head dims or Householder count, a bf16
     state pool, query/key heads fewer than value heads, fp16 or fp32 q/k/v,

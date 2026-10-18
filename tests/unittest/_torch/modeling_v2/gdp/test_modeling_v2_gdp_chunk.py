@@ -9,14 +9,25 @@ import zlib
 import pytest
 import torch
 import torch.nn.functional as F
+import triton
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import (
+    _chunk_list,
+    _decay_cumsum_kernel,
+    _expand_qk_kernel,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk as op
 from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
 )
+from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_o
+from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from tensorrt_llm._torch.modules.fla.cumsum import chunk_local_cumsum
+from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices, prepare_chunk_offsets
+from tensorrt_llm._torch.modules.fla.solve_tril import solve_tril
+from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd
 
 __extra_import_path__ = [".."]
 from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: E402,F401
@@ -236,6 +247,185 @@ def test_guard_refuses_offsets_that_miss_the_tokens() -> None:
     with pytest.raises(AssertionError, match="run from 0 to the token count"):
         with validating(op):
             op(**args)
+
+
+def _through_the_wrappers(
+    q, k, v, g, beta, state_pool, slots, cu_seqlens, has_initial_state, scale
+):
+    """The entry's composition run the way the vendored stage wrappers run it: each
+    wrapper builds its chunk list on the host with `prepare_chunk_indices` and sizes
+    its grid from the list's length. The expansion, the decay cumsum, the kernels
+    and their constants are the entry's. Writes the final states into
+    `state_pool[slots]` and returns the output."""
+    num_tokens, nh, h, dv = v.shape
+    dk = k.shape[-1]
+    steps = num_tokens * nh
+    cu_steps = cu_seqlens.long() * nh
+    q_steps = q.new_empty(1, steps, h, dk)
+    k_steps = torch.empty_like(q_steps)
+    _expand_qk_kernel[(num_tokens,)](
+        q,
+        k,
+        q_steps,
+        k_steps,
+        *q.stride(),
+        *k.stride(),
+        H=h,
+        NH=nh,
+        K=dk,
+        BH=triton.next_power_of_2(h),
+        BK=triton.next_power_of_2(dk),
+        num_warps=4,
+    )
+    v_steps = v.contiguous().view(1, steps, h, dv)
+    beta_steps = beta.contiguous().view(1, steps, h)
+    chunk_indices = prepare_chunk_indices(cu_steps, 64)
+    g_cumsum = torch.empty(1, steps, h, dtype=torch.float32, device="cuda")
+    _decay_cumsum_kernel[(chunk_indices.shape[0],)](
+        g,
+        g_cumsum,
+        cu_steps,
+        chunk_indices,
+        *g.stride(),
+        H=h,
+        NH=nh,
+        BT=64,
+        BH=triton.next_power_of_2(h),
+        num_warps=4,
+    )
+    a = chunk_scaled_dot_kkt_fwd(
+        k=k_steps,
+        beta=beta_steps,
+        g_cumsum=g_cumsum,
+        cu_seqlens=cu_steps,
+        chunk_size=64,
+        output_dtype=torch.float32,
+    )
+    a = solve_tril(A=a, cu_seqlens=cu_steps, output_dtype=k_steps.dtype)
+    w, u = recompute_w_u_fwd(
+        k=k_steps, v=v_steps, beta=beta_steps, g_cumsum=g_cumsum, A=a, cu_seqlens=cu_steps
+    )
+    rows = slots.long()
+    initial = torch.where(has_initial_state[:, None, None, None], state_pool[rows], 0.0)
+    states, v_new, final = chunk_gated_delta_rule_fwd_h(
+        k=k_steps,
+        w=w,
+        u=u,
+        g=g_cumsum,
+        initial_state=initial,
+        output_final_state=True,
+        chunk_size=64,
+        cu_seqlens=cu_steps,
+    )
+    o = chunk_fwd_o(
+        q=q_steps,
+        k=k_steps,
+        v=v_new,
+        h=states,
+        g=g_cumsum,
+        scale=scale,
+        cu_seqlens=cu_steps,
+        chunk_size=64,
+    )
+    state_pool[rows] = final.to(state_pool.dtype)
+    return o.view(num_tokens, nh, h, dv)[:, -1].clone()
+
+
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_the_launches_match_the_wrappers_bitwise(cell) -> None:
+    """The entry launches each stage's kernel itself, over chunk lists built on the
+    device and grids sized from a bound; the wrappers build the lists on the host
+    and size the grids exactly. Same kernels with the same constants, so the output
+    and the whole pool memory must come back bit for bit -- the extra programs past
+    the real chunks write nothing."""
+    args, raw = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
+    raw_before = raw.clone()
+    want = _through_the_wrappers(**args)
+    want_raw = raw.clone()
+    raw.copy_(raw_before)
+    got = op(**args)
+    assert torch.equal(got, want), "the entry's output differs from the wrappers'"
+    assert torch.equal(raw, want_raw), "the entry's pool differs from the wrappers'"
+
+
+@pytest.mark.parametrize("chunk_size", [16, 32, 64])
+def test_the_device_chunk_list_is_the_host_list(chunk_size) -> None:
+    """`_chunk_list` against the host builders the wrappers call,
+    `prepare_chunk_indices` and `prepare_chunk_offsets`: one to 300 sequences, past
+    the kernel's 64-sequence block, with lengths of one sub-step, exact multiples of
+    the chunk, one past them, and anything up to 2100. The entries past the real
+    chunks name the last sequence and a chunk past its end, and one sequence gets no
+    such entry at all."""
+    g = torch.Generator().manual_seed(chunk_size)
+    for num_seqs in (1, 2, 3, 63, 64, 65, 200, 300):
+        lens = torch.randint(1, 2100, (num_seqs,), generator=g)
+        lens[1::5] = chunk_size * torch.randint(1, 20, lens[1::5].shape, generator=g)
+        lens[2::5] = lens[1::5][: lens[2::5].numel()] + 1
+        lens[3::5] = 1
+        cu = F.pad(lens.cumsum(0), (1, 0)).cuda()
+        chunk_indices, chunk_offsets = _chunk_list(cu, int(lens.sum()), chunk_size)
+        want = prepare_chunk_indices(cu, chunk_size)
+        assert torch.equal(chunk_offsets, prepare_chunk_offsets(cu, chunk_size)), num_seqs
+        assert torch.equal(chunk_indices[: want.shape[0]], want), num_seqs
+        past = chunk_indices[want.shape[0] :].cpu()
+        assert (past[:, 0] == num_seqs - 1).all(), num_seqs
+        assert (past[:, 1] * chunk_size >= int(lens[-1])).all(), num_seqs
+        assert num_seqs > 1 or past.numel() == 0
+
+
+def test_the_call_never_waits_for_the_device() -> None:
+    """No op in the call blocks the host: under `torch.cuda.set_sync_debug_mode("error")`
+    the waits torch knows of raise. The control is the host builder the wrappers
+    call, `prepare_chunk_indices`, which the same mode refuses. The kernels are
+    compiled and autotuned beforehand: the autotuner times its configs.
+
+    torch calls the mode a prototype that misses some waits; the CUDA-graph test
+    below is the complete check, since any wait on the capturing stream aborts a
+    capture."""
+    cell = next(c for c in op.CELLS if c.spec["init"] == "mixed" and len(c.spec["seq_lens"]) == 8)
+    args, _ = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
+    op(**args)
+    torch.cuda.synchronize()
+    cu_steps = args["cu_seqlens"].long() * cell.spec["householder"]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        with pytest.raises(RuntimeError, match="synchronizing"):
+            prepare_chunk_indices(cu_steps, 64)
+        op(**args)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+
+
+def test_one_cuda_graph_serves_any_split_of_the_tokens() -> None:
+    """Captured on one split of 8192 tokens into four sequences, then replayed on
+    another, the graph reproduces the eager call on the second split bit for bit,
+    output and pool: the grids depend only on the token and sequence counts, and the
+    chunk lists are rebuilt from `cu_seqlens` on the device at every replay."""
+    first = _spec((3, 509, 2600, 5080), init="mixed")
+    second = _spec((4100, 7, 3000, 1085), init="mixed")
+    args, raw = _build(first, seed=31)
+    other, other_raw = _build(second, seed=32)
+    other_before = other_raw.clone()
+    want = op(**other).clone()
+    want_raw = other_raw.clone()
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(**args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = op(**args)
+
+    for name in ("q", "k", "v", "g", "beta", "slots", "cu_seqlens", "has_initial_state"):
+        args[name].copy_(other[name])
+    raw.copy_(other_before)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(got, want), "the replayed output differs from the eager call's"
+    assert torch.equal(raw, want_raw), "the replayed pool differs from the eager call's"
 
 
 def _expanded(args):
