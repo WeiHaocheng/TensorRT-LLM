@@ -11,6 +11,10 @@ class at all; in ``require`` it raises this error instead.
 The checkpoint is a vision-language composite and every target here serves its
 text model alone, so the fingerprint is read off ``text_config``; the vision
 tower takes no part in the decision.
+
+Two topologies have a target: tp1 and dep4. The other layouts of one 4-GPU node
+that could serve the 8K/1K workload are named in the ``NoTarget`` message with
+the reason they have none.
 """
 
 from __future__ import annotations
@@ -64,6 +68,49 @@ _NANO_PREVIEW = dict(
     num_nextn_predict_layers=2,
     mtp_use_repeated_layer=True,
 )
+
+
+#: The other layouts of one 4-GPU node weighed for the 8K/1K workload, and why each has
+#: no target: what the performance model of this checkpoint on GB300 says of it.
+_NOT_IMPLEMENTED = {
+    "tp2": "on the 8K/1K performance model it never reaches the frontier the other topologies form",
+    "dep2": "on the 8K/1K performance model it leads only below 25 tok/s/user, by 5-8% over dep4",
+    "tp4": "on the 8K/1K performance model it leads only at the latency end, and its gain "
+    "there over tp1 with MTP is not established with measured op times",
+    "tep4": "on the 8K/1K performance model it stays within 0.81-1.01x of tp4, which leads "
+    "only at the latency end",
+}
+
+
+def _topology(mapping: Any) -> Optional[str]:
+    """The node layout this mapping is, named as target directories are: ``tp<n>`` (heads and
+    experts' widths split), ``tep<n>`` (heads split, whole experts per rank) or ``dep<n>``
+    (attention DP, whole experts per rank). None for any other layout: pipeline or context
+    parallelism, a MoE split mixing tensor, expert or cluster parallelism, a vocab-parallel
+    lm_head under attention DP, attention DP over one rank or with tensor-parallel experts."""
+    n = mapping.tp_size
+    if mapping.pp_size != 1 or mapping.cp_size != 1 or mapping.world_size != n:
+        return None
+    whole_experts = mapping.moe_ep_size == n and mapping.moe_tp_size == 1
+    if mapping.enable_attention_dp:
+        if n > 1 and whole_experts and not mapping.enable_lm_head_tp_in_adp:
+            return f"dep{n}"
+        return None
+    if mapping.moe_tp_size == n:
+        return f"tp{n}"
+    return f"tep{n}" if whole_experts else None
+
+
+def _parallel_layout(mapping: Any) -> str:
+    """The mapping's facts a target is chosen on, as the ``NoTarget`` message states them."""
+    layout = (
+        f"world_size={mapping.world_size} tp={mapping.tp_size} pp={mapping.pp_size} "
+        f"cp={mapping.cp_size} attention_dp={mapping.enable_attention_dp} "
+        f"moe_ep={mapping.moe_ep_size} moe_tp={mapping.moe_tp_size}"
+    )
+    if mapping.enable_lm_head_tp_in_adp:
+        layout += " lm_head_tp_in_adp=True"
+    return layout
 
 
 def _text_shape(text_config: Any) -> dict:
@@ -137,31 +184,40 @@ def route(
         if shape[name] != want
     ]
 
-    # tp1: one rank holds the whole model. Attention DP over one rank changes
-    # how the shell builds lm_head and which metadata a step carries, so it is
-    # a different deployment rather than a knob.
-    tp1 = mapping.world_size == 1 and not mapping.enable_attention_dp
+    # The node layout, read off the mapping. Each target is one layout because the layout
+    # fixes which weights a rank holds and in what shape, and which collectives a step makes.
+    #   tp1: one rank holds the whole model. Attention DP over one rank changes how the
+    #     shell builds lm_head and which metadata a step carries, so it is not tp1.
+    #   dep4: attention DP over 4 ranks with the routed experts split four ways and nothing
+    #     else divided. The engine states attention DP as tensor_parallel_size=4 plus
+    #     enable_attention_dp, so "nothing else" means whole experts per rank (moe_tp=1) and
+    #     lm_head whole (no enable_lm_head_tp_in_adp); tep4 and tp4 split the mixers' heads.
+    topology = _topology(mapping)
 
-    # Speculative decoding changes the step's structure (a verify step, a draft
-    # loop, the MTP layer's weights and KV), so every mode the target has no
-    # path for is declined here rather than left to crash in the model. The
-    # draft length and its schedule, the acceptance rule and SA drafting are
-    # knobs: they change how many tokens a step carries or which drafts are
-    # kept, not which code runs.
+    # Speculative decoding changes the step's structure (a verify step, a draft loop, the
+    # MTP layer's weights and KV), so every mode the targets have no path for is declined
+    # here rather than left to crash in the model. The draft length and its schedule, the
+    # acceptance rule and SA drafting are knobs: they change how many tokens a step carries
+    # or which drafts are kept, not which code runs.
     declined = _speculation_declined(spec_config)
 
-    # nemotron4-nano-preview's text model on one GB300 (sm103), with one-model
-    # MTP-Eagle on the checkpoint's MTP layer or no speculative decoding.
-    if compute_capability == (10, 3) and not differs and tp1 and declined is None:
-        # One line on purpose: test_modeling_v2_claims finds a family's targets
-        # by reading this import, and the formatter and isort would wrap it.
+    # nemotron4-nano-preview's text model on GB300s (sm103), with one-model MTP-Eagle on the
+    # checkpoint's MTP layer or no speculative decoding.
+    if compute_capability == (10, 3) and not differs and declined is None:
+        # One line per target on purpose: test_modeling_v2_claims finds a family's targets
+        # by reading these imports, and the formatter and isort would wrap them.
         # fmt: off
         # isort: off
-        from .nemotron4_nano_preview__sm_103__tp1.modeling import ModelingV2Nemotron4NanoPreviewSm103Tp1
+        if topology == "tp1":
+            from .nemotron4_nano_preview__sm_103__tp1.modeling import ModelingV2Nemotron4NanoPreviewSm103Tp1
+
+            return ModelingV2Nemotron4NanoPreviewSm103Tp1
+        if topology == "dep4":
+            from .nemotron4_nano_preview__sm_103__dep4.modeling import ModelingV2Nemotron4NanoPreviewSm103Dep4
+
+            return ModelingV2Nemotron4NanoPreviewSm103Dep4
         # isort: on
         # fmt: on
-
-        return ModelingV2Nemotron4NanoPreviewSm103Tp1
 
     speculation = (
         "off"
@@ -170,11 +226,18 @@ def route(
     )
     if declined is not None:
         speculation += f", which the target does not run: {declined}"
+    not_implemented = (
+        f"; {topology} is not implemented: {_NOT_IMPLEMENTED[topology]}"
+        if topology in _NOT_IMPLEMENTED
+        else ""
+    )
     raise NoTarget(
         f"compute capability {compute_capability}, text config "
         + (f"differs: {', '.join(differs)}" if differs else "matches nemotron4-nano-preview")
-        + f", world_size={mapping.world_size} attention_dp={mapping.enable_attention_dp}, "
-        f"speculative decoding {speculation}; the one nemotron4 target is "
-        "nemotron4-nano-preview's text model on sm103, tp1 (one rank, no attention DP), "
-        "with one-model MTP-Eagle on the checkpoint's MTP layer or without speculative decoding"
+        + f", {topology or 'parallel layout'} ({_parallel_layout(mapping)}), "
+        f"speculative decoding {speculation}{not_implemented}; the nemotron4 targets are "
+        "nemotron4-nano-preview's text model on sm103 at tp1 (one rank, no attention DP) "
+        "and dep4 (4 ranks, attention DP, the routed experts split four ways and nothing "
+        "else divided), each with one-model MTP-Eagle on the checkpoint's MTP layer or "
+        "without speculative decoding"
     )
