@@ -51,6 +51,7 @@ _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 MODELING_V2_ROUTERS = {
     "GptOssForCausalLM": "models.gpt_oss.routing",
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
+    "Nemotron4ForConditionalGeneration": "models.nemotron4.routing",
 }
 
 
