@@ -746,7 +746,7 @@ def extract_mamba_kv_cache_params(
     """Build the mamba-related inputs for kv_cache_manager_cls.
 
     Supports Nemotron-hybrid, Qwen3-hybrid (Qwen3-Next + Qwen3.5),
-    Qwen4-Exp, and Kimi K3 (kimi_linear).
+    Qwen4-Exp, Kimi K3 (kimi_linear), GLM-5 Next and Nemotron 4 (GDP).
 
     Args:
         config: HuggingFace model config of a hybrid Mamba model.
