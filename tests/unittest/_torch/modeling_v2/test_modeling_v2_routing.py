@@ -32,9 +32,18 @@ from pydantic import ValidationError
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import ModelConfig, _mirror_text_subconfig_attrs
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
-from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, TorchLlmArgs
+from tensorrt_llm._torch.speculative.utils import (
+    resolve_mtp_checkpoint_source,
+    update_spec_config_from_model_config,
+)
+from tensorrt_llm.llmapi.llm_args import (
+    Eagle3DecodingConfig,
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -376,16 +385,111 @@ def test_nemotron4_without_a_text_config_does_not_match():
         modeling_v2_resolve(config, _llm_args("require"))
 
 
+def _as_loaded(pretrained_config, spec_config):
+    """The speculative config as ``route`` receives it.
+
+    ``ModelConfig.from_pretrained`` mirrors text_config onto the composite, and
+    the model loader resolves the MTP mode against that config before it
+    routes: the checkpoint's own config decides vanilla MTP or MTP-Eagle.
+    """
+    _mirror_text_subconfig_attrs(pretrained_config)
+    resolve_mtp_checkpoint_source(spec_config, _DUMMY_MODEL)
+    update_spec_config_from_model_config(spec_config, pretrained_config)
+    return spec_config
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize(
-    "spec_config",
-    [MTPDecodingConfig(max_draft_len=2), _NGRAM],
-    ids=["mtp", "ngram"],
+    "spec_kwargs",
+    [
+        dict(max_draft_len=2),
+        dict(max_draft_len=3),
+        dict(max_draft_len=2, speculative_model=_DUMMY_MODEL),
+    ],
+    ids=["trained_depth", "longer_draft", "speculative_model_is_the_checkpoint"],
 )
-def test_nemotron4_tp1_declines_speculative_decoding(spec_config):
-    """The tp1 target carries no draft path, so every speculative mode is
-    declined, the checkpoint's own MTP module included, and the message names
-    the mode."""
+def test_nemotron4_tp1_with_mtp_eagle_matches(mode, spec_kwargs):
+    """The checkpoint's MTP layer through the one-model MTP-Eagle loop.
+
+    Two depths are declared over one repeated layer, so the engine reads one
+    stored layer and resolves MTP-Eagle; the draft length is a knob. A
+    ``speculative_model`` naming the checkpoint itself still drafts with its
+    own MTP layer.
+    """
+    pretrained_config = _nemotron4_config()
+    spec_config = _as_loaded(pretrained_config, MTPDecodingConfig(**spec_kwargs))
+    assert pretrained_config.num_nextn_predict_layers == 2
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert spec_config.max_draft_len == spec_kwargs["max_draft_len"]
+
+    config = _model_config(pretrained_config, spec_config=spec_config)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _NEMOTRON4_TARGET
+
+
+@pytest.mark.parametrize(
+    "make_spec_config, missed",
+    [
+        (
+            lambda draft_dir: MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True),
+            r"MTPDecodingConfig \(MTP\), which the target does not run: use_mtp_vanilla",
+        ),
+        (
+            lambda draft_dir: MTPDecodingConfig(
+                max_draft_len=2, use_dynamic_tree=True, dynamic_tree_max_topK=2
+            ),
+            r"\(MTP_EAGLE_ONE_MODEL\), which the target does not run: use_dynamic_tree",
+        ),
+        (
+            lambda draft_dir: MTPDecodingConfig(max_draft_len=2, speculative_model=draft_dir),
+            r"\(MTP_EAGLE_ONE_MODEL\), which the target does not run: speculative_model=.* "
+            "supplies separate draft weights",
+        ),
+        (
+            lambda draft_dir: Eagle3DecodingConfig(max_draft_len=3, speculative_model=draft_dir),
+            r"Eagle3DecodingConfig \(EAGLE3_ONE_MODEL\), which the target does not run",
+        ),
+        (
+            lambda draft_dir: NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2),
+            r"NGramDecodingConfig \(NGRAM\), which the target does not run",
+        ),
+    ],
+    ids=["vanilla", "dynamic_tree", "external_mtp_head", "eagle3", "ngram"],
+)
+def test_nemotron4_tp1_declines_other_speculative_decoding(make_spec_config, missed, tmp_path):
+    """Every draft path but the checkpoint's own MTP layer in one linear chain
+    is declined, and the message says why: vanilla MTP runs a module per depth,
+    a dynamic tree verifies more than one chain, a separate MTP head or draft
+    model brings weights the target does not carry."""
+    pretrained_config = _nemotron4_config()
+    spec_config = _as_loaded(pretrained_config, make_spec_config(str(tmp_path)))
+    config = _model_config(pretrained_config, spec_config=spec_config)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_nemotron4_tp1_declines_mtp_read_as_one_layer_per_depth():
+    """Read as two stored layers, the checkpoint's two declared depths would be
+    vanilla MTP, which the target does not run; route names the count rather
+    than claiming the deployment."""
+    spec_config = MTPDecodingConfig(max_draft_len=2)
+    spec_config.num_nextn_predict_layers = 2
+    assert spec_config.spec_dec_mode.is_mtp_vanilla()
+
     config = _model_config(_nemotron4_config(), spec_config=spec_config)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match=type(spec_config).__name__):
+    with pytest.raises(ValueError, match="num_nextn_predict_layers=2 resolved it to vanilla MTP"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_nemotron4_with_mtp_eagle_on_another_topology_names_the_topology():
+    """MTP-Eagle is not what rules out tp2; the message must not say it is."""
+    pretrained_config = _nemotron4_config()
+    spec_config = _as_loaded(pretrained_config, MTPDecodingConfig(max_draft_len=2))
+    config = _model_config(pretrained_config, spec_config=spec_config, world_size=2, tp_size=2)
+    with pytest.raises(ValueError) as excinfo:
+        modeling_v2_resolve(config, _llm_args("require"))
+    message = str(excinfo.value)
+    assert "world_size=2" in message
+    assert "speculative decoding MTPDecodingConfig (MTP_EAGLE_ONE_MODEL);" in message
+    assert "which the target does not run" not in message

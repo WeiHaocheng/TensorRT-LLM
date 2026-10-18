@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple
 
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
 from ..._router_index import NoTarget
 
 #: One letter per block type of ``text_config.layer_types``, so the block layout
@@ -73,6 +75,43 @@ def _text_shape(text_config: Any) -> dict:
     return shape
 
 
+def _speculation_declined(spec_config: Optional[Any]) -> Optional[str]:
+    """Why the target does not run this speculative decoding; None when it does.
+
+    The draft path is the checkpoint's own MTP layer (``mtp.layers.0``, which
+    ``mtp_use_repeated_layer`` repeats for every draft depth) driven by the
+    one-model MTP-Eagle loop: one linear draft chain per request, the drafter's
+    weights loaded from the target checkpoint. The model loader resolves the
+    mode against the checkpoint config before routing, so ``spec_dec_mode`` is
+    the mode the engine will run.
+    """
+    if spec_config is None:
+        return None
+    if not isinstance(spec_config, MTPDecodingConfig):
+        return "the target drafts only with the checkpoint's own MTP layer"
+    if not spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+        cause = (
+            "use_mtp_vanilla selects"
+            if spec_config.use_mtp_vanilla
+            else f"num_nextn_predict_layers={spec_config.num_nextn_predict_layers} resolved it to"
+        )
+        return (
+            f"{cause} vanilla MTP (one MTP module and KV layer per draft depth), and the "
+            "target replays its one repeated MTP layer through the one-model MTP-Eagle loop"
+        )
+    if spec_config.use_dynamic_tree:
+        return (
+            "use_dynamic_tree drafts a tree, and the target verifies one linear draft chain "
+            "per request, stepping each request's recurrent state through it"
+        )
+    if spec_config.needs_separate_draft_weights:
+        return (
+            f"speculative_model={str(spec_config.speculative_model)!r} supplies separate "
+            "draft weights, and the target drafts with the checkpoint's own MTP layer"
+        )
+    return None
+
+
 def route(
     pretrained_config: Any,
     mapping: Any,
@@ -103,10 +142,17 @@ def route(
     # a different deployment rather than a knob.
     tp1 = mapping.world_size == 1 and not mapping.enable_attention_dp
 
-    # nemotron4-nano-preview's text model on one GB300 (sm103), no speculative
-    # decoding: the target implements no draft path, so claiming such a
-    # deployment would crash in the model instead of declining here.
-    if compute_capability == (10, 3) and not differs and tp1 and spec_config is None:
+    # Speculative decoding changes the step's structure (a verify step, a draft
+    # loop, the MTP layer's weights and KV), so every mode the target has no
+    # path for is declined here rather than left to crash in the model. The
+    # draft length and its schedule, the acceptance rule and SA drafting are
+    # knobs: they change how many tokens a step carries or which drafts are
+    # kept, not which code runs.
+    declined = _speculation_declined(spec_config)
+
+    # nemotron4-nano-preview's text model on one GB300 (sm103), with one-model
+    # MTP-Eagle on the checkpoint's MTP layer or no speculative decoding.
+    if compute_capability == (10, 3) and not differs and tp1 and declined is None:
         # One line on purpose: test_modeling_v2_claims finds a family's targets
         # by reading this import, and the formatter and isort would wrap it.
         # fmt: off
@@ -122,11 +168,13 @@ def route(
         if spec_config is None
         else f"{type(spec_config).__name__} ({spec_config.spec_dec_mode.name})"
     )
+    if declined is not None:
+        speculation += f", which the target does not run: {declined}"
     raise NoTarget(
         f"compute capability {compute_capability}, text config "
         + (f"differs: {', '.join(differs)}" if differs else "matches nemotron4-nano-preview")
         + f", world_size={mapping.world_size} attention_dp={mapping.enable_attention_dp}, "
         f"speculative decoding {speculation}; the one nemotron4 target is "
         "nemotron4-nano-preview's text model on sm103, tp1 (one rank, no attention DP), "
-        "without speculative decoding"
+        "with one-model MTP-Eagle on the checkpoint's MTP layer or without speculative decoding"
     )
