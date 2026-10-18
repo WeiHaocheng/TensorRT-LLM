@@ -10,9 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import gdp_recurrent
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.gdp.gdp_verify import (  # noqa: E501
-    gdp_verify as op,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_verify import gdp_verify as op
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
 __extra_import_path__ = [".."]

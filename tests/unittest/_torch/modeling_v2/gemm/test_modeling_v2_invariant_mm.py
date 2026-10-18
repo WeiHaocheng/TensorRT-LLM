@@ -15,11 +15,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.gemm.invariant_mm import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.invariant_mm import (
     invariant_mm as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import (  # noqa: E402,F401 — path above; fixture by name
     ULP,
     assert_within_ulp,

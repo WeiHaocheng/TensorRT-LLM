@@ -61,6 +61,9 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_con
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.softclamp_relu2 import (
     softclamp_relu2,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.invariant_gen_attention import (
+    invariant_gen_attention,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
@@ -70,10 +73,15 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_up
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_varlen import (
     causal_conv1d_varlen,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_verify import (
+    causal_conv1d_verify,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_gates import gdp_gates
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import gdp_recurrent
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_verify import gdp_verify
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.invariant_mm import invariant_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
     latent_moe_experts,
 )
@@ -100,10 +108,6 @@ from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate
 from tensorrt_llm._utils import prefer_pinned
 
 from . import weights as _weights
-from .ops.attention.invariant_gen_attention import invariant_gen_attention
-from .ops.conv.causal_conv1d_verify import causal_conv1d_verify
-from .ops.gdp.gdp_verify import gdp_verify
-from .ops.gemm.invariant_mm import invariant_mm
 
 #: Block types by what they run: a GDP mixer keeps recurrent and conv state, an
 #: attention mixer keeps paged KV, a dense MLP keeps nothing; the shortcut blocks

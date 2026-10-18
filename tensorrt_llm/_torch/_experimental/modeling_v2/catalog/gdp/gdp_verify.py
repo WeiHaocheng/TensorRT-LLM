@@ -8,17 +8,14 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
+from .._op import Arch, Cell, OpWrapper
 
 # The decode entry's tile, warp count and grid cap. Each token's update has to
 # round exactly as one `gdp_recurrent` call does, and the order of its two
 # reductions over K follows from the tile and the warps.
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import (
-    _BLOCK_V,
-    _MAX_GRID_ROWS,
-    _NUM_WARPS,
-)
-from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+from .gdp_recurrent import _BLOCK_V, _MAX_GRID_ROWS, _NUM_WARPS
 
 
 @triton.jit(do_not_specialize=["num_rows", "num_slots"])

@@ -11,12 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 #: Keys one program attends over. Fixed: a split never follows the batch size,
 #: the tokens per request or the request's own length, so a query token's keys

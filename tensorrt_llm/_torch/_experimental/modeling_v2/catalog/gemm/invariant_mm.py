@@ -11,12 +11,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 
 class _Tile(NamedTuple):

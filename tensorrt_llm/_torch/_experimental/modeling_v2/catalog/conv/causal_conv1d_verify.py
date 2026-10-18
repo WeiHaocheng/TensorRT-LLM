@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: Channels per program and warps per program: one channel per thread. Measured at batch 1, 8,
 #: 64, 256, 512 and 1024, T = 2 and 3, against 64 to 512 channels per program at one channel per

@@ -20,14 +20,14 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.invariant_gen_attention import (
+    invariant_gen_attention as op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.attention.invariant_gen_attention import (  # noqa: E501
-    invariant_gen_attention as op,
-)
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "invariant_gen_attention requires a CUDA device"

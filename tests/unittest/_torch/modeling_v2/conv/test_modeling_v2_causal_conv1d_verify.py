@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_update import (
     causal_conv1d_update as decode,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.conv.causal_conv1d_verify import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_verify import (
     causal_conv1d_verify as op,
 )
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
