@@ -65,7 +65,9 @@ class SoftclampRelu2(OpWrapper):
 
     # The two widths the activation runs at, each at the three token counts that differ in kind:
     # one decode token (a launch of a handful of programs), the largest CUDA-graph decode batch,
-    # and an 8192-token prefill chunk (the bandwidth end). Both widths are multiples of the
+    # and an 8192-token prefill chunk (the bandwidth end). Then the same at a tp4 rank's
+    # quarter of each width: 3072 of the dense MLP's 12288 and 1024 of the shared expert's 4096,
+    # where one decode token is three programs and a single one. Every width is a multiple of the
     # block, so no cell has a partial program; the masked tail is exercised by the test
     # separately, since no width this checkpoint has can produce one.
     CELLS: tuple[Cell, ...] = (
@@ -92,6 +94,30 @@ class SoftclampRelu2(OpWrapper):
         Cell(
             why="shared expert prefill: an 8192-token chunk",
             spec=dict(tokens=8192, width=4096, activation_clamp=16.0),
+        ),
+        Cell(
+            why="tp4 dense MLP decode: one token, a rank's 3072 of 12288",
+            spec=dict(tokens=1, width=3072, activation_clamp=16.0),
+        ),
+        Cell(
+            why="tp4 dense MLP at 1024 tokens, a rank's 3072 of 12288",
+            spec=dict(tokens=1024, width=3072, activation_clamp=16.0),
+        ),
+        Cell(
+            why="tp4 dense MLP prefill: an 8192-token chunk, width 3072",
+            spec=dict(tokens=8192, width=3072, activation_clamp=16.0),
+        ),
+        Cell(
+            why="tp4 shared expert decode: one token, a rank's 1024 of 4096",
+            spec=dict(tokens=1, width=1024, activation_clamp=16.0),
+        ),
+        Cell(
+            why="tp4 shared expert at 1024 tokens, a rank's 1024 of 4096",
+            spec=dict(tokens=1024, width=1024, activation_clamp=16.0),
+        ),
+        Cell(
+            why="tp4 shared expert prefill: an 8192-token chunk, width 1024",
+            spec=dict(tokens=8192, width=1024, activation_clamp=16.0),
         ),
     )
 

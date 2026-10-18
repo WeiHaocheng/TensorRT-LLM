@@ -171,15 +171,16 @@ exercised:
    step: an 8192-token prefill, a 2048-token chunk on 6144 cached tokens,
    mixed steps, decode at B = 1, 64 and 1024, and MTP verify steps (3 query
    tokens per request, linear spec-dec off as sm_103 runs it) at B = 1, 64
-   and 512, alone and beside contexts. Histories are written into scattered
-   pages; each call's appends are checked bitwise, its kernels must be
-   trtllm-gen's and never MMHA, and its writes must stay inside the workspace
-   it sized (a canary past the end). A one-hot readout pins a verify step's
-   rows causal within their own group across small and large batches and
-   short and long histories. Past 32 q heads per KV head, or on pages under 8
-   tokens, generation falls back to MMHA, which computes multi-token rows
-   wrongly without raising (NaNs, or values ~700 ulp off); `is_valid` refuses
-   them.
+   and 512, alone and beside contexts; and the same cells at a tp4 rank's 4
+   query heads over the replicated KV head (4q/1kv d256). Histories are
+   written into scattered pages; each call's appends are checked bitwise, its
+   kernels must be trtllm-gen's and never MMHA, and its writes must stay inside
+   the workspace it sized (a canary past the end). A one-hot readout pins a
+   verify step's rows causal within their own group across small and large
+   batches and short and long histories, at both head counts. Past 32 q heads
+   per KV head, or on pages under 8 tokens, generation falls back to MMHA,
+   which computes multi-token rows wrongly without raising (NaNs, or values
+   ~700 ulp off); `is_valid` refuses them.
 """
 
 import contextlib
@@ -289,7 +290,10 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     softmax, once over the same range in the value product -- and the
     kernel splits both differently from a single fp32 pass. 8 ulp
     element-wise against the row scale and 4 of relative RMS, the same band
-    a two-GEMM MoE chain gets, and for the same reason.
+    a two-GEMM MoE chain gets, and for the same reason. Measured on the
+    nemotron4 cells, at 16 query heads and at a tp4 rank's 4: at most 2.0
+    element-wise (one rounding flip at the top of a row's range) and 0.81 of
+    relative RMS.
 
     Scored in bf16 ulp whatever the output dtype: on the fp8 paths the
     operands are e4m3 and the accumulation is bf16-limited, so fp32's ulp
@@ -5352,9 +5356,10 @@ def test_mla_rejects_null_q_lora_rank() -> None:
 # for them, and what the op does when a multi-token generation row reaches
 # MMHA instead of those kernels.
 
-#: The geometry the entry certifies for nemotron4, read off its own cells.
+#: The geometry the entry certifies for nemotron4, read off its own cells, and a
+#: tp4 rank's: the same at 4 query heads per KV head rather than 16.
 N4 = next(c.spec for c in op.CELLS if c.why.startswith("nemotron4"))
-N4_HQ, N4_HKV, N4_D = N4["num_heads"], N4["num_kv_heads"], N4["head_size"]
+N4_TP4 = next(c.spec for c in op.CELLS if c.why.startswith("nemotron4 tp4"))
 
 #: How far a rival hypothesis has to sit outside a cell's gate, in element ulp
 #: against the row scale (`_compare` admits 8). Measured: the dense-mask rival
@@ -5515,6 +5520,7 @@ def _element_ulp(out: torch.Tensor, ref: torch.Tensor) -> float:
     return ((o - r).abs() / scale).max().item() / ULP[torch.bfloat16]
 
 
+@pytest.mark.parametrize("geometry", [N4, N4_TP4], ids=["16q", "tp4-4q"])
 @pytest.mark.parametrize(
     "batch, histories",
     [
@@ -5527,7 +5533,7 @@ def _element_ulp(out: torch.Tensor, ref: torch.Tensor) -> float:
     ],
     ids=["b1-short", "b1-longest", "b6-mixed", "b64-short", "b64-longest", "b512-mixed"],
 )
-def test_nemotron4_verify_rows_are_causal_within_their_group(batch, histories) -> None:
+def test_nemotron4_verify_rows_are_causal_within_their_group(batch, histories, geometry) -> None:
     """Read a 3-token verify step's attention weights out of its output.
 
     The cached histories carry V = 0 and the step's three tokens carry one-hot
@@ -5537,26 +5543,28 @@ def test_nemotron4_verify_rows_are_causal_within_their_group(batch, histories) -
     0..t. The kernel the op picks changes with batch and history -- SwapsAb at
     small batches, named with a dense mask because causality inside the group
     is a separate compiled option, GroupedKeepsAb with a causal mask at larger
-    ones -- and the parameters span both. A cell alone is a weak witness at
+    ones -- and with the query heads per KV head, so the parameters span both
+    at tp1's 16 and at a tp4 rank's 4. A cell alone is a weak witness at
     long histories: at a 9341-token history the dense-mask rival sits 16
     element ulp from the output, two gate-widths, where short histories put it
     hundreds away.
     """
     step = 3
+    hq, hkv, dim = geometry["num_heads"], geometry["num_kv_heads"], geometry["head_size"]
     gen = torch.Generator().manual_seed(batch)
     torch.manual_seed(batch)
     rows = [(histories[i % len(histories)], step, 1) for i in range(batch)]
-    env = _pool(rows, N4)
+    env = _pool(rows, geometry)
     _seed_histories(env, rows, gen, zero_v=True)
     qkv = env.random_qkv(batch * step)
-    v_col = (N4_HQ + N4_HKV) * N4_D
+    v_col = (hq + hkv) * dim
     qkv[:, v_col:] = 0
     qkv[torch.arange(batch * step), v_col + torch.arange(step).repeat(batch)] = 1.0
     out, kernels, overrun = _profiled_paged_call(env, qkv, [step] * batch, 0, list(range(batch)))
     assert overrun == 0, f"the op wrote {overrun} bytes past the workspace it sized"
     _assert_trtllm_gen(kernels, contexts=False, generations=True)
 
-    weights = out.float().view(batch, step, N4_HQ, N4_D)
+    weights = out.float().view(batch, step, hq, dim)
     for row in range(step):
         assert (weights[:, row, :, row + 1 : step] == 0).all(), (
             f"verify row {row} attends to a later token of its own group ({kernels})"
