@@ -13,7 +13,10 @@ import zlib
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual import wide_residual as entry
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.wide_residual import (
     wide_residual as op,
 )
@@ -168,6 +171,91 @@ def test_a_captured_graph_replays_bitwise() -> None:
     torch.cuda.synchronize()
     for got, want in zip(captured, eager):
         assert torch.equal(got, want)
+
+
+def test_a_programmatic_launch_gives_the_plain_launch_bits(monkeypatch) -> None:
+    """PDL moves when a call starts, not what it computes: every row count it is used for gives
+    the bits of the same call launched plainly (`TRTLLM_ENABLE_PDL=0`)."""
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+    assert entry._launch_with_pdl(entry._PDL_MAX_TOKENS)
+    assert not entry._launch_with_pdl(entry._PDL_MAX_TOKENS + 1)
+    for tokens, reads in ((1, 1), (3, 2), (entry._PDL_MAX_TOKENS, 2)):
+        kwargs = _build(dict(op.CELLS[0].spec, tokens=tokens, write=True, reads=reads), seed=51)
+        start = kwargs["streams"].clone()
+        monkeypatch.setenv("TRTLLM_ENABLE_PDL", "0")
+        plain = op(**{**kwargs, "streams": start.clone()})
+        monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+        pdl = op(**{**kwargs, "streams": start.clone()})
+        for got, want in zip(pdl, plain):
+            assert (got is None and want is None) or torch.equal(got, want), f"T={tokens}"
+
+
+@triton.jit
+def _late_writer(dst_ptr, src_ptr, numel, spins, BLOCK: tl.constexpr):
+    """Let a programmatic dependent start at once, spin, then copy `src` over `dst`."""
+    tl.extra.cuda.gdc_launch_dependents()
+    acc = tl.load(src_ptr).to(tl.float32)
+    for _ in range(spins):
+        acc = acc * 0.999999 + 1e-7
+    offs = tl.arange(0, BLOCK)
+    for start in range(0, numel, BLOCK):
+        mask = start + offs < numel
+        value = tl.load(src_ptr + start + offs, mask=mask, other=0.0)
+        # `acc == acc` holds for every finite acc; it makes each store wait for the spin.
+        tl.store(dst_ptr + start + offs, tl.where(acc == acc, value, 0.0), mask=mask)
+
+
+@triton.jit
+def _copy_without_waiting(dst_ptr, src_ptr, numel, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    for start in range(0, numel, BLOCK):
+        mask = start + offs < numel
+        tl.store(dst_ptr + start + offs, tl.load(src_ptr + start + offs, mask=mask), mask=mask)
+
+
+def test_a_programmatic_launch_reads_the_streams_and_update_after_the_kernel_before_it(
+    monkeypatch,
+) -> None:
+    """Under PDL the op starts before the kernel ahead of it is done, so it must not read what that
+    kernel writes until it is: the streams (the embedding writes them before the first call) and
+    `update` (the branch GEMM writes it). Here that kernel lets its dependents start at once, then
+    spins before writing both; a dependent that read them without waiting reads them stale."""
+    tokens = 4
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+    assert entry._launch_with_pdl(tokens)
+    kwargs = _build(dict(op.CELLS[0].spec, tokens=tokens, write=True, reads=2), seed=61)
+    final_streams, final_update = kwargs["streams"].clone(), kwargs["update"].clone()
+    want = op(**{**kwargs, "streams": final_streams.clone()})
+
+    def late(dst, src, spins=1 << 20):  # a dependent chain of a few ms
+        _late_writer[(1,)](dst, src, src.numel(), spins, BLOCK=1024)
+
+    # Compiled first, with the launch options used below: a first call's compile would let the
+    # writer finish before the dependent was even enqueued.
+    scratch = torch.empty_like(final_update)
+    late(scratch, final_update, spins=16)
+    _copy_without_waiting[(1,)](scratch, final_update, scratch.numel(), BLOCK=1024, launch_pdl=True)
+    torch.cuda.synchronize()
+
+    # The hazard is live: a programmatic dependent that does not wait copies the stale values.
+    stale = torch.zeros_like(final_update)
+    seen = torch.empty_like(final_update)
+    late(stale, final_update)
+    _copy_without_waiting[(1,)](seen, stale, stale.numel(), BLOCK=1024, launch_pdl=True)
+    torch.cuda.synchronize()
+    assert torch.equal(stale, final_update), "the late writer did not copy its source"
+    assert torch.equal(seen, torch.zeros_like(seen)), (
+        "the dependent did not start before the writer finished: this test checks nothing"
+    )
+
+    for name, final in (("streams", final_streams), ("update", final_update)):
+        inputs = dict(streams=final_streams.clone(), update=final_update.clone())
+        inputs[name].zero_()
+        late(inputs[name], final)  # the kernel right before the op writes this input
+        got = op(**{**kwargs, **inputs})
+        torch.cuda.synchronize()
+        for g, w in zip(got, want):
+            assert torch.equal(g, w), f"the op read {name} before the kernel writing it was done"
 
 
 def test_fp32_coefficients_and_update_are_rounded_as_the_checkpoint_rounds_them() -> None:

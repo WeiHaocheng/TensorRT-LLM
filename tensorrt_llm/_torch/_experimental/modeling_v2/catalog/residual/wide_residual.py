@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -22,6 +23,17 @@ _GEOMETRY = dict(streams=3, hidden=3072, eps=1e-5)
 # that chose them by T would give the same token different bits in batches of different size.
 # Four were fastest at every T measured, and one row per program beat two to eight.
 _NUM_WARPS = 4
+
+# Up to this many rows a call's time is one row's latency, and launching it as a programmatic
+# dependent of the kernel before it (PDL) measured 0.5-0.7 us faster a call behind a cuBLAS GEMM,
+# and ~0.2 us in tp1's decode step. From 96 rows it measured no faster, and from 192 slower.
+_PDL_MAX_TOKENS = 64
+
+
+def _launch_with_pdl(num_tokens: int) -> bool:
+    """Whether a call of `num_tokens` rows launches with PDL; `TRTLLM_ENABLE_PDL=0` turns it off."""
+    return num_tokens <= _PDL_MAX_TOKENS and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+
 
 # Why each token count is a cell.
 _TOKENS = (
@@ -50,6 +62,19 @@ def _cell(tokens: int, why_tokens: str, write: bool, reads: int, why_shape: str)
 
 
 @triton.jit
+def _gdc_wait():
+    """`griddepcontrol.wait`, with a memory clobber so that no load is scheduled above it."""
+    tl.inline_asm_elementwise(
+        "griddepcontrol.wait; // dummy $0",
+        "=r,~{memory}",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _rmsnorm_row(acc, g, y_ptr, cols, mask, inv_hidden, eps):
     """Round the read to bf16, then `Nemotron4RMSNorm`: normalize in fp32, round, scale, round.
 
@@ -59,7 +84,7 @@ def _rmsnorm_row(acc, g, y_ptr, cols, mask, inv_hidden, eps):
     x = acc.to(tl.bfloat16).to(tl.float32)
     var = tl.sum(x * x, axis=0) * inv_hidden
     normed = (x * tl.rsqrt(var + eps)).to(tl.bfloat16).to(tl.float32)
-    tl.store(y_ptr + cols, (g * normed).to(tl.bfloat16), mask=mask)
+    tl.store(y_ptr + cols, (g.to(tl.bfloat16).to(tl.float32) * normed).to(tl.bfloat16), mask=mask)
 
 
 @triton.jit
@@ -93,35 +118,56 @@ def _wide_residual_kernel(
     stream order and rounded once. A row's stores land on the elements this thread loaded, so the
     in-place write never races a load of the same row.
 
-    The norm weights are loaded first: behind the variance reduction's barrier they would cost
-    a decode row one more memory round trip.
+    Every load is issued before the first store: a load the compiler cannot prove disjoint from an
+    earlier store is issued after it, behind that store's own inputs, one more memory round trip
+    a row. The loads come in two groups. The parameters first: the norm weights and the
+    coefficients, which nothing in a forward writes. Then the wait for the kernel before this one
+    (`griddepcontrol.wait`), and the streams and `update` behind it. Under a programmatic launch
+    (PDL) the program starts while that kernel drains and the parameters' loads overlap it; under
+    a plain launch the wait returns at once. Either way its memory clobber holds the two groups
+    apart: left to interleave them, the compiler's order measured up to 0.9 us slower a call at one
+    row, and 21% slower for a write and two reads at 8192 rows and over.
     """
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < HIDDEN
-    g0 = tl.load(g0_ptr + cols, mask=mask, other=0.0).to(tl.bfloat16).to(tl.float32)
+    g0 = tl.load(g0_ptr + cols, mask=mask, other=0.0)
     if TWO_READS:
-        g1 = tl.load(g1_ptr + cols, mask=mask, other=0.0).to(tl.bfloat16).to(tl.float32)
+        g1 = tl.load(g1_ptr + cols, mask=mask, other=0.0)
+    f0 = ()
+    f1 = ()
+    r = ()
+    w = ()
+    for k in tl.static_range(STREAMS):
+        f0 = f0 + (tl.load(f0_ptr + k),)
+        if TWO_READS:
+            f1 = f1 + (tl.load(f1_ptr + k),)
+        if WRITE:
+            r = r + (tl.load(r_ptr + k),)
+            w = w + (tl.load(w_ptr + k),)
+    _gdc_wait()
     s_row = s_ptr + row * stride_s
+    s = ()
+    for k in tl.static_range(STREAMS):
+        s = s + (tl.load(s_row + k * HIDDEN + cols, mask=mask, other=0.0),)
     if WRITE:
         u = tl.load(u_ptr + row * stride_u + cols, mask=mask, other=0.0)
         u = u.to(tl.bfloat16).to(tl.float32)
+    tl.extra.cuda.gdc_launch_dependents()
     for k in tl.static_range(STREAMS):
-        s = tl.load(s_row + k * HIDDEN + cols, mask=mask, other=0.0).to(tl.float32)
+        sk = s[k].to(tl.float32)
         if WRITE:
-            r = tl.load(r_ptr + k).to(tl.bfloat16).to(tl.float32)
-            w = tl.load(w_ptr + k).to(tl.bfloat16).to(tl.float32)
-            kept = (s * r).to(tl.bfloat16).to(tl.float32)
-            s = (kept + u * w).to(tl.bfloat16)
-            tl.store(s_row + k * HIDDEN + cols, s, mask=mask)
-            s = s.to(tl.float32)
-        p0 = tl.load(f0_ptr + k).to(tl.bfloat16).to(tl.float32) * s
+            kept = (sk * r[k].to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+            new = (kept + u * w[k].to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
+            tl.store(s_row + k * HIDDEN + cols, new, mask=mask)
+            sk = new.to(tl.float32)
+        p0 = f0[k].to(tl.bfloat16).to(tl.float32) * sk
         if k == 0:
             acc0 = p0
         else:
             acc0 = acc0 + p0
         if TWO_READS:
-            p1 = tl.load(f1_ptr + k).to(tl.bfloat16).to(tl.float32) * s
+            p1 = f1[k].to(tl.bfloat16).to(tl.float32) * sk
             if k == 0:
                 acc1 = p1
             else:
@@ -155,6 +201,10 @@ class WideResidual(OpWrapper):
     The streams come back bit-identical to the checkpoint's torch ops. The normed reads differ from
     them only where the fp32 variance, summed in another order, moves a value across a bf16
     rounding boundary. A captured CUDA graph replays the eager call bit for bit.
+
+    A call of up to `_PDL_MAX_TOKENS` rows launches as a programmatic dependent (PDL) of the kernel
+    before it: it starts while that kernel drains and reads the streams and `update` only once that
+    kernel is done. That moves when it runs, not what it computes.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -176,6 +226,15 @@ class WideResidual(OpWrapper):
 
     One program per token row, the whole row in registers (the hidden width rounded up to a power
     of two). `T = 0` launches nothing.
+
+    PDL follows `TRTLLM_ENABLE_PDL` (default on) and the row count; it changes scheduling, not
+    results, and is not a cell axis. Under it the norm weights and the coefficients are read before
+    the kernel ahead of the call has finished, so that kernel must not write them; nothing in a
+    forward does. The streams and `update` are read after the wait and may come from it, as the
+    streams do from the embedding before the first call.
+
+    The no-write, two-read shape at 8192 rows and over runs ~7% slower in this load order than
+    when the compiler orders the loads itself; no nemotron4 target makes that call.
     """
 
     def __call__(
@@ -197,6 +256,7 @@ class WideResidual(OpWrapper):
         normed = torch.empty(num_tokens, hidden, dtype=streams.dtype, device=streams.device)
         normed2 = torch.empty_like(normed) if two_reads else None
         if num_tokens:
+            pdl = _launch_with_pdl(num_tokens)
             _WIDE_RESIDUAL[(num_tokens,)](
                 streams,
                 update,
@@ -219,6 +279,7 @@ class WideResidual(OpWrapper):
                 WRITE=update is not None,
                 TWO_READS=two_reads,
                 num_warps=_NUM_WARPS,
+                launch_pdl=pdl,
             )
         return streams, normed, normed2
 
