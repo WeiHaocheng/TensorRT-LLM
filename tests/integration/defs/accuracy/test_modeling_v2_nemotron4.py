@@ -168,7 +168,7 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
-    """nemotron4-nano-preview (text model) / sm_103 / tp4, identity."""
+    """nemotron4-nano-preview (text model) / sm_103 / tp4, identity and the mtp2 variant."""
 
     MODEL_NAME = "Nemotron4/nemotron4-nano-preview"
     MODEL_PATH = f"{llm_models_root()}/nemotron4-nano-preview"
@@ -193,31 +193,29 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
     # Every step's tokens. The per-rank GEMM and expert entries are certified
     # up to 8192 rows, and the all-reduce workspace is sized for this many, so
     # the gate keeps each step inside them. A 5-shot GSM8K prompt (at most
-    # ~1.5K tokens) fits in one step, so prompts are not chunked.
+    # ~1.5K tokens) fits in one step, so prompts are not chunked, and a full
+    # batch of MTP verifies is 512 rows of 3 tokens.
     MAX_NUM_TOKENS = 8192
 
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
-    def test_gsm8k(self, mocker):
-        """The identity accuracy gate on 4 ranks.
+    # The checkpoint's trained draft depth: its one MTP layer serves both
+    # depths. It is also a depth at which a tp4 rank's GDP verify gives every
+    # token the bits decode gives it (gdp_verify's note). MTPDecodingConfig
+    # defaults to a depth of 1, so it is stated.
+    MTP_DRAFT_LEN = 2
 
-        It holds tp4 to the bar tp1 is held to: the anchor is a property of
-        the checkpoint, and the topology only changes where the row-parallel
-        projections' and the routed experts' sums are rounded. Each rank
-        rounds its partial to bf16, and the all-reduce adds the four in fp32,
-        in rank order, and rounds once, so every rank holds the same bits and
-        forms the same logits.
+    # There is deliberately no standalone identity gsm8k case. The paired test
+    # below evaluates the identity config as its first leg, and
+    # ``task.evaluate`` asserts accuracy against the reference on the way past,
+    # so a separate one would gate nothing new for one more 4-rank engine boot.
 
-        The step contract is checked on every rank's first forward, as on tp1;
-        the switch travels as ``env_overrides`` because the check runs on the
-        ranks.
-        """
-        # The stock protocol, as the anchor was measured: 5-shot, no chat
-        # template, the default 256 output tokens. Only the filter is patched.
-        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
-        task = GSM8K(self.MODEL_NAME)
-
-        with LLM(
+    def _llm(self, **variant) -> LLM:
+        # Built fresh for each leg, so nothing the engine resolves into one
+        # leg's config objects reaches the other.
+        #
+        # The step contract is checked on every rank's first forward, as on
+        # tp1; the switch travels as ``env_overrides`` because the check runs
+        # on the ranks.
+        return LLM(
             self.MODEL_PATH,
             modeling_v2="require",
             env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
@@ -230,5 +228,69 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
                 enable_padding=True, max_batch_size=self.MAX_BATCH_SIZE
             ),
             **self.TP4,
+            **variant,
+        )
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_gsm8k_identity_vs_mtp2(self, mocker):
+        """The identity accuracy gate on 4 ranks, and the gate on MTP not moving it.
+
+        It holds tp4 to the bar tp1 is held to: the anchor is a property of
+        the checkpoint, and the topology only changes where the row-parallel
+        projections' and the routed experts' sums are rounded. Each rank
+        rounds its partial to bf16, and the all-reduce adds the four in fp32,
+        in rank order, and rounds once, so every rank holds the same bits and
+        forms the same logits.
+
+        Sampling is greedy, so a draft is accepted only where it equals the
+        target's own next token: MTP on emits the target model's greedy text.
+        A verify gives each of its tokens the bits a decode step gives it, so
+        the two scores can differ only where a prefill or mixed step, which
+        the two legs batch differently, tips a near-tie the other way.
+
+        Both legs assert accuracy against the registered reference as they
+        run, and the MTP row there carries the same anchor, so MTP on is held
+        to the bar MTP off is held to. Both are measured in this one test, so
+        the variance of the session is common to both and cancels.
+
+        The acceptance length is reported, not gated, as on tp1: GSM8K has no
+        reference acceptance for this checkpoint. Computing it does assert
+        that the MTP leg drafted at all.
+        """
+        # The stock protocol, as the anchor was measured: 5-shot, no chat
+        # template, the default 256 output tokens. Only the filter is patched.
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+        task = GSM8K(self.MODEL_NAME)
+
+        with self._llm() as llm:
+            identity = task.evaluate(llm)
+
+        # The default kv-cache fraction is kept. A rank's verify states are a
+        # quarter of tp1's (~10 GiB at max_batch_size 512), so the quota left
+        # with MTP, ~190 GiB a rank against ~203 GiB without, is far more than
+        # a full batch of GSM8K requests takes.
+        #
+        # Every iteration's stats are kept (``max_stats_len=-1``), so the
+        # acceptance length covers the whole run rather than its last 1000
+        # iterations.
+        with self._llm(
+            speculative_config=MTPDecodingConfig(max_draft_len=self.MTP_DRAFT_LEN),
+            enable_iter_perf_stats=True,
+            max_stats_len=-1,
         ) as llm:
-            task.evaluate(llm)
+            mtp2 = task.evaluate(llm)
+            acceptance_length = compute_acceptance_length(llm)
+
+        delta = mtp2 - identity
+        print(
+            f"[modeling_v2] gsm8k tp4 identity={identity:.4f} mtp2={mtp2:.4f} "
+            f"delta={delta:+.4f} acceptance_length={acceptance_length:.4f}"
+        )
+        # 2 sigma at the 1.36 stderr this benchmark reports at n=1319 for a
+        # score near 57%, as on tp1.
+        assert abs(delta) < 2.7, (
+            f"MTP moved gsm8k by {delta:+.4f} on tp4 (identity={identity:.4f}, "
+            f"mtp2={mtp2:.4f}); greedy MTP emits the target's own tokens, so "
+            f"this is not near-tie noise"
+        )
