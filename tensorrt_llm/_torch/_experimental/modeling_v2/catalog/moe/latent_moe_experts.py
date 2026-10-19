@@ -732,9 +732,9 @@ class LatentMoeExperts(OpWrapper):
     note = """
     Certified: bf16 x and weights, fp32 routing weights, int32 ids, top-10 of 512, latent 768,
     intermediate 4096, clamp 16, the window (0, 512) up to 16384 tokens, and the 4-rank
-    expert-parallel windows (128 r, 128): r = 0 and 3 from 4 to 32768 gathered tokens with bf16
+    expert-parallel windows (128 r, 128): r = 0 and 3 from 4 to 65536 gathered tokens with bf16
     and fp32 outputs, r = 1 at 256 tokens. Also intermediate 1024, a 4-rank tensor-parallel
-    rank's slice of every expert, over the window (0, 512) from 1 to 8192 tokens with bf16 and
+    rank's slice of every expert, over the window (0, 512) from 1 to 16384 tokens with bf16 and
     fp32 outputs. Not certified, because no target here reaches it: another top-k, latent or
     intermediate width, another window size, a window at intermediate 1024, fp16 or fp64
     outputs, a zero-token batch, and a token that names the same expert twice (the checkpoint's
@@ -784,8 +784,9 @@ class LatentMoeExperts(OpWrapper):
 
     Memory per call, at T tokens: the down-projection output [T*10, 768] bf16 and the
     intermediate [T*10, 4096] bf16, plus the gathered x [T*10, 768] on the grouped-GEMM path --
-    1.3 GB at T = 16384. A window sizes them for every slot too, in window or not: the in-window
-    count is only known on the device.
+    1.3 GB of intermediate at T = 16384. A window sizes them for every slot too, in window or
+    not: the in-window count is only known on the device. So a dep4 rank's window over 65536
+    gathered tokens holds a 5.4 GB intermediate of 2.7e9 elements, past 2^31 (a cell).
     """
 
     def __call__(
