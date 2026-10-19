@@ -35,18 +35,22 @@ turns the engine's per-step slot list into the slots the state entries read;
 each target's `step_args` projects the prepared metadata onto the explicit
 arguments its forward passes.
 
-Numerics across batches. Every step runs its GEMMs through cuBLAS and its
-attention through `thop_attention`: a decode step's generation kernels, an MTP
-verify's over 1 + D tokens a row, a prefill's context kernel. cuBLAS picks its
-kernel by the row count and the attention kernels by the batch, and some of
-them split their sums differently, so a request's logits and the state it
-writes move in the last bits with the batch it runs in: a padded CUDA-graph
-batch against the same step run eagerly, a verify token against the MTP-off
-decode step of the same token. Greedy output can therefore part between such
-runs where the top two tokens are nearly tied; the gates bound every parting
-by a near-tie band measured on this target. The MTP layer's draft steps run
-the same kernels: a draft's bits change which drafts the trunk accepts, and
-the tokens it emits are the verify's own greedy choices.
+Numerics across batches. A prefill or mixed step runs its GEMMs through
+cuBLAS. A decode or verify step -- the target CUDA graphs capture -- runs each
+bf16 GEMM through the low-M kernel `lowm_entry` names for its (rows, k, n),
+and cuBLAS where it names none, and its router through `dsv3_router_gemm` up
+to 8 rows. Attention goes through `thop_attention`: a decode step's
+generation kernels, an MTP verify's over 1 + D tokens a row, a prefill's
+context kernel. Every one of these picks its kernel by the row count or the
+batch, and some of them split their sums differently, so a request's logits
+and the state it writes move in the last bits with the batch it runs in: a
+padded CUDA-graph batch against the same step run eagerly, a verify token
+against the MTP-off decode step of the same token. Greedy output can
+therefore part between such runs where the top two tokens are nearly tied;
+the gates bound every parting by a near-tie band measured on this target. The
+MTP layer's draft steps run the same kernels: a draft's bits change which
+drafts the trunk accepts, and the tokens it emits are the verify's own greedy
+choices.
 """
 
 import weakref
@@ -66,19 +70,25 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_update import (
     causal_conv1d_update,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_varlen import (
-    causal_conv1d_varlen,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_verify import (
     causal_conv1d_verify,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.triton_causal_conv1d_varlen import (  # noqa: E501
+    triton_causal_conv1d_varlen,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.flashinfer_gdp_chunk import (
+    flashinfer_gdp_chunk,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_gates import gdp_gates
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import gdp_recurrent
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_verify import gdp_verify
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
-    latent_moe_experts,
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.dsv3_router_gemm import (
+    dsv3_router_gemm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.lowm_plan import lowm_entry
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts_fused_act import (  # noqa: E501
+    latent_moe_experts_fused_act,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
@@ -87,7 +97,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm import gated_rmsnorm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm_multirow import (
+    gated_rmsnorm_multirow,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.wide_residual import (
     wide_residual,
 )
@@ -110,6 +122,16 @@ from . import weights as _weights
 _GDP_BLOCKS = ("linear_attention", "shortcut_moe_gdp")
 _ATTENTION_BLOCKS = ("shortcut_moe_attn",)
 _SHORTCUT_BLOCKS = ("shortcut_moe_attn", "shortcut_moe_gdp")
+
+#: The scratch prompts that compile the chunked GDP recurrence's two FlashInfer kernels at load
+#: (`PrefillTarget.warm_up`): one long enough for the context-parallel kernel, one short enough
+#: for the per-sequence one.
+_WARM_CP_TOKENS = 2048
+_WARM_PER_SEQUENCE_TOKENS = 64
+
+#: The most rows `dsv3_router_gemm`'s own kernel takes at the router's 512 x 3072; cuBLAS is the
+#: faster router GEMM above it.
+_ROUTER_KERNEL_ROWS = 8
 
 # thop_attention's arguments that do not move with the step. NoPE: no positional
 # encoding at all (`Nemotron4Attention` applies none), so the rope_* values are
@@ -585,7 +607,8 @@ class Nemotron4NanoPreviewTp1ModelingV2(DecoderModel):
         self._decode: "DecodeTarget | None" = None
 
     def post_load_weights(self) -> None:
-        """Construct the two targets, now that the weights are real.
+        """Construct the two targets, now that the weights are real, and compile the
+        chunked GDP recurrence's kernels (`PrefillTarget.warm_up`).
 
         Must only be called after meta init is over, never from `__init__`, where the
         shell's containers are still meta.
@@ -596,6 +619,7 @@ class Nemotron4NanoPreviewTp1ModelingV2(DecoderModel):
         """
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
+        self._prefill.warm_up()
 
     def state_views(self, kv_cache_manager: MambaHybridCacheManager) -> _StateViews:
         """The per-layer cache addresses of the manager that prepared this step.
@@ -775,7 +799,9 @@ class PrefillTarget:
         follow take one slot each, and every one of them the same number of tokens: one,
         or 1 + D under MTP, whose states go to the `intermediate_*` buffers.
         `query_start_loc` counts one token per generation row, so only its first
-        `num_contexts + 1` entries hold under MTP.
+        `num_contexts + 1` entries hold under MTP. `max_ctx_len`, the longest context
+        row's token count, is read off the host copy of the row lengths: it picks the
+        chunked recurrence's kernel without a device round trip.
         """
         state = _state_metadata(md)
         views = self.core.state_views(md.kv_cache_manager)
@@ -787,6 +813,7 @@ class PrefillTarget:
             num_rows=num_rows,
             num_contexts=num_contexts,
             num_ctx_tokens=md.num_ctx_tokens,
+            max_ctx_len=int(md.seq_lens[:num_contexts].max()) if num_contexts else 0,
             query_start_loc=state.query_start_loc,
             query_start_loc_long=state.query_start_loc_long,
             has_initial_state=state.has_initial_states[:num_contexts],
@@ -905,7 +932,7 @@ class PrefillTarget:
             conv_out = torch.empty(
                 num_ctx_tokens, d.conv.stop - d.conv.start, dtype=proj.dtype, device=proj.device
             ).t()
-            causal_conv1d_varlen(
+            triton_causal_conv1d_varlen(
                 proj[ctx, d.conv].t(),
                 g.conv,
                 None,
@@ -917,23 +944,16 @@ class PrefillTarget:
                 PAD_SLOT_ID,
                 conv_out,
             )
-            vkq = conv_out.t()
             outs.append(
-                gdp_chunk(
-                    vkq[:, d.conv_q].view(num_ctx_tokens, d.gdp_heads, d.gdp_key),
-                    vkq[:, d.conv_k].view(
-                        num_ctx_tokens, d.gdp_householder, d.gdp_heads, d.gdp_key
-                    ),
-                    vkq[:, d.conv_v].view(
-                        num_ctx_tokens, d.gdp_householder, d.gdp_heads, d.gdp_value
-                    ),
+                self._gdp_chunk(
+                    conv_out.t(),
                     decay[ctx],
                     beta[ctx],
                     ssm_states,
                     slots,
                     step["query_start_loc_long"][: num_contexts + 1],
                     step["has_initial_state"],
-                    d.gdp_scale,
+                    step["max_ctx_len"],
                 )
             )
         if num_rows > num_contexts:
@@ -949,17 +969,73 @@ class PrefillTarget:
                 )
             )
         out = outs[0] if len(outs) == 1 else torch.cat(outs)
-        y = gated_rmsnorm(
+        y = gated_rmsnorm_multirow(
             out.view(num_tokens, d.gdp_value_dim),
+            proj[:, : d.gdp_value_dim],
             g.norm,
-            None,
             d.gdp_eps,
-            z=proj[:, : d.gdp_value_dim],
-            group_size=d.gdp_value,
-            norm_before_gate=False,
-            is_rms_norm=True,
+            d.gdp_value,
         )
         return cublas_mm(y, g.out_proj)
+
+    def _gdp_chunk(
+        self,
+        vkq: torch.Tensor,
+        decay: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_states: torch.Tensor,
+        slots: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """The chunked GDP recurrence of the context rows' tokens: `vkq` is their conv output
+        `[tokens, V0..V2 K0..K2 Q]`, each row starts from zero or from its slot and leaves its
+        final state there. `max_seqlen`, the longest row's token count, picks FlashInfer's
+        context-parallel kernel or its per-sequence one."""
+        d = self._d
+        num_tokens = vkq.shape[0]
+        return flashinfer_gdp_chunk(
+            vkq[:, d.conv_q].view(num_tokens, d.gdp_heads, d.gdp_key),
+            vkq[:, d.conv_k].view(num_tokens, d.gdp_householder, d.gdp_heads, d.gdp_key),
+            vkq[:, d.conv_v].view(num_tokens, d.gdp_householder, d.gdp_heads, d.gdp_value),
+            decay,
+            beta,
+            ssm_states,
+            slots,
+            cu_seqlens,
+            has_initial_state,
+            d.gdp_scale,
+            max_seqlen,
+        )
+
+    def warm_up(self) -> None:
+        """Compile the chunked recurrence's kernels before the first served prompt.
+
+        FlashInfer compiles each of its two kernels on its first call in a process, for each
+        head count -- seconds each -- and never again for any token count. The engine's own
+        warmup reaches only the context-parallel one (its prompts are long), so a first short
+        prompt would stall on the other mid-serve. One call per kernel on scratch rows, each
+        `max_seqlen` on its side of the choice, compiles both.
+        """
+        d = self._d
+        device = self._embed.device
+        width = d.conv.stop - d.conv.start
+        pool = torch.zeros(1, d.gdp_heads, d.gdp_value, d.gdp_key, device=device)
+        slots = torch.zeros(1, dtype=torch.int32, device=device)
+        fresh = torch.zeros(1, dtype=torch.bool, device=device)
+        for tokens in (_WARM_CP_TOKENS, _WARM_PER_SEQUENCE_TOKENS):
+            vkq = torch.full((tokens, width), 0.01, dtype=self._embed.dtype, device=device)
+            self._gdp_chunk(
+                vkq,
+                torch.full((tokens, d.gdp_heads), -0.01, device=device),
+                torch.full((tokens, d.gdp_householder, d.gdp_heads), 0.5, device=device),
+                pool,
+                slots,
+                torch.tensor([0, tokens], dtype=torch.long, device=device),
+                fresh,
+                tokens,
+            )
 
     def _gdp_generation(
         self,
@@ -1035,7 +1111,7 @@ class PrefillTarget:
             d.top_k,
             d.routed_scale,
         )
-        experts = latent_moe_experts(
+        experts = latent_moe_experts_fused_act(
             cublas_mm(routed, m.fc1_latent),
             ids,
             weights,
@@ -1097,10 +1173,14 @@ class DecodeTarget:
     """The specialization: routed to only when there are no context rows.
 
     Every row is a generation row: one token, or under MTP the 1 + D tokens a verify
-    runs. The GEMMs run through cuBLAS and attention through `thop_attention`'s
-    generation kernels, as a prefill step's generation rows do; the GDP and conv run
-    their decode entries for one token and their verify entries for 1 + D. This is the
-    target CUDA graphs capture, at every padded batch size.
+    runs. Attention runs through `thop_attention`'s generation kernels, as a prefill
+    step's generation rows do; the GDP and conv run their decode entries for one token
+    and their verify entries for 1 + D. Each bf16 GEMM runs through the low-M kernel
+    certified for its row count where there is one (`_mm`), the router through
+    `dsv3_router_gemm` up to `_ROUTER_KERNEL_ROWS` rows (`_router_logits`), and the rest
+    through cuBLAS. This is the target CUDA graphs capture, at every padded batch size:
+    the low-M kernels cost more host time per launch than cuBLAS, which a replay does not
+    pay.
     """
 
     def __init__(self, core: Nemotron4NanoPreviewTp1ModelingV2) -> None:
@@ -1232,6 +1312,22 @@ class DecodeTarget:
             kv_layer=md.kv_cache_manager.layer_offsets[self._mtp.attention.layer],
         )
 
+    @staticmethod
+    def _mm(x: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
+        """A bf16 GEMM over the step's rows: the low-M entry `lowm_entry` names for its
+        (rows, k, n), else `cublas_mm`. The row count is a host shape, fixed for a captured
+        CUDA graph, and so is the choice."""
+        low_m = lowm_entry(x.shape[0], weight_t.shape[0], weight_t.shape[1])
+        return cublas_mm(x, weight_t) if low_m is None else low_m(x, weight_t)
+
+    @staticmethod
+    def _router_logits(routed: torch.Tensor, router: torch.Tensor) -> torch.Tensor:
+        """fp32 router logits: `dsv3_router_gemm`'s own kernel up to `_ROUTER_KERNEL_ROWS`
+        rows, `cublas_mm` above, both over the bf16 rows and the `.t()` router weight."""
+        if routed.shape[0] <= _ROUTER_KERNEL_ROWS:
+            return dsv3_router_gemm(routed, router, None, torch.float32)
+        return cublas_mm(routed, router, None, torch.float32)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1263,7 +1359,7 @@ class DecodeTarget:
                 # within a row's tokens. NoPE; q_scaling 1 keeps the softmax scale at
                 # head_dim**-0.5 = 1/16.
                 attn_out = thop_attention(
-                    q=cublas_mm(x, L.mixer.qkv),
+                    q=self._mm(x, L.mixer.qkv),
                     output=attn_out,
                     local_layer_idx=step["kv_layer"][L.mixer.layer],
                     num_heads=d.heads_q,
@@ -1272,9 +1368,9 @@ class DecodeTarget:
                     **step["attention"],
                     **_CALL_CONSTANTS,
                 )
-                update = cublas_mm(attn_out, L.mixer.o)
+                update = self._mm(attn_out, L.mixer.o)
             else:
-                update = cublas_mm(softclamp_relu2(cublas_mm(x, L.mixer.up), d.clamp), L.mixer.down)
+                update = self._mm(softclamp_relu2(self._mm(x, L.mixer.up), d.clamp), L.mixer.down)
             if L.moe is None:
                 routed, x = self._streams_step(streams, update, L.write, L.next_reads)
                 continue
@@ -1311,21 +1407,18 @@ class DecodeTarget:
         """`Nemotron4GDPMixer` for the rows' tokens, each row continuing from its slot
         (`_gdp_generation`); padding rows (`PAD_SLOT_ID`) read zeros and write nothing."""
         d = self._d
-        proj = cublas_mm(x, g.in_proj)  # [B * T, 18528] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
+        proj = self._mm(x, g.in_proj)  # [B * T, 18528] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
         num_tokens = proj.shape[0]
         beta, decay = gdp_gates(proj[:, d.beta], proj[:, d.decay], g.neg_a, g.dt_bias)
         out = self._gdp_generation(proj, beta, decay, g, step["state_slots"], step)
-        y = gated_rmsnorm(
+        y = gated_rmsnorm_multirow(
             out.view(num_tokens, d.gdp_value_dim),
+            proj[:, : d.gdp_value_dim],
             g.norm,
-            None,
             d.gdp_eps,
-            z=proj[:, : d.gdp_value_dim],
-            group_size=d.gdp_value,
-            norm_before_gate=False,
-            is_rms_norm=True,
+            d.gdp_value,
         )
-        return cublas_mm(y, g.out_proj)
+        return self._mm(y, g.out_proj)
 
     def _gdp_generation(
         self,
@@ -1394,15 +1487,15 @@ class DecodeTarget:
         latent space, `fc2_norm` and the projection back up, plus the shared expert."""
         d = self._d
         weights, ids = noaux_tc_op(
-            cublas_mm(routed, m.router, None, torch.float32),
+            self._router_logits(routed, m.router),
             m.router_bias,
             1,
             1,
             d.top_k,
             d.routed_scale,
         )
-        experts = latent_moe_experts(
-            cublas_mm(routed, m.fc1_latent),
+        experts = latent_moe_experts_fused_act(
+            self._mm(routed, m.fc1_latent),
             ids,
             weights,
             m.experts_up,
@@ -1411,8 +1504,8 @@ class DecodeTarget:
             0,
             d.num_experts,
         )
-        experts = cublas_mm(flashinfer_rmsnorm(experts, m.fc2_norm, d.eps), m.fc2_latent)
-        shared = cublas_mm(softclamp_relu2(cublas_mm(shared, m.shared_up), d.clamp), m.shared_down)
+        experts = self._mm(flashinfer_rmsnorm(experts, m.fc2_norm, d.eps), m.fc2_latent)
+        shared = self._mm(softclamp_relu2(self._mm(shared, m.shared_up), d.clamp), m.shared_down)
         return torch.add(experts, shared)
 
     def mtp_forward(
@@ -1440,11 +1533,11 @@ class DecodeTarget:
         # The next token's embedding first, then the previous step's hidden state.
         e = flashinfer_rmsnorm(nn.functional.embedding(input_ids, embed_tokens), m.enorm, d.eps)
         h = flashinfer_rmsnorm(hidden_states, m.hnorm, d.eps)
-        x = cublas_mm(torch.cat((e, h), dim=-1), m.eh)
+        x = self._mm(torch.cat((e, h), dim=-1), m.eh)
         # The shortcut block on an ordinary residual: routing reads the block input.
         routed = flashinfer_rmsnorm(x, m.shortcut_norm, d.eps)
         attn_out = thop_attention(
-            q=cublas_mm(flashinfer_rmsnorm(x, m.input_norm, d.eps), m.attention.qkv),
+            q=self._mm(flashinfer_rmsnorm(x, m.input_norm, d.eps), m.attention.qkv),
             output=torch.empty(x.shape[0], d.q_width, dtype=x.dtype, device=x.device),
             local_layer_idx=step["kv_layer"],
             num_heads=d.heads_q,
@@ -1455,7 +1548,7 @@ class DecodeTarget:
         )
         # In place: the attention output becomes the shared expert's input, `x` the residual.
         shared, x = flashinfer_fused_add_rmsnorm(
-            cublas_mm(attn_out, m.attention.o), x, m.pre_moe_norm, d.eps
+            self._mm(attn_out, m.attention.o), x, m.pre_moe_norm, d.eps
         )
         out, _ = flashinfer_fused_add_rmsnorm(
             self._moe(routed, shared, m.moe), x, m.final_norm, d.eps

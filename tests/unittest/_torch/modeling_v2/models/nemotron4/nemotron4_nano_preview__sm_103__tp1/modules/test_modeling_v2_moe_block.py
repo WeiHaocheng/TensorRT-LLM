@@ -4,7 +4,10 @@
 
 What runs is the target's own block: `DecodeTarget._moe` at the CUDA-graph decode batch sizes
 and `PrefillTarget._moe` at the prefill chunk sizes -- router GEMM, `noaux_tc_op` top-10,
-`fc1_latent_proj`, `latent_moe_experts`, `fc2_norm`, `fc2_latent_proj`, plus the shared expert.
+`fc1_latent_proj`, `latent_moe_experts_fused_act`, `fc2_norm`, `fc2_latent_proj`, plus the shared
+expert. The decode block runs its router through `dsv3_router_gemm` up to 8 rows and each bf16
+GEMM through the low-M kernel certified for its row count where there is one
+(`DecodeTarget._mm`); the prefill block runs cuBLAS.
 Both targets come from their own constructors over the target's own weight table
 (`weights.MODEL_WEIGHTS`): every parameter is declared on the meta device, and the MoE layers
 under test are filled from the checkpoint through the table's manifest, the way `load` fills
@@ -67,8 +70,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.softclamp_
     softclamp_relu2,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
-    latent_moe_experts,
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.dsv3_router_gemm import (
+    dsv3_router_gemm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.lowm_direct_mm import lowm_direct_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.lowm_splitk_mm import lowm_splitk_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts_fused_act import (  # noqa: E501
+    latent_moe_experts_fused_act,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
@@ -103,7 +111,16 @@ CELLS = tuple(("decode", t) for t in DECODE_TOKENS) + tuple(("prefill", t) for t
 
 _BF16_ULP = ULP[torch.bfloat16]
 _FP32_ULP = ULP[torch.float32]
-_GUARDED = (cublas_mm, noaux_tc_op, latent_moe_experts, flashinfer_rmsnorm, softclamp_relu2)
+_GUARDED = (
+    cublas_mm,
+    lowm_direct_mm,
+    lowm_splitk_mm,
+    dsv3_router_gemm,
+    noaux_tc_op,
+    latent_moe_experts_fused_act,
+    flashinfer_rmsnorm,
+    softclamp_relu2,
+)
 
 
 def _checkpoint_or_skip() -> str:
@@ -234,7 +251,7 @@ def cell_rows(phase: str, tokens: int, layer: int, num_rows: int, num_long: int)
 #: The calls of `_moe` the test observes: modeling's name for the entry, the entry, the record.
 _OBSERVED = (
     ("noaux_tc_op", noaux_tc_op, "route"),
-    ("latent_moe_experts", latent_moe_experts, "experts"),
+    ("latent_moe_experts_fused_act", latent_moe_experts_fused_act, "experts"),
     ("flashinfer_rmsnorm", flashinfer_rmsnorm, "fc2_norm"),
 )
 
@@ -539,8 +556,9 @@ def measure(target, layer: int, routed, shared, mw, config, plant=None, target_s
 
 LOGITS_BAND = (1024.0, 512.0)
 """Router logits against IEEE fp32, in fp32 ulps (2^-23): element against the row's max |logit|,
-and relative RMS. The band the `cublas_mm` entry certifies its fp32-output router cells with: the
-products of two bf16 values are exact in fp32, so the sides differ in summation order alone.
+and relative RMS. The band `cublas_mm` and `dsv3_router_gemm` certify their fp32-output router
+cells with: the products of two bf16 values are exact in fp32, so the sides differ in summation
+order alone.
 Measured on the model's inputs: at most 59.2 element and 27.3 RMS; the logits differ by at
 most 9.3e-5."""
 
@@ -574,8 +592,9 @@ spreads each flip over a whole output row. `R_t` against `R_hf` measures at most
 
 STAGE_BANDS = dict(fc1=(4.0, 2.0), experts=(4.0, 0.4))
 """Two ops on the target's own input against their references, at the entries' certified bands:
-`cublas_mm` (bf16 out, 4 / 2) for `fc1_latent_proj`, measured at most 1.90 / 0.039;
-`latent_moe_experts` (4 / 0.4), measured at most 1.97 / 0.268. The tail -- `fc2_latent_proj`, the
+`cublas_mm`'s (bf16 out, 4 / 2), which the low-M entries certify too, for `fc1_latent_proj`,
+measured at most 1.90 / 0.039; `latent_moe_experts_fused_act` (`latent_moe_experts`' bits and
+band, 4 / 0.4), measured at most 1.97 / 0.268. The tail -- `fc2_latent_proj`, the
 shared expert and the add, on the target's own `fc2_norm` output -- takes the block band (measured
 at most 5.95 / 0.155 from 64 rows, 0.74 / 0.219 below), and `fc2_norm` its entry's gate: within
 one bf16 spacing everywhere, and at most max(1, n / 1000) outputs not bit-identical (measured: at
@@ -721,7 +740,9 @@ def _weight_after_down_proj(x, topk_ids, topk_weights, up_proj, down_proj, clamp
     for k in range(topk_ids.shape[1]):
         ids = topk_ids[:, k : k + 1].contiguous()
         unweighted = torch.ones_like(topk_weights[:, k : k + 1])
-        o = latent_moe_experts(x, ids, unweighted, up_proj, down_proj, clamp, offset, count)
+        o = latent_moe_experts_fused_act(
+            x, ids, unweighted, up_proj, down_proj, clamp, offset, count
+        )
         out += o.float() * topk_weights[:, k : k + 1]
     return out.to(x.dtype)
 
@@ -753,7 +774,7 @@ RIVALS = {
         {"routing: flips only at near-ties"},
     ),
     "the routing weight applied after down_proj": (
-        dict(latent_moe_experts=_weight_after_down_proj),
+        dict(latent_moe_experts_fused_act=_weight_after_down_proj),
         False,
         {"block: T vs R_t", "stage: experts"},
     ),

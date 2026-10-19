@@ -3,10 +3,12 @@
 """GPU test: how far the nemotron4 tp1 decode step moves with its batch, on real weights and real
 cache state.
 
-A decode step runs its GEMMs through cuBLAS and its attention through ``thop_attention``'s
-generation kernels, and both pick their kernel by the batch: cuBLAS by the row count, thop by the
-batch size and history length. So a request's decode step gives slightly different bits alone, inside
-a larger eager batch and inside a padded CUDA-graph batch -- what CUDA graphs change between the two
+A decode step runs each bf16 GEMM through the low-M kernel certified for its row count or through
+cuBLAS (``DecodeTarget._mm``), its router through ``dsv3_router_gemm`` up to 8 rows, and its
+attention through ``thop_attention``'s generation kernels, and every one of them picks its kernel by
+the batch: the GEMMs by the row count, thop by the batch size and history length. So a request's
+decode step gives slightly different bits alone, inside a larger eager batch and inside a padded
+CUDA-graph batch, whose padding rows can move a GEMM onto another kernel -- what CUDA graphs change between the two
 legs of a CUDA-graph on / off identity run, and what batching changes between a prompt alone and in
 a batch. This test measures how far, per request: its fp32 logits (the largest |difference| and the
 largest shift of a gap between its top-1 and one of its top `TOP` tokens), and the GDP recurrent and
@@ -73,22 +75,23 @@ TOP = 8
 # The bands: how far a probe's decode step in a batch may sit from the same step alone. Measured on
 # this model's own state over every probe in the eager batches (2 to 256 rows, 132 rows) and the
 # padded graphs (1 to 256, 144 rows) below; the kernels are deterministic, so the worst cases repeat
-# run to run. The worst cases, eager and graph alike: |logit diff| 1.1193, top-gap shift 0.4664,
-# recurrent state 0.0276, conv state 0.0355 and K/V 0.0649 of max |alone|; no top-1 changed. A graph
+# run to run. The worst cases, eager and graph alike: |logit diff| 0.9276, top-gap shift 0.4056,
+# recurrent state 0.0390, conv state 0.0500 and K/V 0.0633 of max |alone|; no top-1 changed. A graph
 # batch against the same rows run eagerly, what the CUDA-graph identity gate's legs differ by in one
-# step, measured 0.4413 / 0.2283. Each band is its worst case plus a quarter, rounded up: room for a
-# batch, history or graph size the runs did not take, where cuBLAS or thop may pick yet another
-# kernel.
+# step, measured 0.9966 / 0.3790: a padded graph batch can run a GEMM on another low-M kernel than
+# the eager batch of its real rows. Each band is its worst case plus a quarter, rounded up: room
+# for a batch, history or graph size the runs did not take, where a GEMM or thop may pick yet
+# another kernel.
 #: max |batched logit - alone logit| over the vocabulary, fp32.
-LOGIT_BAND = 1.40
+LOGIT_BAND = 1.16
 #: The largest change, batched against alone, of the gap between the alone step's top-1 and any of
 #: its top `TOP` tokens: how close to a tie the batch can tip the alone step's choice.
-GAP_BAND = 0.59
+GAP_BAND = 0.51
 #: max |batched - alone| / max |alone|, per tensor, over every GDP layer (recurrent state fp32, conv
 #: state bf16) and every attention layer (the appended K/V).
-SSM_BAND = 0.035
-CONV_BAND = 0.045
-KV_BAND = 0.082
+SSM_BAND = 0.049
+CONV_BAND = 0.063
+KV_BAND = 0.080
 
 
 def _modeling():
@@ -685,7 +688,7 @@ def test_the_band_tells_a_state_one_token_off(harness):
     """The bands have teeth: a decode step from the state one token too far -- every GDP slot
     holding the state its own decode step left, as a rollback that kept a rejected draft would
     leave it -- moves every probe's logits by more than twice the logit band. (Measured: at least
-    4.604, on the 4096-token prefix of `gsm8k_multiturn`, whose top gaps it moves by only 0.282,
+    4.551, on the 4096-token prefix of `gsm8k_multiturn`, whose top gaps it moves by only 0.268,
     inside the gap band: there the logit band is what tells the two states apart.)"""
     h = harness
     smallest, smallest_gap = float("inf"), float("inf")

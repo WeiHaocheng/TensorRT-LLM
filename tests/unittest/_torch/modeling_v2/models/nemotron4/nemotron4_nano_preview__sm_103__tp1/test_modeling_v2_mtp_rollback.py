@@ -359,6 +359,7 @@ def test_mixed_step_commits_only_its_generation_rows(manager, layer, text_config
         num_rows=1 + len(slots),
         num_contexts=1,
         num_ctx_tokens=37,
+        max_ctx_len=37,
         query_start_loc=starts,
         query_start_loc_long=starts.long(),
         has_initial_state=torch.zeros(1, dtype=torch.bool, device="cuda"),

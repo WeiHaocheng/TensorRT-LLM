@@ -5,11 +5,11 @@
 Under one-model MTP-Eagle (``max_draft_len`` 2) a generation row carries its last accepted token
 and two drafts, and the trunk verifies the three in one step: 3B rows through every GEMM, three
 tokens per request through attention, the GDP mixers through the verify entries. A decode step
-runs the same entries over one token a row -- cuBLAS for every GEMM, ``thop_attention``'s
-generation kernels -- and the GDP and conv decode entries. cuBLAS picks its kernel by the row
-count, thop by the batch size, history length and tokens per row, and the verify entries sum in
-their own order, so a verify token sits near its decode step's bits rather than on them. It is
-compared with its decode step two ways:
+runs the same entries over one token a row -- each GEMM on the low-M kernel certified for its row
+count or on cuBLAS, ``thop_attention``'s generation kernels -- and the GDP and conv decode entries.
+The GEMMs pick their kernel by the row count, thop by the batch size, history length and tokens
+per row, and the verify entries sum in their own order, so a verify token sits near its decode
+step's bits rather than on them. It is compared with its decode step two ways:
 
 * **within a band**, everything it leaves: its fp32 logits, the recurrent and conv state it leaves
   in every GDP layer and the K/V it appends in every attention layer. The bands are derived from
@@ -91,36 +91,36 @@ SHORT_TOKENS, LONG_TOKENS = 256, 1024
 TOP = 8
 
 # The bands. A verify token differs from its decode step through every kernel whose choice moves
-# with the step: cuBLAS at 3B rows against B, thop_attention's generation kernels at three tokens a
+# with the step: a GEMM at 3B rows against B, thop_attention's generation kernels at three tokens a
 # row against one, the GDP and conv verify entries against the decode ones. Each rounds within a
 # bf16 step of the other, and every later layer carries the difference into the token's state, its
 # K/V and its logits; this model amplifies such differences (a decode step and a teacher-forced one,
 # apart only in GEMM row counts, differ by up to 1.15 in their logits). How far is measured here, on
 # this model's own state: every probe's three tokens alone (36), in eager batches of 2 to 256 (396)
 # and in padded graphs of 1 to 256 (432). The kernels are deterministic, so the worst cases repeat
-# run to run: |logit diff| 0.8246 alone and 1.0445 in batches and graphs; top-gap shift 0.2685
-# alone, 0.4664 in batches; recurrent state, conv state and K/V 0.0535 / 0.069 / 0.0877 of max
-# |decode|; no top-1 changed. Each band is its worst case plus a quarter, rounded up: room for a
-# batch, history or graph size the runs did not take, where cuBLAS or thop may pick yet another
-# variant.
+# run to run: |logit diff| 0.8370 alone, 0.9136 in batches and 0.9623 in graphs; top-gap shift
+# 0.2263 alone, 0.4730 in batches and graphs; recurrent state, conv state and K/V 0.0542 / 0.0728 /
+# 0.0871 of max |decode|; no top-1 changed. Each band is its worst case plus a quarter, rounded up:
+# room for a batch, history or graph size the runs did not take, where a GEMM or thop may pick yet
+# another variant.
 #: max |verify logit - decode logit| over the vocabulary, fp32.
-LOGIT_BAND = 1.31
+LOGIT_BAND = 1.21
 #: The largest change, verify against decode, of the gap between the decode step's top-1 and any
 #: of its top `TOP` tokens: how close to a tie the verify can tip the decode step's choice.
-GAP_BAND = 0.59
+GAP_BAND = 0.60
 #: max |verify - decode| / max |decode|, per tensor, over every GDP layer (recurrent state fp32,
 #: conv state bf16) and every attention layer (K/V).
-SSM_BAND = 0.067
-CONV_BAND = 0.087
+SSM_BAND = 0.068
+CONV_BAND = 0.091
 KV_BAND = 0.11
 # The drift: the same two quantities over the 6132 matched positions of
 # `test_the_drift_over_consecutive_verifies`, where the verify's state and K/V carry each earlier
-# verify's deviation. Worst cases 4.3650 (|logit diff|, on the 2-shot chat `clips`; 0.68-1.41 on
-# every other probe) and 0.9300 (top-gap shift, on `haiku`), plus a quarter, rounded up. The MTP
+# verify's deviation. Worst cases 1.7959 (|logit diff|, on `fibonacci`; 0.59-1.67 on every other
+# probe) and 0.9255 (top-gap shift, on `sky`; `haiku` 0.8988), plus a quarter, rounded up. The MTP
 # identity gate's near-tie band is built on the measured top-gap shift; the MTP acceptance gate's
 # verify term is the measured |logit diff|.
-DRIFT_LOGIT_BAND = 5.46
-DRIFT_GAP_BAND = 1.17
+DRIFT_LOGIT_BAND = 2.25
+DRIFT_GAP_BAND = 1.16
 
 
 def _modeling():
@@ -1079,7 +1079,7 @@ def test_the_band_tells_a_state_one_token_off(harness):
     """The bands have teeth: a verify that starts from the state one token too far -- every GDP
     slot holding the state after t0 already, as a rollback that kept a rejected draft would
     leave it -- moves every probe's logits by more than twice the logit band, and one of its top
-    gaps by more than the gap band. (Measured: at least 4.529 and 0.767, the least on the long
+    gaps by more than the gap band. (Measured: at least 4.583 and 0.754, the least on the long
     prompts, whose top gaps one token of GDP state moves least.)"""
     h = harness
     smallest, smallest_gap = float("inf"), float("inf")
