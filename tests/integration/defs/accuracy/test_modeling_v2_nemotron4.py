@@ -914,6 +914,29 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
         return sorted(requests, key=lambda r: r.max_tokens != self.LONG_TOKENS)
 
 
+class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpIdentity(_MtpIdentity):
+    """nemotron4-nano-preview (text model) / sm_103 / tp4: MTP-Eagle on against off, on 4 ranks.
+
+    Tensor parallel over the 4 GPUs of one node, without attention DP: every
+    rank runs every request, in the steps rank 0's executor schedules, on its
+    quarter of the mixers' heads and of every MLP's and routed expert's
+    intermediate width, the MTP layer's included, and the ranks meet in every
+    block's all-reduce. A verify token gets its decode step's bits on every
+    rank: the all-reduce sums a token's four partials by one formula whatever
+    the step's row count, and the GDP verify reads a request's tokens 3 x 4632
+    elements apart at the draft length here, which like the decode step's 4632
+    is not a multiple of 16, so its kernel rounds as the decode kernel does. So
+    tp1's legs, checks and reports carry over unchanged.
+    """
+
+    pytestmark = pytest.mark.skip_less_device(4)
+
+    # The parallel topology the tp4 target implements: tensor parallel over the
+    # 4 GPUs of one node, the mixers' heads and every MLP's and routed expert's
+    # intermediate width split four ways.
+    PARALLEL = dict(tensor_parallel_size=4, moe_tensor_parallel_size=4)
+
+
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
     """nemotron4-nano-preview (text model) / sm_103 / tp1, MTP-Eagle draft 2.
 
