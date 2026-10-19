@@ -47,6 +47,7 @@ _EP_LOADS = {
     1024: "256 decode tokens per rank: every window expert touched, ~20 rows each",
     8192: "a prefill chunk's worth over the ranks: ~160 rows per window expert",
     32768: "four 8192-token prefill chunks: ~640 rows per expert, twice tp1's largest",
+    65536: "four 16384-token steps: ~1280 rows per expert, four times tp1's largest",
 }
 
 # The ranks whose windows touch the ends of the expert range: rank 0's starts at expert 0, rank
@@ -87,6 +88,7 @@ _TP4_LOADS = {
     256: "decode 256: every expert touched, ~5 rows each",
     1024: "decode 1024, the largest CUDA-graph batch: ~20 rows each",
     8192: "prefill 8192, the max_num_tokens baseline: ~160 rows each",
+    16384: "a 16384-token prefill or mixed step: ~320 rows each",
 }
 
 
