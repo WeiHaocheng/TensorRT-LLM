@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the latent_moe_experts entry of nemotron4_nano_preview__sm_103__tp1.
+"""GPU test for the latent_moe_experts catalog entry, at nemotron4-nano-preview's tp1 window,
+a dep4 rank's expert windows and a tp4 rank's intermediate slice.
 
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into what the target hands the entry -- a latent batch, top-10

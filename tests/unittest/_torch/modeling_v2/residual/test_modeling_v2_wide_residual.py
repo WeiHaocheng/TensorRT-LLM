@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the wide_residual entry of nemotron4_nano_preview__sm_103__tp1.
+"""GPU test for the wide_residual catalog entry, at the widths every nemotron4-nano-preview
+target runs it.
 
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into the tensors a target hands the op -- streams whose rows span
