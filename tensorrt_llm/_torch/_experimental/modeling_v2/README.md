@@ -268,10 +268,10 @@ rejection sampling makes a miscomputed draft layer *slower*, not wrong, so
 boot and accuracy are blind to it and only the acceptance rate against a
 reference can see it. deepseek's draft lengths 1 and 2 remain ungated -- they
 are the dominated end of the measured draft-length axis. The nemotron4 targets
-run draft length 2, the checkpoint's trained depth; tp1 also runs 3, the
-repeated MTP layer's next depth, gated the same ways as 2 (paired gsm8k, MTP
-identity, acceptance). Routing declines every other length and any per-step
-draft-length schedule.
+run draft length 2, the checkpoint's trained depth; tp1 also runs 3, 4 and 5,
+the repeated MTP layer's next three depths, each gated the same ways as 2
+(paired gsm8k, MTP identity, acceptance). Routing declines every other length
+and any per-step draft-length schedule.
 
 ### What replaced the version pin
 
