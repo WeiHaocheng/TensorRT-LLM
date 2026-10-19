@@ -293,8 +293,37 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
         )
 
 
+def _record_requests(llm: LLM, mocker) -> list:
+    """Every request ``llm`` is given from here on, as the output its caller waits on."""
+    requests = []
+    generate_async = llm.generate_async
+
+    def generate_and_record(*args, **kwargs):
+        requests.append(generate_async(*args, **kwargs))
+        return requests[-1]
+
+    mocker.patch.object(llm, "generate_async", generate_and_record)
+    return requests
+
+
+def _acceptance_length(requests: list) -> float:
+    """Tokens per verify step over ``requests``: (verify steps + accepted drafts) / verify steps.
+
+    It is ``compute_acceptance_length``'s estimator, summed over each request's
+    own counters rather than over the iteration statistics: under attention DP
+    every rank's row of an iteration carries rank 0's speculative-decoding
+    counts, so the iteration statistics measure rank 0's requests alone.
+    Computing it asserts that the MTP leg drafted at all.
+    """
+    # Every verify step drafts position 0.
+    steps = sum((r.per_pos_drafted or [0])[0] for r in requests)
+    accepted = sum(sum(r.per_pos_accepted or ()) for r in requests)
+    assert steps, f"None of the {len(requests)} requests verified a draft"
+    return (steps + accepted) / steps
+
+
 class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
-    """nemotron4-nano-preview (text model) / sm_103 / dep4, identity."""
+    """nemotron4-nano-preview (text model) / sm_103 / dep4, identity and the mtp2 variant."""
 
     MODEL_NAME = "Nemotron4/nemotron4-nano-preview"
     MODEL_PATH = f"{llm_models_root()}/nemotron4-nano-preview"
@@ -309,21 +338,55 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
     # slack, stated because the config's max_position_embeddings is 1,048,576.
     MAX_SEQ_LEN = 9344
 
-    # The serve config of dep4's MTP-off 8K/1K Pareto sweep, per rank: under
+    # The serve configs of dep4's 8K/1K Pareto sweeps, per rank: under
     # attention DP every rank schedules its own requests, and the CUDA graphs
-    # are captured per rank, with padding, for every batch size up to 1024.
-    # Every step holds at most 9216 tokens a rank (36864 gathered rows into each
-    # expert window, inside the routed MoE's certified collectives and window
-    # calls), and a 5-shot GSM8K prompt (at most ~1.5K tokens) fits one step,
-    # so prompts are not chunked. The 1319 questions, spread over the four
-    # ranks, are all in flight at once and drain through the smaller graphs.
+    # are captured per rank, with padding, for every batch size up to the
+    # leg's batch, 1024 with MTP off and 512 with MTP on. A step holds at most
+    # 8192 tokens a rank plus a row per request, of 1 + D tokens with MTP:
+    # 9216 and 9728 tokens, up to 38912 gathered rows into each expert window,
+    # inside the routed MoE's certified collectives and window calls. A 5-shot
+    # GSM8K prompt (at most ~1.5K tokens) fits one step, so prompts are not
+    # chunked. The 1319 questions, spread over the four ranks, are all in
+    # flight at once and drain through the smaller graphs.
     MAX_BATCH_SIZE = 1024
     MAX_NUM_TOKENS = 9216
+    MTP_MAX_BATCH_SIZE = 512
+    MTP_MAX_NUM_TOKENS = 9728
+
+    # The checkpoint's trained draft depth: its one MTP layer serves both
+    # depths. MTPDecodingConfig defaults to a depth of 1, so it is stated.
+    MTP_DRAFT_LEN = 2
+
+    # There is deliberately no standalone identity gsm8k case. The paired test
+    # below evaluates the identity config as its first leg, and
+    # ``task.evaluate`` asserts accuracy against the reference on the way past,
+    # so a separate one would gate nothing new for one more 4-rank engine boot.
+
+    def _llm(self, max_batch_size: int, max_num_tokens: int, **variant) -> LLM:
+        # Built fresh for each leg, so nothing the engine resolves into one
+        # leg's config objects reaches the other.
+        #
+        # The step contract is checked on every rank's first forward, as on
+        # tp1; the switch travels as ``env_overrides`` because the check runs
+        # on the ranks.
+        return LLM(
+            self.MODEL_PATH,
+            modeling_v2="require",
+            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
+            trust_remote_code=True,
+            max_seq_len=self.MAX_SEQ_LEN,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=max_batch_size),
+            **self.DEP4,
+            **variant,
+        )
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
-    def test_gsm8k(self, mocker):
-        """The identity accuracy gate on 4 ranks.
+    def test_gsm8k_identity_vs_mtp2(self, mocker):
+        """The identity accuracy gate on 4 ranks, and the gate on MTP not moving it.
 
         It holds dep4 to the bar tp1 is held to: the anchor is a property of
         the checkpoint, and the topology only changes where each request runs
@@ -331,30 +394,60 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
         adds the four ranks' fp32 partial sums before its one rounding to
         bf16, which is the rounding HF makes.
 
-        The step contract is checked on every rank's first forward, as on tp1;
-        the switch travels as ``env_overrides`` because the check runs on the
-        ranks.
+        Sampling is greedy, so a draft is accepted only where it equals the
+        target's own next token: MTP on emits the target model's greedy text.
+        A verify gives each of its tokens the bits a decode step gives it, so
+        the two scores can differ only where a prefill or mixed step tips a
+        near-tie the other way. Under attention DP those steps change between
+        any two engines, MTP or not: which rank serves a request, and beside
+        which others, depends on when it arrives.
+
+        Both legs assert accuracy against the registered reference as they
+        run, and the MTP row there carries the same anchor, so MTP on is held
+        to the bar MTP off is held to. Both are measured in this one test, so
+        the variance of the session is common to both and cancels.
+
+        The acceptance length is reported, not gated, as on tp1: GSM8K has no
+        reference acceptance for this checkpoint. It is taken from the
+        requests' own counters (``_acceptance_length``).
         """
         # The stock protocol, as the anchor was measured: 5-shot, no chat
         # template, the default 256 output tokens. Only the filter is patched.
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
         task = GSM8K(self.MODEL_NAME)
 
-        with LLM(
-            self.MODEL_PATH,
-            modeling_v2="require",
-            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
-            trust_remote_code=True,
-            max_seq_len=self.MAX_SEQ_LEN,
-            max_batch_size=self.MAX_BATCH_SIZE,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(
-                enable_padding=True, max_batch_size=self.MAX_BATCH_SIZE
-            ),
-            **self.DEP4,
+        with self._llm(self.MAX_BATCH_SIZE, self.MAX_NUM_TOKENS) as llm:
+            identity = task.evaluate(llm)
+
+        # The default kv-cache fraction is kept, as dep4's MTP serve config
+        # keeps it. A rank runs every recurrent layer, so its verify states are
+        # tp1's (~41 GiB at 512 requests), but it holds a quarter of the routed
+        # experts: the quota left with MTP, ~153 GiB a rank, is far more than
+        # the state slots and a full batch of GSM8K requests take, and the
+        # tenth of the free memory the fraction leaves, ~17 GiB, is over three
+        # times what tp1's MTP leg would keep at the default (``MTP_KV``).
+        with self._llm(
+            self.MTP_MAX_BATCH_SIZE,
+            self.MTP_MAX_NUM_TOKENS,
+            speculative_config=MTPDecodingConfig(max_draft_len=self.MTP_DRAFT_LEN),
         ) as llm:
-            task.evaluate(llm)
+            requests = _record_requests(llm, mocker)
+            mtp2 = task.evaluate(llm)
+            acceptance_length = _acceptance_length(requests)
+
+        delta = mtp2 - identity
+        print(
+            f"[modeling_v2] gsm8k dep4 identity={identity:.4f} mtp2={mtp2:.4f} "
+            f"delta={delta:+.4f} acceptance_length={acceptance_length:.4f} "
+            f"over {len(requests)} requests"
+        )
+        # 2 sigma at the 1.36 stderr this benchmark reports at n=1319 for a
+        # score near 57%, as on tp1.
+        assert abs(delta) < 2.7, (
+            f"MTP moved gsm8k by {delta:+.4f} on dep4 (identity={identity:.4f}, "
+            f"mtp2={mtp2:.4f}); greedy MTP emits the target's own tokens, so "
+            f"this is not near-tie noise"
+        )
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
