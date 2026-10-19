@@ -316,15 +316,19 @@ def test_verify_row_equals_decode_of_the_same_token(tokens) -> None:
         )
 
 
-@pytest.mark.parametrize("tokens,batch", [(2, 64), (3, 64), (3, 512)])
-def test_grouped_verify_kernel_equals_the_per_token_kernel(tokens, batch, monkeypatch) -> None:
+@pytest.mark.parametrize("tokens,batch,heads", [(2, 64, 16), (3, 64, 16), (3, 512, 16), (3, 64, 4)])
+def test_grouped_verify_kernel_equals_the_per_token_kernel(
+    tokens, batch, heads, monkeypatch
+) -> None:
     """A verify call of `_VERIFY_MIN_SEQS` or more requests runs one program per
     (split, request) holding the whole group; a smaller one, and decode, run one
     program per (token, split). The two compute every token's partial with the
     same arithmetic, so the same call through either kernel gives the same bits,
     outputs and appended bytes alike. Group ends sit where a token's keys end a
-    page (32), tile (64) or split (512) before its group's last token's do."""
-    spec = _cell(tokens, batch).spec
+    page (32), tile (64) or split (512) before its group's last token's do. Four
+    heads is a tensor-parallel rank's share: both kernels pad it to the 16-row
+    tile the same way."""
+    spec = dict(_cell(tokens, batch).spec, num_heads=heads)
     gen = torch.Generator().manual_seed(100 + tokens)
     ends = [31, 32, 33, 64, 65, 66, 511, 512, 513, 514, 576, 577, 578, 1024, 1025, 1026, 4097, 9344]
     lens = ends + [tokens] + [min(n + 1000, 9344) for n in ends]
