@@ -5525,7 +5525,9 @@ _LONGEST = -1
 
 
 @pytest.mark.parametrize(
-    "geometry, step", [(N4, 3), (N4_TP4, 3), (N4, 4)], ids=["16q", "tp4-4q", "16q-T4"]
+    "geometry, step",
+    [(N4, 3), (N4_TP4, 3), (N4, 4), (N4, 5), (N4, 6)],
+    ids=["16q", "tp4-4q", "16q-T4", "16q-T5", "16q-T6"],
 )
 @pytest.mark.parametrize(
     "batch, histories",
@@ -5543,7 +5545,8 @@ def test_nemotron4_verify_rows_are_causal_within_their_group(
     batch, histories, geometry, step
 ) -> None:
     """Read a verify step's attention weights out of its output: 3 tokens a
-    request (two drafts), and 4 at tp1's 16 query heads (its three drafts).
+    request (two drafts), and 4 to 6 at tp1's 16 query heads (its three to
+    five drafts).
 
     The cached histories carry V = 0 and the step's tokens carry one-hot V rows
     (dims 0 .. step - 1), so output row t of a request, in every head, is the
