@@ -37,7 +37,16 @@ linear, and its shared expert's partial in the same call. That is 72
 all-reduces a forward. Each rank's GEMMs round their partial to bf16, and the
 all-reduce sums the four partials in fp32, in rank order, and rounds once, so
 every rank holds the same bits of every stream: the replicated work after it
-needs no collective, and every rank forms the same logits.
+needs no collective.
+
+The logits are formed vocab-parallel for a few rows (`_logits`): each rank
+multiplies the final hidden state by its quarter of lm_head's rows (fp32 out),
+and an all-gather (`allgather`, dim 0, rank order) brings the four quarters to
+every rank, which lays them side by side. That is the decode, verify and draft
+steps' head up to `_VOCAB_PARALLEL_ROWS` rows; for more rows every rank runs
+the whole GEMM. Both give every logit the same bits, so every rank hands the
+engine's sampler, and under MTP the worker's acceptance and draft argmax, the
+same fp32 logits over the whole vocabulary.
 
 The streams are `[T, 3 * 3072]` bf16, the embedding repeated three times. One
 `wide_residual` call sits between every two branches: it writes the finished
@@ -70,7 +79,9 @@ those through `invariant_mm`, and generation attention through
 `invariant_gen_attention`, whose KV split is fixed and whose kernels compute a
 verify token with the arithmetic that decodes it. The all-reduce moves nothing: it forms
 every element's sum by one formula -- fp32, rank order, one rounding --
-whatever the row count or the row's place in the message. Prefill and mixed
+whatever the row count or the row's place in the message. lm_head's two paths
+give every logit the same bits, and the logits all-gather and the copy after it
+move them unchanged. Prefill and mixed
 steps keep cuBLAS and `thop_attention`; CUDA graphs do not change their
 batches. So do the MTP layer's draft steps: a draft's bits change how many
 drafts the trunk accepts, never the tokens it emits.
@@ -93,6 +104,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.invariant_g
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allreduce import allreduce
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_update import (
     causal_conv1d_update,
@@ -137,7 +149,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import mpi_disabled, prefer_pinned
 
 from . import weights as _weights
 
@@ -704,12 +716,15 @@ class Nemotron4NanoPreviewTp4ModelingV2(DecoderModel):
         self._checked_manager: weakref.ref | None = None
 
         self.allreduce_workspace: _AllreduceWorkspace | None = None
+        # The logits all-gather's communicator, as the engine's own TP all-gather picks it:
+        # the MPI session (None), or the TP group's process group when MPI is disabled.
+        self.tp_group_pg = None
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
 
     def post_load_weights(self) -> None:
-        """Build the all-reduce workspace and construct the two targets, now that the
-        weights are real.
+        """Build the all-reduce workspace, pick the logits all-gather's communicator and
+        construct the two targets, now that the weights are real.
 
         Must only be called after meta init is over, never from `__init__`, where the
         shell's containers are still meta. Every rank calls it at the same point of the
@@ -725,6 +740,8 @@ class Nemotron4NanoPreviewTp4ModelingV2(DecoderModel):
         self.allreduce_workspace = _allreduce_workspace(
             self.model_config, (text.hidden_size, text.moe_latent_size + text.hidden_size)
         )
+        if mpi_disabled():
+            self.tp_group_pg = self.model_config.mapping.tp_group_pg.boxed()
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -1693,14 +1710,48 @@ class DecodeTarget:
         return out
 
 
+#: The most rows `_logits` forms vocab-parallel. Below it a rank's quarter of the GEMM plus the
+#: all-gather and the copy after it cost less than the whole GEMM, which streams all of
+#: lm_head's 1.6 GB whatever the rows; above it the gather, which grows with the rows over
+#: NVLink, and the copy cost more.
+_VOCAB_PARALLEL_ROWS = 64
+
+
+def _logits(
+    hidden: torch.Tensor, weight: torch.Tensor, core: Nemotron4NanoPreviewTp4ModelingV2
+) -> torch.Tensor:
+    """fp32 logits of `hidden`'s rows over the whole vocabulary, `[rows, vocab]`, the same on
+    every rank.
+
+    HF's lm_head is an fp32 GEMM over the bf16 hidden state and weight; `cublas_mm` with an
+    fp32 output computes it, over `weight`, the whole of lm_head, on every rank. Up to
+    `_VOCAB_PARALLEL_ROWS` rows it is vocab-parallel instead: each rank multiplies by its
+    quarter of the rows, the r-th, the catalog all-gather brings every rank's slice in rank
+    order along dim 0, `[tp * rows, vocab / tp]`, and one copy lays the slices side by side (at
+    one row the gathered row already is that row). Each logit is the same dot product either
+    way, and cuBLAS gives a quarter's columns the whole GEMM's bits at every row count
+    measured, so the two paths return the same logits.
+    """
+    rows = hidden.shape[0]
+    if rows > _VOCAB_PARALLEL_ROWS:
+        return cublas_mm(hidden, weight.t(), None, torch.float32)
+    width = weight.shape[0] // core.tp_size
+    quarter = weight[core.tp_rank * width : (core.tp_rank + 1) * width]
+    part = cublas_mm(hidden, quarter.t(), None, torch.float32)
+    gathered = allgather(part, None, core.tp_group, core.tp_group_pg)
+    if rows == 1:
+        return gathered.view(1, core.tp_size * width)
+    return torch.cat(gathered.view(core.tp_size, rows, width).unbind(0), dim=1)
+
+
 class MTPLayer:
     """The checkpoint's MTP layer, global layer `num_layers`, as the one-model MTP-Eagle worker
     runs it once per draft depth (`mtp_use_repeated_layer`: one layer serves every depth).
 
     Its output is already normed by the layer's `final_layernorm`, which is what HF hands the
     next depth and its head (`Nemotron4MultiTokenPredictionLayer.forward`), so `shared_head`
-    is the trunk's fp32 lm_head alone -- whole on every rank, so every rank forms every draft
-    logit, and the worker's argmax needs no vocabulary gather.
+    is the trunk's fp32 lm_head alone (`_logits`): every rank hands the worker every draft
+    logit, and its argmax needs no gather of its own.
     """
 
     def __init__(self, core: Nemotron4NanoPreviewTp4ModelingV2) -> None:
@@ -1712,9 +1763,9 @@ class MTPLayer:
     def shared_head(
         self, hidden_states, lm_head, attn_metadata, return_context_logits
     ) -> torch.Tensor:
-        """fp32 draft logits of every row, as the trunk's: HF's fp32 GEMM over the bf16
-        hidden state and lm_head weight."""
-        return cublas_mm(hidden_states, lm_head.weight.t(), None, torch.float32)
+        """fp32 draft logits of every row over the whole vocabulary, as the trunk's: HF's fp32
+        GEMM over the bf16 hidden state and lm_head weight (`_logits`)."""
+        return _logits(hidden_states, lm_head.weight, self.core)
 
     def forward(
         self,
@@ -1775,9 +1826,11 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp4(
             hidden_size=text.hidden_size,
             vocab_size=text.vocab_size,
         )
-        # Without attention DP the base class builds lm_head split over the vocabulary.
-        # Every rank here forms every logit itself from the same hidden state, so lm_head
-        # is whole on every rank, built as the base class builds it under attention DP.
+        # Without attention DP the base class builds lm_head split over the vocabulary. Here
+        # it is whole on every rank, built as the base class builds it under attention DP:
+        # `_logits` multiplies by a rank's quarter of its rows for a few rows, the whole of
+        # it for many, and the two give every logit the same bits.
+        assert text.vocab_size % model_config.mapping.tp_size == 0, text.vocab_size
         self.lm_head = LMHead(text.vocab_size, text.hidden_size, dtype=model_config.torch_dtype)
         self.epilogue = [self.lm_head]
         spec_config = getattr(model_config, "spec_config", None)
@@ -1823,9 +1876,10 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp4(
         HF's lm_head is an fp32 GEMM over the bf16 hidden state and weight
         (`Nemotron4ForCausalLM.forward`); `cublas_mm` with an fp32 output computes the same
         products, exact in fp32, and keeps the fp32 sum, where the default logits processor
-        would round the logits to bf16 first. The worker gets the same logits for each
-        context's last token and every token a generation row verifies (`gather_ids`), and
-        `position_ids` in the engine's [1, T] shape, which it squeezes itself.
+        would round the logits to bf16 first (`_logits`, vocab-parallel for a few rows). The
+        worker gets the same logits for each context's last token and every token a
+        generation row verifies (`gather_ids`), and `position_ids` in the engine's [1, T]
+        shape, which it squeezes itself.
         """
         hidden = self.model(
             input_ids=input_ids,
@@ -1839,10 +1893,8 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp4(
             if not return_context_logits:
                 last = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
                 hidden = hidden[last]
-            return cublas_mm(hidden, self.lm_head.weight.t(), None, torch.float32)
-        logits = cublas_mm(
-            hidden[spec_metadata.gather_ids], self.lm_head.weight.t(), None, torch.float32
-        )
+            return _logits(hidden, self.lm_head.weight, self.model)
+        logits = _logits(hidden[spec_metadata.gather_ids], self.lm_head.weight, self.model)
         return self.spec_worker(
             input_ids=input_ids,
             position_ids=position_ids,

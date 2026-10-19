@@ -32,8 +32,10 @@ The blocks under test (`LAYERS`), each with the stream write and reads around it
 * latent MoE (5, 6, 24, 39): router, `noaux_tc_op` and `fc1_latent_proj` replicated, every expert
   on the rank's quarter of its intermediate width, the shared expert column / row parallel; the
   routed latent partial and the shared partial all-reduced in one packed call before `fc2_norm`;
-* lm_head: whole on every rank. The target keeps it unsplit, so there is no vocab-parallel head
-  and no logits all-gather to measure; it is compared as it runs.
+* lm_head: whole on every rank, and vocab-parallel up to `modeling._VOCAB_PARALLEL_ROWS` rows
+  (every step here): each rank's GEMM over its quarter of the rows is compared against the
+  reference over the same rows, and the forward's logits are every rank's slice side by side,
+  gathered by the catalog all-gather. Above that the whole GEMM runs and is compared as it is.
 
 The steps (`_Campaign.run`), the shapes a served engine runs: the six short prompts as one
 varlen context batch; two ~8K prompts alone, unchunked; a ~8K prompt in 2048-token chunks over its
@@ -62,7 +64,8 @@ record per comparison and output (`_Campaign.note`):
   partials, bit for bit; `same_on_every_rank` -- every rank holds the same bits of each
   replicated output; `tp_within_rounding` -- every element of the TP term at a row-parallel
   GEMM's all-reduce lies within its partials' rounding (`_Campaign.within_rounding`); the MoE's
-  packing, and lm_head reading the final hidden.
+  packing, lm_head reading the final hidden, and the returned logits being its GEMM, or every
+  rank's lm_head slice side by side.
 
 The MoE block is also measured with the family helper (`_nemotron4_moe_block`): routing against
 HF's router, and the block against the fp32-GEMM and HF-order references, as on tp1.
@@ -302,6 +305,7 @@ def _bind() -> None:
         entries=(
             wide_residual,
             cublas_mm,
+            allgather,
             thop_attention,
             allreduce,
             gdp_gates,
@@ -628,7 +632,11 @@ class Observer:
             ):
                 self.gemm[w[f"l{i}_{name}"].data_ptr()] = (i, role)
             self.norms[w[f"l{i}_fc2_norm"].data_ptr()] = i
-        self.gemm[model.lm_head.weight.data_ptr()] = ("lm_head", "logits")
+        # lm_head: the whole weight, and this rank's quarter of its rows, a view of it.
+        lm_head = model.lm_head.weight
+        quarter = lm_head.shape[0] // model.model.tp_size
+        for ptr in (lm_head.data_ptr(), lm_head[model.model.tp_rank * quarter :].data_ptr()):
+            self.gemm[ptr] = ("lm_head", "logits")
         for i in observed:
             if kinds[i] in ("linear_attention", "mlp"):
                 self.writes[w[f"l{i}_res_retain"].data_ptr()] = (i, "plain_call")
@@ -1721,15 +1729,32 @@ class _Campaign:
         rec = record["lm_head"].get("logits")
         assert rec is not None, "the observer saw no lm_head GEMM"
         hidden, out = rec["a"], rec["out"]
-        self.flag(phase, "lm_head", -1, "returned_logits_are_the_gemm", torch.equal(out, logits))
-        self.flag(phase, "lm_head", -1, "same_on_every_rank:logits", self.same_on_every_rank(out))
+        if out.shape[1] == logits.shape[1]:
+            # The whole GEMM, above the vocab-parallel rows.
+            cols = slice(None)
+            self.flag(
+                phase, "lm_head", -1, "returned_logits_are_the_gemm", torch.equal(out, logits)
+            )
+        else:
+            # Vocab-parallel: this rank's slice, the rank-th quarter of lm_head's rows.
+            cols = slice(self.rank * out.shape[1], (self.rank + 1) * out.shape[1])
+            self.flag(
+                phase,
+                "lm_head",
+                -1,
+                "returned_logits_are_every_ranks_gemm_side_by_side",
+                torch.equal(logits, self.gather_cols(out)),
+            )
+        self.flag(
+            phase, "lm_head", -1, "same_on_every_rank:logits", self.same_on_every_rank(logits)
+        )
         self.note(
             phase,
             "lm_head",
             -1,
             "op",
             "logits",
-            measure(out, X.R.linear_fp32(hidden, self.lm_head_w), ulp=_FP32_ULP),
+            measure(out, X.R.linear_fp32(hidden, self.lm_head_w[cols]), ulp=_FP32_ULP),
         )
         final = getattr(self, "final_hidden", None)
         if final is not None:
