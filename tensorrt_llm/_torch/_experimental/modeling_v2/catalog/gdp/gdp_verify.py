@@ -75,7 +75,10 @@ def _gdp_verify_kernel(
     The state tile is loaded once from the request's slot and carried through
     the T tokens in fp32 registers. Each token is `_gdp_recurrent_kernel`'s
     body, statement for statement; the state after it goes to
-    `intermediate[request, token]`, and the slot itself is never written.
+    `intermediate[request, token]`, and the slot itself is never written. A
+    padding row's masks are off: it loads zeros and stores nothing. The slot
+    and the snapshots are each touched once, so the load is evict-first and the
+    stores streaming.
     """
     i_v = tl.program_id(0)
     i_row = tl.program_id(1)
@@ -97,10 +100,10 @@ def _gdp_verify_kernel(
             + o_k[:, None] * stride_s_k
             + o_v[None, :] * stride_s_v
         )
-        b_h = tl.zeros([BK, BV], dtype=tl.float32)
-        if slot >= 0:
-            tl.device_assert(slot < num_slots, "slot out of range")
-            b_h = tl.load(p_state, mask=mask_kv, other=0.0).to(tl.float32)
+        tl.device_assert(slot < num_slots, "slot out of range")
+        b_h = tl.load(
+            p_state, mask=mask_kv & (slot >= 0), other=0.0, eviction_policy="evict_first"
+        ).to(tl.float32)
 
         for t in tl.static_range(T):
             b_g = tl.load(g + i_n * stride_g_n + t * stride_g_t + i_h * stride_g_h).to(tl.float32)
@@ -145,16 +148,20 @@ def _gdp_verify_kernel(
                 b_o.to(out.dtype.element_ty),
                 mask=mask_v,
             )
-            if slot >= 0:
-                p_snapshot = (
-                    intermediate
-                    + i_n * stride_i_n
-                    + t * stride_i_t
-                    + i_h * stride_i_h
-                    + o_k[:, None] * stride_i_k
-                    + o_v[None, :] * stride_i_v
-                )
-                tl.store(p_snapshot, b_h.to(intermediate.dtype.element_ty), mask=mask_kv)
+            p_snapshot = (
+                intermediate
+                + i_n * stride_i_n
+                + t * stride_i_t
+                + i_h * stride_i_h
+                + o_k[:, None] * stride_i_k
+                + o_v[None, :] * stride_i_v
+            )
+            tl.store(
+                p_snapshot,
+                b_h.to(intermediate.dtype.element_ty),
+                mask=mask_kv & (slot >= 0),
+                cache_modifier=".cs",
+            )
         i_row += tl.num_programs(1)
 
 
