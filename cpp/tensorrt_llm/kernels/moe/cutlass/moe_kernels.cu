@@ -2823,6 +2823,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SiTuAdaptor,
                         decltype(block_scaling_type)::value, num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Relu2:
+                    // A swiglu_limit on Relu2 is its tanh soft cap (SoftcapRelu2Adaptor).
+                    if (activation_type.swiglu_limit)
+                    {
+                        return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SoftcapRelu2Adaptor,
+                            decltype(block_scaling_type)::value, num_rows_per_cta_v, false, kWriteFp8>;
+                    }
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, decltype(block_scaling_type)::value,
                         num_rows_per_cta_v, false, kWriteFp8>;
@@ -2979,6 +2985,11 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
                 case ActivationType::SiTu:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SiTuAdaptor, NVFP4_TYPE, kRows, true>;
                 case ActivationType::Relu2:
+                    if (activation_type.swiglu_limit)
+                    {
+                        return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SoftcapRelu2Adaptor, NVFP4_TYPE,
+                            kRows, true>;
+                    }
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, NVFP4_TYPE, kRows, true>;
                 default:
@@ -3840,6 +3851,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             alpha_scale_ptr_array = computeFP8DequantScale(
                 alpha_scale_ptr_array, num_experts_per_node, quant_params.groupwise.fc1.alpha, stream);
         }
+        // Relu2 with a swiglu_limit is the tanh soft-capped Relu2, which no fused GEMM epilogue implements: the GEMM
+        // adds the bias only, and the activation runs in place afterwards.
+        bool const softcap_relu2
+            = fc1_activation_type.activation_type == ActivationType::Relu2 && fc1_activation_type.swiglu_limit;
         auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{input,
             total_tokens_including_expert, fc1_expert_weights,
             /*scales*/ quant_params.groupwise.group_size > 0
@@ -3849,12 +3864,30 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc1.weight_zeros)
                 : nullptr,
             fc1_expert_biases, reinterpret_cast<OutputType*>(output), alpha_scale_ptr_array, /*occupancy*/ nullptr,
-            fc1_activation_type, expanded_num_rows, /*N*/ int64_t(fc1_out_size),
+            softcap_relu2 ? ActivationType::Identity : fc1_activation_type.activation_type, expanded_num_rows,
+            /*N*/ int64_t(fc1_out_size),
             /*K*/ hidden_size, num_experts_per_node, quant_params.groupwise.group_size, bias_is_broadcast,
             /*use_fused_moe*/ false, stream, config};
         gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
         sync_check_cuda_error(stream);
+
+        if (softcap_relu2)
+        {
+            if constexpr (std::is_same_v<T, OutputType>)
+            {
+                doActivation<T, OutputType>(output, reinterpret_cast<OutputType const*>(output),
+                    /*fp8_quant*/ nullptr, static_cast<ScaleBiasType const*>(nullptr), bias_is_broadcast,
+                    expert_first_token_offset, num_experts_per_node, inter_size, expanded_num_rows, fc1_activation_type,
+                    quant_params, /*use_per_expert_act_scale*/ false,
+                    /*fc2_act_sf_flat*/ nullptr, stream);
+                sync_check_cuda_error(stream);
+            }
+            else
+            {
+                TLLM_CHECK_WITH_INFO(false, "Soft-capped Relu2 needs the GEMM output type to be the activation type");
+            }
+        }
     }
     else
     {
