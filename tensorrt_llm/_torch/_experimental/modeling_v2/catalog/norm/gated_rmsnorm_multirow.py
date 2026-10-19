@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 # Every GDP layer of the checkpoint (12 `linear_attention`, 20 `shortcut_moe_gdp`) builds the same
@@ -71,6 +72,10 @@ def _gated_rmsnorm_multirow_kernel(
     tl.store(Y + rows[:, None] * N + cols[None, :], y.to(Y.dtype.element_ty), mask=mask)
 
 
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_GATED_RMSNORM_MULTIROW = Launch(_gated_rmsnorm_multirow_kernel)
+
+
 class GatedRmsnormMultirow(OpWrapper):
     """`x * silu(z)`, RMS-normalized per group of `group_size` channels, times `weight`.
 
@@ -125,7 +130,8 @@ class GatedRmsnormMultirow(OpWrapper):
     38.24 and perf-gated-rmsnorm's Gluon kernel's 1.29, 1.51, 3.59 and 7.80. Eager GPU time at
     8192 tokens 13.1 against 101.2 and 20.0, 1.2x the bytes' bound (x, z and y at the HBM copy
     rate). A tp4 rank's 6 heads: 1.29, 1.39, 1.70 and 2.50 in a graph, 5.4 eager at 8192.
-    Eager host issue ~27 us against `_layer_norm_fwd`'s ~48.
+    Eager host issue through `JITFunction.run` ~27 us against `_layer_norm_fwd`'s ~48; the entry
+    launches through `Launch`, which skips `run` once the call's specialization is compiled.
     """
 
     def __call__(
@@ -141,7 +147,7 @@ class GatedRmsnormMultirow(OpWrapper):
         rows = tokens * (width // group_size)
         if rows:
             per_program = _MANY_ROWS_PER_PROGRAM if rows >= _MANY_ROWS else _FEW_ROWS
-            _gated_rmsnorm_multirow_kernel[(triton.cdiv(rows, per_program),)](
+            _GATED_RMSNORM_MULTIROW[(triton.cdiv(rows, per_program),)](
                 x,
                 z,
                 weight,

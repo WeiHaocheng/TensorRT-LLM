@@ -165,15 +165,19 @@ def _real_rows(slots: torch.Tensor) -> torch.Tensor:
 # bands exist to catch sit orders of magnitude out: a reference whose fp32
 # draft fold ran in TF32 read 4816 / 317 on the state.
 #: out: one bf16 rounding of an fp32 value on each side, so up to one bf16 step,
-#: 2 ulp of the row scale (`gdp_verify`'s band); measured 1.90 / 0.085.
+#: 2 ulp of the row scale (`gdp_verify`'s band); measured 1.90 / 0.085, and
+#: 1.97 / 0.024 over the draft-3 cells alone.
 OUT_ELEMENT_ULP, OUT_RMS_ULP = 2.0, 0.25
 #: The committed state, fp32 ulp per sqrt(drafts replayed + 1 token): independent
-#: roundings that add like a random walk; measured 4.01 / 0.87 per sqrt(depth).
+#: roundings that add like a random walk; measured 4.01 / 0.87 per sqrt(depth),
+#: and 3.91 / 0.76 over the draft-3 cells alone.
 STATE_ELEMENT_ULP, STATE_RMS_ULP = 8.0, 1.5
 #: A cached u: one Householder step's reduction over K in another order, after
-#: up to two drafts and a token of state drift; measured 6.06 / 1.66.
+#: up to three drafts and a token of state drift; measured 6.06 / 1.66, and
+#: 7.07 / 1.33 over the draft-3 cells alone.
 U_ELEMENT_ULP, U_RMS_ULP = 12.0, 3.0
-#: A cached key: the l2 norm summed in another order; measured 2.04 / 0.23.
+#: A cached key: the l2 norm summed in another order; measured 2.04 / 0.23, and
+#: 1.91 / 0.15 over the draft-3 cells alone.
 K_ELEMENT_ULP, K_RMS_ULP = 4.0, 0.5
 
 

@@ -12,6 +12,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 #: Columns of the [K, V] state one program holds, and its warp count: the
@@ -264,6 +265,10 @@ def _gdp_replay_kernel(
         i_row += tl.num_programs(1)
 
 
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_GDP_REPLAY = Launch(_gdp_replay_kernel)
+
+
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
     """HF `l2norm`: `x * rsqrt(sum(x * x) + 1e-6)` over the head dim."""
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + 1e-6)
@@ -324,7 +329,8 @@ class GdpReplay(OpWrapper):
     _NEMOTRON4_TP4 = dict(_NEMOTRON4, heads=6, proj_width=4632, conv_offset=384)
 
     # tokens is 1 + the step's draft length; drafts (D) the caches' depth, the
-    # engine's max_draft_len: 2 (the checkpoint's trained depth) or 1. A verify
+    # engine's max_draft_len: 2 (the checkpoint's trained depth) or 1, and 3 at
+    # tp1's geometry, the longer draft the tp1 target also runs. A verify
     # step's rows replay 0..D pending drafts each, drawn per slot; a decode step
     # (tokens 1) runs with no cache under MTP off, and with one -- folding in a
     # verify's accepted drafts -- when a step without drafts follows a verify.
@@ -411,6 +417,30 @@ class GdpReplay(OpWrapper):
         Cell(
             why="draft 1 verify, graph batch 256",
             spec=dict(tokens=2, drafts=1, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3 verify, concurrency 1: tp1's longer draft, 4 tokens a row",
+            spec=dict(tokens=4, drafts=3, batch=1, pad_rows=0, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3 verify, eager batch 3",
+            spec=dict(tokens=4, drafts=3, batch=3, pad_rows=0, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3 verify, graph batch 64",
+            spec=dict(tokens=4, drafts=3, batch=64, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3 verify, graph batch 256",
+            spec=dict(tokens=4, drafts=3, batch=256, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3 verify, graph batch 448 (tp1's MTP max_batch_size), v2 past 2^31",
+            spec=dict(tokens=4, drafts=3, batch=448, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="decode folding up to 3 pending drafts in, graph batch 64",
+            spec=dict(tokens=1, drafts=3, batch=64, pad_rows=1, pool="v1", **_NEMOTRON4),
         ),
         Cell(
             why="tp4 rank decode, MTP off: concurrency 1",
@@ -501,10 +531,10 @@ class GdpReplay(OpWrapper):
     prefetching grid at 24 heads (71 us) and 8 columns a program at a tp4 rank's
     B >= 256 (25 us).
 
-    Uncertified: T > 3 or D > 2, other head counts, head dims or Householder
-    count, a bf16 state pool or caches, a disaggregated or chunked hand-over of
-    a slot with pending drafts. CUDA-graph capturable: no host sync and no
-    allocation besides `out`.
+    Uncertified: T > 4 or D > 3, T = 4 or D = 3 at a tp4 rank's 6 heads, other
+    head counts, head dims or Householder count, a bf16 state pool or caches, a
+    disaggregated or chunked hand-over of a slot with pending drafts.
+    CUDA-graph capturable: no host sync and no allocation besides `out`.
     """
 
     def __call__(
@@ -547,7 +577,7 @@ class GdpReplay(OpWrapper):
         elif num_rows >= _WIDE_DECODE_ROWS:
             block_v = 2 * _BLOCK_V
         grid = (triton.cdiv(value_dim, block_v), rows)
-        _gdp_replay_kernel[grid](
+        _GDP_REPLAY[grid](
             q,
             k,
             v,

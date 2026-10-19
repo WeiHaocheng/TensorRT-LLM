@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 # One geometry per target width, as for `causal_conv1d_varlen`: every GDP layer builds the same
@@ -389,6 +390,10 @@ def _triton_causal_conv1d_varlen_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_TRITON_CAUSAL_CONV1D_VARLEN = Launch(_triton_causal_conv1d_varlen_kernel)
+
+
 def _cell(why: str, seq_lens: tuple[int, ...], init: str, geometry: dict = _GDP) -> Cell:
     """`init`: "fresh" (no sequence resumes), "continued" (every one does), "mixed" (even ones do)."""
     return Cell(why=why, spec=dict(seq_lens=seq_lens, init=init, **geometry))
@@ -477,8 +482,9 @@ class TritonCausalConv1dVarlen(OpWrapper):
     for a 4-sequence 8192-token batch (whose chunks past each sequence's end cost 4% against a
     grid sized from host lengths); a tp4 rank's 4224, 46 against 78, 84 against 149 and 53 against
     98. About 2x the bytes' bound at the HBM copy rate; SiLU's arithmetic over 138M elements is
-    most of the rest. Host issue time is Triton's launch, 22 to 27 us eager against the C++ op's
-    8 to 9 us (both with a preallocated `out`).
+    most of the rest. Host issue time through `JITFunction.run` is 22 to 27 us eager against the
+    C++ op's 8 to 9 us (both with a preallocated `out`); the entry launches through `Launch`,
+    which skips `run` once the call's specialization is compiled.
     """
 
     def __call__(
@@ -513,7 +519,7 @@ class TritonCausalConv1dVarlen(OpWrapper):
             return out
         wide = dim >= _WIDE
         block_n, warps = (512, 4) if wide else (128, 2)
-        _triton_causal_conv1d_varlen_kernel[
+        _TRITON_CAUSAL_CONV1D_VARLEN[
             (num_seqs, triton.cdiv(total, _BLOCK_M), triton.cdiv(dim, block_n))
         ](
             x,

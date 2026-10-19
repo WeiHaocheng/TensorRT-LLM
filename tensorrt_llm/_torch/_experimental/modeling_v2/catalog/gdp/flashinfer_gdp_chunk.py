@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 #: FlashInfer's Blackwell GDN prefill takes one head size for q, k and v, and only 128.
@@ -214,6 +215,13 @@ def _scatter_state_kernel(
     )
 
 
+#: Each glue kernel launched straight to its compiled form once compiled (`Launch`): an eager
+#: prefill step makes one call per GDP layer, so each launch's host time counts.
+_EXPAND = Launch(_expand_kernel)
+_GATHER_STATE = Launch(_gather_state_kernel)
+_SCATTER_STATE = Launch(_scatter_state_kernel)
+
+
 def _flashinfer_gdp_chunk_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -239,7 +247,7 @@ def _flashinfer_gdp_chunk_fwd(
     v_steps = v.new_empty(steps, num_heads, _HEAD)
     alpha_steps = torch.empty(steps, num_heads, dtype=torch.float32, device=q.device)
     beta_steps = torch.empty(steps, num_heads, dtype=torch.float32, device=q.device)
-    _expand_kernel[(num_tokens,)](
+    _EXPAND[(num_tokens,)](
         q,
         k,
         v,
@@ -267,7 +275,7 @@ def _flashinfer_gdp_chunk_fwd(
         (num_seqs, num_heads, _HEAD, key_dim), dtype=torch.float32, device=q.device
     )
     cu_steps = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
-    _gather_state_kernel[(num_seqs, num_heads)](
+    _GATHER_STATE[(num_seqs, num_heads)](
         state_pool,
         slots,
         has_initial_state,
@@ -299,7 +307,7 @@ def _flashinfer_gdp_chunk_fwd(
         use_cp=use_cp,
     )
     out.copy_(o_steps.view(num_tokens, num_householder, num_heads, _HEAD)[:, -1, :, :value_dim])
-    _scatter_state_kernel[(num_seqs, num_heads)](
+    _SCATTER_STATE[(num_seqs, num_heads)](
         final,
         state_pool,
         slots,
