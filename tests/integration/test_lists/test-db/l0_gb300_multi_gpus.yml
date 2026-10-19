@@ -17,6 +17,8 @@ l0_gb300_multi_gpus:
   tests:
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
+  # The tp4 target's own collective entry: its 4-rank matrix starts its own MPI job (~50 s).
+  - unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp4/comm
   - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
   - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[modeling_v2]
   - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]
