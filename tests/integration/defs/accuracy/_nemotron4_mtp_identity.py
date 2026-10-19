@@ -12,7 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MTP token-identity gates for the nemotron4 modeling_v2 targets.
+"""The MTP token-identity harness of the nemotron4 modeling_v2 targets.
+
+Each target's gate is a subclass of ``_MtpIdentity`` in
+test_modeling_v2_nemotron4.py, beside the target's other gates; this module
+holds the legs, the gate and the batched report they share.
 
 Greedy one-model MTP-Eagle accepts a draft token only where it equals the
 target's own greedy token, so with MTP on the engine emits the target's greedy
@@ -51,10 +55,8 @@ built-in implementation of this architecture, and ``"require"`` makes a
 routing decline raise with its reason instead of finding no model class.
 """
 
-import importlib.util
 import json
 import os
-import sys
 import time
 from dataclasses import asdict, dataclass
 
@@ -65,7 +67,8 @@ from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_E
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, MTPDecodingConfig
 
-from ..conftest import llm_models_root, unittest_path
+from ..conftest import llm_models_root
+from ._nemotron4_cuda_graph_identity import _prompt_module
 from .accuracy_core import LlmapiAccuracyTestHarness, acceptance_length_from_iteration_stats
 
 # The targets assert their own SM at construction: certification is per GPU
@@ -78,23 +81,6 @@ skip_not_sm103 = pytest.mark.skipif(
 # MTP-off top logprobs, iteration compositions, acceptance lengths and the
 # classified partings), for comparing runs offline.
 REPORT_DIR_ENV = "NEMOTRON4_MTP_IDENTITY_REPORT_DIR"
-
-
-def _prompt_module():
-    """The nemotron4 targets' fixed prompt set, ``_nemotron4_prompts.py`` of the unit tests.
-
-    It imports only ``tokenizers`` and ``pyarrow``, and pins every prompt's token ids
-    (``PROMPT_SHA256``), so this file and the unit tests compare the same inputs.
-    """
-    name = "_nemotron4_prompts"
-    if name not in sys.modules:
-        path = unittest_path() / "_torch" / "modeling_v2" / "models" / "nemotron4" / f"{name}.py"
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        # dataclasses resolves the module's string annotations through sys.modules.
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules[name]
 
 
 @dataclass(frozen=True)
@@ -670,7 +656,3 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
             for req in restarts:
                 pending[req.name] = (offsets[req.name], call.outputs[req.name])
         return partings, uncovered
-
-
-class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpIdentity(_MtpIdentity):
-    """nemotron4-nano-preview (text model) / sm_103 / tp1: MTP-Eagle on against off."""

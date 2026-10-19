@@ -19,6 +19,24 @@ test_llm_api_pytorch.py: these gate a parallel implementation, and reading them
 next to the built-in model's tests would invite treating one as a variant of
 the other.
 
+Every gate of every nemotron4 target is a class here, its topology and serve
+constants stated in it:
+
+* routing on the checkpoint's own config (``...Routing``);
+* GSM8K, the accuracy anchor, with MTP off and on (``...Tp1``, ``...Dep4``,
+  ``...Tp4``);
+* token identity with CUDA graphs on and off (``...Identity``, criterion A);
+* token identity with MTP on and off (``...MtpIdentity``, criterion B(1));
+* the MTP acceptance length against the checkpoint's own MTP layer
+  (``...MtpAcceptance``, criterion B(2)).
+
+The legs and checks the identity and acceptance gates share are the harnesses
+beside this file: ``_nemotron4_cuda_graph_identity.py``,
+``_nemotron4_mtp_identity.py`` and ``_nemotron4_mtp_acceptance.py``. The MTP
+layer's module accuracy (criterion B(3)) and the decode / verify invariance the
+identity gates rest on are unit tests, under
+tests/unittest/_torch/modeling_v2/models/nemotron4/.
+
 Every test here passes ``modeling_v2="require"`` to ``LLM``. TensorRT-LLM has no
 built-in implementation of this architecture, so there is nothing to fall back
 to: under ``"auto"`` a deployment routing declines would find no model class at
@@ -28,15 +46,36 @@ in references/gsm8k.yaml is the checkpoint's own HuggingFace implementation,
 measured under the protocol these tests run.
 """
 
+import dataclasses
+from collections import Counter
+
 import pytest
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
+from tensorrt_llm._torch._experimental.modeling_v2 import (
+    MODELING_V2_VALIDATE_ENV,
+    modeling_v2_resolve,
+)
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.speculative.utils import (
+    resolve_mtp_checkpoint_source,
+    update_spec_config_from_model_config,
+)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.mapping import Mapping
 
 from ..conftest import llm_models_root
-from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness, compute_acceptance_length
+from ._nemotron4_cuda_graph_identity import _CudaGraphIdentity, _Request
+from ._nemotron4_mtp_acceptance import _al, _MtpAcceptance
+from ._nemotron4_mtp_identity import _MtpIdentity
+from .accuracy_core import (
+    GSM8K,
+    LlmapiAccuracyTestHarness,
+    acceptance_length_from_iteration_stats,
+    compute_acceptance_length,
+)
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
@@ -50,6 +89,86 @@ skip_not_sm103 = pytest.mark.skipif(
 _SCORES_FILTER = {"scores_filter": "exact_match,flexible-extract"}
 
 
+# Each target's layout as the engine's mapping states it, and the class routing returns.
+_TOPOLOGIES = {
+    "tp1": ({}, "ModelingV2Nemotron4NanoPreviewSm103Tp1"),
+    "dep4": (
+        dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=True),
+        "ModelingV2Nemotron4NanoPreviewSm103Dep4",
+    ),
+    "tp4": (
+        dict(world_size=4, tp_size=4, moe_ep_size=1, moe_tp_size=4),
+        "ModelingV2Nemotron4NanoPreviewSm103Tp4",
+    ),
+    "tp2": (dict(world_size=2, tp_size=2), None),
+}
+
+
+class TestModelingV2Nemotron4NanoPreviewRouting:
+    """Routing on the checkpoint's own config, resolved as the model loader resolves it.
+
+    The routing unit test (tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py)
+    drives every decision with a synthetic config of this checkpoint's shape. This reads the
+    shipped config.json through the checkpoint's own configuration_nemotron4.py and resolves
+    the speculative config against it, as the model loader does before it routes, so a
+    config that drifted from the shape the targets were written for fails here. No weights
+    are read and no engine is built.
+    """
+
+    MODEL_PATH = f"{llm_models_root()}/nemotron4-nano-preview"
+
+    def _resolve(self, topology: str, spec_config) -> type:
+        config = ModelConfig.from_pretrained(self.MODEL_PATH, trust_remote_code=True)
+        if spec_config is not None:
+            # What the model loader does to the speculative config before it routes.
+            resolve_mtp_checkpoint_source(spec_config, self.MODEL_PATH)
+            update_spec_config_from_model_config(spec_config, config.pretrained_config)
+        mapping = Mapping(**_TOPOLOGIES[topology][0])
+        config = dataclasses.replace(config, mapping=mapping, spec_config=spec_config)
+        # Routing reads only the mode off the arguments.
+        llm_args = TorchLlmArgs(model=self.MODEL_PATH, modeling_v2="require")
+        return modeling_v2_resolve(config, llm_args)
+
+    @skip_not_sm103
+    @pytest.mark.parametrize("mtp", [False, True], ids=["mtp_off", "mtp2"])
+    @pytest.mark.parametrize("topology", ["tp1", "dep4", "tp4"])
+    def test_each_target_claims_its_deployment(self, topology, mtp):
+        spec_config = MTPDecodingConfig(max_draft_len=2) if mtp else None
+        assert self._resolve(topology, spec_config).__name__ == _TOPOLOGIES[topology][1]
+
+    @skip_not_sm103
+    @pytest.mark.parametrize(
+        "topology, make_spec_config, reason",
+        [
+            ("tp2", lambda: None, "tp2 is not implemented"),
+            (
+                "tp4",
+                lambda: MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True),
+                "use_mtp_vanilla selects vanilla MTP",
+            ),
+            (
+                "tp1",
+                lambda: MTPDecodingConfig(max_draft_len=3),
+                "max_draft_len=3: the target runs 2 drafts",
+            ),
+            (
+                "dep4",
+                lambda: MTPDecodingConfig(max_draft_len=2, draft_len_schedule={4: 2, 64: 1}),
+                "per-step all-gather and reduce-scatter would not meet",
+            ),
+        ],
+        ids=["tp2", "vanilla_mtp", "draft_len_3", "draft_len_schedule_under_attention_dp"],
+    )
+    def test_other_deployments_are_declined_with_the_reason(
+        self, topology, make_spec_config, reason
+    ):
+        with pytest.raises(
+            ValueError, match="no target fits 'Nemotron4ForConditionalGeneration'"
+        ) as e:
+            self._resolve(topology, make_spec_config())
+        assert reason in str(e.value)
+
+
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
     """nemotron4-nano-preview (text model) / sm_103 / tp1, identity and the mtp2 variant."""
 
@@ -61,10 +180,14 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
     # is the context the target serves: 8192 + 1024 tokens plus draft slack.
     MAX_SEQ_LEN = 9344
 
-    # The decode batch the target serves, and CUDA graphs captured with padding
-    # for every batch size up to it. The 1319 questions are submitted at once,
-    # so the run fills the batch and then drains it through the smaller graphs.
-    MAX_BATCH_SIZE = 512
+    # The decode batch each leg serves, with CUDA graphs captured with padding for
+    # every batch size up to it: the serve configs of tp1's 8K/1K Pareto sweeps,
+    # 896 with MTP off and 448 with MTP on, where the verify's per-position
+    # states (85 MB a row) leave the KV cache room for about half the batch. The
+    # 1319 questions are submitted at once, so each leg fills its batch and then
+    # drains it through the smaller graphs.
+    MAX_BATCH_SIZE = 896
+    MTP_MAX_BATCH_SIZE = 448
 
     # The checkpoint's trained draft depth: its one MTP layer serves both
     # depths. MTPDecodingConfig defaults to a depth of 1, so it is stated.
@@ -75,7 +198,7 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
     # ``task.evaluate`` asserts accuracy against the reference on the way past,
     # so a separate one would gate nothing new for one more engine boot.
 
-    def _llm(self, **variant) -> LLM:
+    def _llm(self, max_batch_size: int, **variant) -> LLM:
         # Built fresh for each leg, so nothing the engine resolves into one
         # leg's config objects reaches the other.
         #
@@ -93,11 +216,9 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
             env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
             trust_remote_code=True,
             max_seq_len=self.MAX_SEQ_LEN,
-            max_batch_size=self.MAX_BATCH_SIZE,
+            max_batch_size=max_batch_size,
             disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(
-                enable_padding=True, max_batch_size=self.MAX_BATCH_SIZE
-            ),
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=max_batch_size),
             **variant,
         )
 
@@ -133,19 +254,19 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
         task = GSM8K(self.MODEL_NAME)
 
-        with self._llm() as llm:
+        with self._llm(self.MAX_BATCH_SIZE) as llm:
             identity = task.evaluate(llm)
 
         # The default kv-cache fraction is kept. The verify's per-position GDP
-        # and conv states (~41 GiB at max_batch_size 512) are allocated before
+        # and conv states (~36 GiB at max_batch_size 448) are allocated before
         # the engine's profiling forward, so the cache pools are sized from the
-        # memory left after them, ~40 GiB: about twice what the state slots and
-        # a full batch of GSM8K requests take.
+        # memory left after them.
         #
         # Every iteration's stats are kept (``max_stats_len=-1``), so the
         # acceptance length covers the whole run rather than its last 1000
         # iterations.
         with self._llm(
+            self.MTP_MAX_BATCH_SIZE,
             speculative_config=MTPDecodingConfig(max_draft_len=self.MTP_DRAFT_LEN),
             enable_iter_perf_stats=True,
             max_stats_len=-1,
@@ -183,17 +304,16 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
     # slack, stated because the config's max_position_embeddings is 1,048,576.
     MAX_SEQ_LEN = 9344
 
-    # Per rank: under attention DP every rank schedules its own requests, and
-    # the CUDA graphs are captured per rank, with padding, for every batch size
-    # up to it. The 1319 questions, spread over the four ranks, are all in
-    # flight at once and drain through the smaller graphs.
-    MAX_BATCH_SIZE = 512
-
-    # Every step's rows per rank. The routed MoE's all-gather and
-    # reduce-scatter are certified up to 2048 rows a rank, so the gate keeps
-    # each step inside them. A 5-shot GSM8K prompt (at most ~1.5K tokens)
-    # still fits in one step, so prompts are not chunked.
-    MAX_NUM_TOKENS = 2048
+    # The serve config of dep4's MTP-off 8K/1K Pareto sweep, per rank: under
+    # attention DP every rank schedules its own requests, and the CUDA graphs
+    # are captured per rank, with padding, for every batch size up to 1024.
+    # Every step holds at most 9216 tokens a rank (36864 gathered rows into each
+    # expert window, inside the routed MoE's certified collectives and window
+    # calls), and a 5-shot GSM8K prompt (at most ~1.5K tokens) fits one step,
+    # so prompts are not chunked. The 1319 questions, spread over the four
+    # ranks, are all in flight at once and drain through the smaller graphs.
+    MAX_BATCH_SIZE = 1024
+    MAX_NUM_TOKENS = 9216
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
@@ -249,16 +369,16 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
     # slack, stated because the config's max_position_embeddings is 1,048,576.
     MAX_SEQ_LEN = 9344
 
-    # Every rank runs every request, so this is the engine's batch, as on tp1,
-    # and the CUDA graphs are captured with padding for every batch size up to
-    # it on each rank. The 1319 questions are submitted at once, so the run
-    # fills the batch and then drains it through the smaller graphs.
+    # The batch of tp4's serve config (its MTP 8K/1K Pareto sweep). Every rank
+    # runs every request, so this is the engine's batch, as on tp1, and the
+    # CUDA graphs are captured with padding for every batch size up to it on
+    # each rank. The 1319 questions are submitted at once, so the run fills the
+    # batch and then drains it through the smaller graphs.
     MAX_BATCH_SIZE = 512
 
-    # Every step's tokens. The per-rank GEMM and expert entries are certified
-    # up to 8192 rows, and the all-reduce workspace is sized for this many, so
-    # the gate keeps each step inside them. A 5-shot GSM8K prompt (at most
-    # ~1.5K tokens) fits in one step, so prompts are not chunked.
+    # Every step's tokens, for which the all-reduce workspace is sized. A
+    # 5-shot GSM8K prompt (at most ~1.5K tokens) fits in one step, so prompts
+    # are not chunked.
     MAX_NUM_TOKENS = 8192
 
     @skip_not_sm103
@@ -297,3 +417,443 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
             **self.TP4,
         ) as llm:
             task.evaluate(llm)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Tp1Identity(_CudaGraphIdentity):
+    """nemotron4-nano-preview (text model) / sm_103 / tp1: CUDA graphs on against off."""
+
+    # The serve config tp1's MTP-off 8K/1K Pareto sweep measured: an
+    # explicit max_seq_len (the config's max_position_embeddings is 1,048,576),
+    # 896 requests with a CUDA graph for every padded size up to 896, unchunked
+    # prefill in 9088-token steps, and the state pool sized for 9.2K-token
+    # requests (avg_seq_len). The CUDA-graph leg therefore carries every graph
+    # the benchmark replays.
+    MAX_SEQ_LEN = 9344
+    MAX_BATCH_SIZE = 896
+    MAX_NUM_TOKENS = 9088
+    CHUNKED_PREFILL = False
+    KV_FRACTION = 0.9
+    AVG_SEQ_LEN = 9216
+
+    # Short requests beside the fixed prompts in a second batch, finishing at
+    # staggered lengths, so that one call's decode batch shrinks from 64 rows
+    # through most padded graph sizes below it.
+    NUM_FILLERS = 54
+
+    def _one_token(self, prompts) -> list[_Request]:
+        return [_Request("one_token", prompts[0].token_ids[:1], self.MAX_TOKENS)]
+
+    def _batch_order(self, prompts) -> list[_Request]:
+        """The fixed prompts as one batch, the first-submitted being a long one.
+
+        The executor wakes on the first request alone, so that request's prefill
+        runs alone in both legs. An ~8K-token prefill holds the executor for
+        ~150 ms (the GDP chunk entry syncs with the host in every GDP layer),
+        long enough for every other request of the call to arrive before the
+        next iteration takes them all.
+        """
+        first = next(p for p in prompts if p.long)
+        ordered = [first] + [p for p in prompts if p is not first]
+        return [_Request(p.name, p.token_ids, self.MAX_TOKENS) for p in ordered]
+
+    def _fillers(self, prompts) -> list[_Request]:
+        """Short requests cut from a long prompt's ids: 8-64 tokens, 8-256 output tokens."""
+        source = next(p for p in prompts if p.name == "news_digest").token_ids
+        fillers = []
+        for i in range(self.NUM_FILLERS):
+            length = 8 + (5 * i) % 57
+            start = 97 * i
+            fillers.append(
+                _Request(f"filler{i}", source[start : start + length], 8 + (37 * i) % 249)
+            )
+        return fillers
+
+    def _saturations(self, prompts) -> dict[str, list[_Request]]:
+        """A long prompt, then MAX_BATCH_SIZE - 1 short requests: one call holding every slot.
+
+        All of them run at once, so afterwards each request slot of the state
+        pool holds the recurrent and conv state of a finished request. As in
+        `_batch_order`, the long prompt's prefill holds the executor while the
+        rest arrive, and their prompts (4-16 tokens) fit the next iteration
+        together. Their output lengths are spread over 16-143 tokens, then ten
+        one apart, so the decode batch shrinks from MAX_BATCH_SIZE rows through
+        every padded graph size down to one row.
+        """
+        long_prompt = next(p for p in prompts if p.name == "news_digest")
+        source = next(p for p in prompts if p.name == "gpqa_explain").token_ids
+        num_short = self.MAX_BATCH_SIZE - 1
+        lengths = [16 + i % 128 for i in range(num_short - 10)] + [150 + i for i in range(10)]
+        return {
+            "saturation": [_Request("saturation_long", long_prompt.token_ids, 16)]
+            + [
+                _Request(f"saturation{i}", source[7 * i : 7 * i + 4 + i % 13], lengths[i])
+                for i in range(num_short)
+            ]
+        }
+
+    def _flush(self, prompts) -> list[_Request]:
+        return [_Request("flush", prompts[0].token_ids, 8)]
+
+    def _check_chunks(self, prompts) -> None:
+        # Unchunked, a prompt is one context chunk of its full length. A final
+        # one-token chunk would run as a context row with CUDA graphs off and as
+        # a promoted graph decode row with them on -- other kernels -- so none of
+        # the fixed prompts may end in one.
+        for p in prompts:
+            print(f"[modeling_v2] identity prompt {p.name}: {len(p.token_ids)} tokens, one chunk")
+            assert 1 < len(p.token_ids) <= self.MAX_NUM_TOKENS, (
+                f"{p.name} ({len(p.token_ids)} tokens) does not run as one context chunk "
+                f"of more than one token at max_num_tokens {self.MAX_NUM_TOKENS}"
+            )
+
+    @skip_not_sm103
+    def test_cuda_graph_identity(self, monkeypatch):
+        """Greedy tokens with CUDA graphs on equal those with CUDA graphs off.
+
+        On the fixed prompt set (6 short prompts and 4 of ~8K tokens, 256
+        tokens each) as one batch, each alone, and beside 54 shorter requests;
+        on MAX_BATCH_SIZE requests at once, whose decode batch passes through
+        every padded graph size; and a fresh one-token prompt on a state slot a
+        finished request left equals the same prompt in the fresh engine.
+
+        Each prompt's output in the batch is also compared with its output alone
+        and reported, not gated: prefill and mixed steps are not batch-invariant.
+        """
+        self._check_identity(monkeypatch)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Dep4Identity(_CudaGraphIdentity):
+    """nemotron4-nano-preview (text model) / sm_103 / dep4: CUDA graphs on against off.
+
+    Attention DP over the 4 GPUs of one node: every rank runs its own requests,
+    and the ranks meet in every routed MoE block. Under CUDA graphs a decode
+    step runs as a graph only when every rank's batch can, and every rank pads
+    to the busiest rank's graph size; an idle rank runs the attention-DP dummy.
+    Every request is pinned to a rank, so each leg places the same requests on
+    the same ranks.
+    """
+
+    # The parallel topology the dep4 target implements: attention DP over the
+    # 4 GPUs of one node, the routed experts split four ways.
+    PARALLEL = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
+    RANKS = 4
+
+    # The batch of dep4's MTP-off 8K/1K serve config: an explicit max_seq_len and
+    # 1024 requests per rank with a CUDA graph for every padded size up to 1024,
+    # so the CUDA-graph leg carries every graph the benchmark replays. Every step
+    # holds at most 2048 tokens a rank, so the ~8K prompts prefill in 2048-token
+    # chunks, which is what makes each rank's batches the same in both legs
+    # (`_batch_order`). The state pool is sized for 9.2K-token requests
+    # (avg_seq_len), as the 8K/1K benchmark's is.
+    MAX_SEQ_LEN = 9344
+    MAX_BATCH_SIZE = 1024
+    MAX_NUM_TOKENS = 2048
+    CHUNKED_PREFILL = True
+    KV_FRACTION = 0.9
+    AVG_SEQ_LEN = 9216
+
+    # Requests per rank when the fixed prompts run with the fillers: every rank's
+    # decode batch then shrinks from 64 rows through the padded graph sizes below.
+    BATCH_ROWS_PER_RANK = 64
+
+    def _ranks(self, prompts) -> dict[str, int]:
+        """Where each fixed prompt runs: one long prompt per rank, the short ones dealt round-robin."""
+        longs = [p.name for p in prompts if p.long]
+        shorts = [p.name for p in prompts if not p.long]
+        assert len(longs) == self.RANKS, f"{len(longs)} long prompts for {self.RANKS} ranks"
+        ranks = {name: rank for rank, name in enumerate(longs)}
+        ranks.update({name: i % self.RANKS for i, name in enumerate(shorts)})
+        return ranks
+
+    def _one_token(self, prompts) -> list[_Request]:
+        token = prompts[0].token_ids[:1]
+        return [
+            _Request(f"one_token/rank{rank}", token, self.MAX_TOKENS, rank)
+            for rank in range(self.RANKS)
+        ]
+
+    def _batch_order(self, prompts) -> list[_Request]:
+        """The fixed prompts as one batch: the long ones first, one per rank, then the short ones.
+
+        Each rank's batches are then the same whatever the arrival times. The
+        idle executor wakes on the first request alone, and the others arrive
+        while its first chunk runs. A rank's long prompt (more than three times
+        MAX_NUM_TOKENS) then takes the rank's whole token budget for its first
+        three chunks, and the scheduler, first come first served, holds the
+        rank's other requests behind it until its last chunk -- by when every
+        request of the call has arrived.
+        """
+        ranks = self._ranks(prompts)
+        ordered = [p for p in prompts if p.long] + [p for p in prompts if not p.long]
+        return [_Request(p.name, p.token_ids, self.MAX_TOKENS, ranks[p.name]) for p in ordered]
+
+    def _fillers(self, prompts) -> list[_Request]:
+        """Short requests dealt round-robin until every rank holds BATCH_ROWS_PER_RANK requests.
+
+        Their prompts (8-32 tokens, cut from a long prompt's ids) fit one KV
+        block, and the scheduler starts a context only with a block of token
+        budget left, so they are never split into chunks; their output lengths
+        (8-256 tokens) are staggered.
+        """
+        held = Counter(self._ranks(prompts).values())
+        source = next(p for p in prompts if p.name == "news_digest").token_ids
+        fillers = []
+        while any(held[rank] < self.BATCH_ROWS_PER_RANK for rank in range(self.RANKS)):
+            for rank in range(self.RANKS):
+                if held[rank] == self.BATCH_ROWS_PER_RANK:
+                    continue
+                i = len(fillers)
+                length = 8 + (7 * i) % 25
+                start = (97 * i) % (len(source) - length)
+                fillers.append(
+                    _Request(f"filler{i}", source[start : start + length], 8 + (37 * i) % 249, rank)
+                )
+                held[rank] += 1
+        return fillers
+
+    def _saturations(self, prompts) -> dict[str, list[_Request]]:
+        """For each rank in turn, MAX_BATCH_SIZE requests there at once.
+
+        A call holds every request slot of its rank and leaves the recurrent and
+        conv state of finished requests in the state slots it used, which the
+        cache manager hands to later requests on the rank. As in
+        `_batch_order`, the rank's long prompt goes first and holds the rank's
+        token budget while the rest arrive; their prompts (4-16 tokens) are
+        never chunked, and their output lengths (16-143 tokens, then ten one
+        apart) shrink the rank's decode batch from MAX_BATCH_SIZE rows through
+        every padded graph size down to one row. The other ranks run the
+        attention-DP dummy, padded to the same graph.
+        """
+        ranks = self._ranks(prompts)
+        source = next(p for p in prompts if p.name == "gpqa_explain").token_ids
+        num_short = self.MAX_BATCH_SIZE - 1
+        lengths = [16 + i % 128 for i in range(num_short - 10)] + [150 + i for i in range(10)]
+        return {
+            f"saturation/rank{ranks[p.name]}": [
+                _Request("saturation_long", p.token_ids, 16, ranks[p.name])
+            ]
+            + [
+                _Request(
+                    f"saturation{i}",
+                    source[7 * i : 7 * i + 4 + i % 13],
+                    lengths[i],
+                    ranks[p.name],
+                )
+                for i in range(num_short)
+            ]
+            for p in prompts
+            if p.long
+        }
+
+    def _flush(self, prompts) -> list[_Request]:
+        return [_Request("flush", prompts[0].token_ids, 8, 0)]
+
+    def _check_chunks(self, prompts) -> None:
+        # Chunked prefill cuts a prompt into chunks of whole KV blocks but the
+        # last, so a final one-token chunk needs a length of one more than a
+        # whole number of blocks. Such a chunk would run as a context row with
+        # CUDA graphs off and as a promoted graph decode row with them on --
+        # other kernels -- so none of the fixed prompts may have that length. The
+        # gate also checks every compared iteration (`_promotable`).
+        block = self._kv_cache_config().tokens_per_block
+        for p in prompts:
+            print(
+                f"[modeling_v2] identity prompt {p.name}: {len(p.token_ids)} tokens on rank "
+                f"{self._ranks(prompts)[p.name]}, last chunk {len(p.token_ids) % block} (mod "
+                f"{block}) tokens"
+            )
+            assert len(p.token_ids) > 1 and len(p.token_ids) % block != 1, (
+                f"{p.name} ({len(p.token_ids)} tokens) can end in a one-token context chunk "
+                f"with {block}-token KV blocks"
+            )
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_cuda_graph_identity(self, monkeypatch):
+        """Greedy tokens with CUDA graphs on equal those with CUDA graphs off, on 4 ranks.
+
+        On the fixed prompt set (6 short prompts and 4 of ~8K tokens, 256
+        tokens each) spread over the ranks as one batch, each alone on its rank
+        while the others idle, and beside short requests up to 64 a rank; on
+        MAX_BATCH_SIZE requests on one rank at a time, whose decode batch passes
+        through every padded graph size; and a fresh one-token prompt on every
+        rank, on a state slot a finished request left, equals the same prompt in
+        the fresh engine.
+
+        Each prompt's output in the batch is also compared with its output alone
+        and reported, not gated: prefill and mixed steps are not batch-invariant.
+        """
+        self._check_identity(monkeypatch)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Tp4Identity(
+    TestModelingV2Nemotron4NanoPreviewSm103Tp1Identity
+):
+    """nemotron4-nano-preview (text model) / sm_103 / tp4: CUDA graphs on against off.
+
+    Tensor parallel over the 4 GPUs of one node, without attention DP: every
+    rank runs every request, in the batches rank 0's executor schedules, and
+    the ranks meet in every block's all-reduce. A rank's decode step computes
+    each row from that row alone, all-reduces included, so tp1's calls, batch
+    check and reports carry over; only the saturation call changes.
+    """
+
+    PARALLEL = dict(tensor_parallel_size=4, moe_tensor_parallel_size=4)
+
+    # The 8K/1K serve config, by the rule tp1's follows: an explicit max_seq_len,
+    # 1024 requests with a CUDA graph for every padded size up to 1024 (the
+    # largest batch tp4's decode-invariance test runs), unchunked prefill in
+    # steps of 8192 tokens plus one row per request, and the state pool sized
+    # for 9.2K-token requests (avg_seq_len).
+    MAX_SEQ_LEN = 9344
+    MAX_BATCH_SIZE = 1024
+    MAX_NUM_TOKENS = 8192 + 1024
+    KV_FRACTION = 0.9
+    AVG_SEQ_LEN = 9216
+
+    def _saturations(self, prompts) -> dict[str, list[_Request]]:
+        """Two long prompts, then MAX_BATCH_SIZE - 2 short requests: one call holding every slot.
+
+        tp1's saturation call with a second long prompt. A tp4 rank's ~8K-token
+        prefill holds the executor for less time than tp1's, little more than a
+        thousand requests take to arrive behind the first. The second long prompt is
+        MAX_NUM_TOKENS - 3 tokens: beside the first one's decode row it leaves no
+        room for a short request (4-12 tokens), and the scheduler, first come
+        first served, stops at the first context that does not fit. So the short
+        requests all wait for the call's third iteration, two prefills after it
+        began, and run in it together. Their output lengths are tp1's: the
+        decode batch shrinks from MAX_BATCH_SIZE rows through every padded graph
+        size down to one row.
+        """
+        first = next(p for p in prompts if p.name == "news_digest").token_ids
+        source = next(p for p in prompts if p.name == "gpqa_explain").token_ids
+        second = (source + first)[: self.MAX_NUM_TOKENS - 3]
+        num_short = self.MAX_BATCH_SIZE - 2
+        lengths = [16 + i % 128 for i in range(num_short - 10)] + [150 + i for i in range(10)]
+        shorts = [
+            _Request(f"saturation{i}", source[7 * i : 7 * i + 4 + i % 9], lengths[i])
+            for i in range(num_short)
+        ]
+        assert len(second) == self.MAX_NUM_TOKENS - 3 <= self.MAX_SEQ_LEN - 16, (
+            "the second long prompt does not fill one iteration's token budget"
+        )
+        assert sum(len(r.token_ids) for r in shorts) + 2 <= self.MAX_NUM_TOKENS, (
+            "the short requests do not fit one iteration beside the two decode rows"
+        )
+        return {
+            "saturation": [
+                _Request("saturation_long", first, 16),
+                _Request("saturation_long2", second, 16),
+            ]
+            + shorts
+        }
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_cuda_graph_identity(self, monkeypatch):
+        """Greedy tokens with CUDA graphs on equal those with CUDA graphs off, on 4 ranks.
+
+        tp1's calls (see its test), with MAX_BATCH_SIZE requests at once
+        passing through all 33 padded graph sizes up to 1024.
+        """
+        super().test_cuda_graph_identity(monkeypatch)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpIdentity(_MtpIdentity):
+    """nemotron4-nano-preview (text model) / sm_103 / tp1: MTP-Eagle on against off."""
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
+    """nemotron4-nano-preview (text model) / sm_103 / tp1, MTP-Eagle draft 2.
+
+    The acceptance length against the checkpoint's own MTP layer.
+    """
+
+    # How far the target's MTP logits can be from the reference's, per draft
+    # depth: the MTP module gate's measured worst |logit difference| against the
+    # reference's own drafting chain on the same trunk hidden states
+    # (test_modeling_v2_mtp_layer.py, 49,877 depth-1 and 4,098 depth-2 rows; the
+    # largest gain of any token on the reference's top-1 there is 2.619 / 2.430),
+    # plus the band on the target trunk's logits against the reference's
+    # (check_goldens.py: free-running logits over the whole vocabulary, 2.0, the
+    # larger of its two logit bands; the decode-step one is 1.25), because here
+    # the target's MTP layer reads the target trunk's hidden states and the
+    # reference's reads its own, at prefill rows and decode rows alike.
+    MTP_LOGIT_ERROR = (2.6806, 2.4847)
+    TRUNK_LOGIT_BAND = 2.0
+
+    @skip_not_sm103
+    def test_mtp2_acceptance_matches_reference(self, monkeypatch):
+        """The acceptance length the target measures matches the reference's (``_check_acceptance``).
+
+        The ~8K prompts' prefills run beside the short prompts' verify steps,
+        and AL_trt comes from the iteration statistics.
+        """
+        self._check_acceptance(monkeypatch)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpAcceptance(_MtpAcceptance):
+    """nemotron4-nano-preview (text model) / sm_103 / tp4, MTP-Eagle draft 2.
+
+    The acceptance length against the checkpoint's own MTP layer, on 4 ranks
+    tensor parallel without attention DP. Every rank runs every request on its
+    quarter of the mixers' heads and of every MLP's and routed expert's
+    intermediate width, the MTP layer's included, and the all-reduces give
+    every rank the same bits; the lm_head is whole on every rank, so every rank
+    drafts the same tokens. MAX_BATCH_SIZE and the CUDA graphs are the
+    engine's, as on tp1.
+    """
+
+    # Tensor parallel over the 4 GPUs of one node without attention DP: the
+    # topology the tp4 target implements. Every step carries at most 8192
+    # tokens, for which the all-reduce workspace is sized, so a ~8K prompt
+    # prefills in one step beside the other requests' verify rows, as on tp1.
+    ENGINE_ARGS = dict(tensor_parallel_size=4, moe_tensor_parallel_size=4, max_num_tokens=8192)
+
+    # How far the target's MTP logits can move a margin of the reference's
+    # drafts, per draft depth: the larger of the MTP module gate's worst |logit
+    # difference| against the reference's own drafting chain on the same trunk
+    # hidden states and its largest gain of any token on that chain's top-1,
+    # every rank alike (test_modeling_v2_tp4_mtp_layer.py; depth 1: 2.7225 and
+    # 2.6390, depth 2: 2.47151 and 2.47161, the gain, rounded up), plus the band
+    # on the target trunk's logits against the reference's: tp4's trunk passes
+    # check_goldens_tp4.py at tp1's free-running logits band, 2.0, plus its
+    # measured tensor-parallel term, 1.1922 (tp4 against tp1 on the same
+    # prompts, largest on an ~8K prompt).
+    MTP_LOGIT_ERROR = (2.7225, 2.4717)
+    TRUNK_LOGIT_BAND = 3.1922
+
+    def _engine_al(
+        self, stats: list[dict], walks: dict[str, list[tuple[int, int]]], ranks: dict[str, int]
+    ) -> tuple[float, int, dict]:
+        """AL_trt from the requests' own walks, which count each verify step once.
+
+        Every rank runs every request, so rank 0's iteration statistics see
+        them all, but they count a request once more after its last step when
+        the overlap scheduler had already scheduled it again
+        (``_MtpAcceptance._engine_al``). They are reported, not used: the
+        suite's estimator over them, and the steps they count beyond the
+        requests'.
+        """
+        spec_stats = [s["specDecodingStats"] for s in stats if s.get("specDecodingStats")]
+        stats_steps = sum(s["numRequestsWithDraftTokens"] for s in spec_stats)
+        return (
+            _al([a for walk in walks.values() for _, a in walk]),
+            0,
+            dict(
+                iteration_stats_al=round(acceptance_length_from_iteration_stats(stats), 4),
+                iteration_stats_steps=stats_steps,
+                iteration_stats_accepted=sum(s["numAcceptedTokens"] for s in spec_stats),
+                iteration_stats_extra_steps=stats_steps - sum(len(w) for w in walks.values()),
+            ),
+        )
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_mtp2_acceptance_matches_reference(self, monkeypatch):
+        """The acceptance length the target measures matches the reference's (``_check_acceptance``).
+
+        Every rank verifies every request beside the ~8K prompts' prefills, and
+        AL_trt comes from the requests' own walks.
+        """
+        self._check_acceptance(monkeypatch)

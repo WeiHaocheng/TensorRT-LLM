@@ -12,7 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Acceptance-length gate for the nemotron4 modeling_v2 targets' MTP draft path.
+"""The acceptance-length harness of the nemotron4 modeling_v2 targets' MTP draft path.
+
+Each target's gate is a subclass of ``_MtpAcceptance`` in
+test_modeling_v2_nemotron4.py, beside the target's other gates; this module
+holds the legs, the reference walk and the checks they share.
 
 A draft path that computes the wrong thing leaves greedy output correct: the
 verify step rejects the bad drafts and emits the target model's own tokens. It
@@ -46,22 +50,14 @@ import time
 from collections import Counter
 from dataclasses import asdict, dataclass
 
-import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, MTPDecodingConfig, SchedulingParams
 
 from ..conftest import llm_models_root, unittest_path
 from .accuracy_core import LlmapiAccuracyTestHarness, acceptance_length_from_iteration_stats
-
-# The targets assert their own SM at construction: certification is per GPU
-# architecture, and a receipt from another one says nothing here.
-skip_not_sm103 = pytest.mark.skipif(
-    get_sm_version() != 103, reason="modeling_v2 targets in this batch are certified on sm_103 only"
-)
 
 # Setting this to a file path writes the per-prompt and pooled figures there as
 # JSON, for comparing runs offline.
@@ -549,100 +545,3 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
             f"AL_trt {al_trt:.4f} vs AL_ref {al_ref:.4f}: |delta| {abs(al_trt - al_ref):.4f} > "
             f"tol {tol:.4f} = (2 * {pooled['k1']} + {pooled['k2']} + 2 * {unpaired}) / {n}"
         )
-
-
-class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
-    """nemotron4-nano-preview (text model) / sm_103 / tp1, MTP-Eagle draft 2.
-
-    The acceptance length against the checkpoint's own MTP layer.
-    """
-
-    # How far the target's MTP logits can be from the reference's, per draft
-    # depth: the MTP module gate's measured worst |logit difference| against the
-    # reference's own drafting chain on the same trunk hidden states
-    # (test_modeling_v2_mtp_layer.py, 49,877 depth-1 and 4,098 depth-2 rows; the
-    # largest gain of any token on the reference's top-1 there is 2.619 / 2.430),
-    # plus the band on the target trunk's logits against the reference's
-    # (check_goldens.py: free-running logits over the whole vocabulary, 2.0, the
-    # larger of its two logit bands; the decode-step one is 1.25), because here
-    # the target's MTP layer reads the target trunk's hidden states and the
-    # reference's reads its own, at prefill rows and decode rows alike.
-    MTP_LOGIT_ERROR = (2.6806, 2.4847)
-    TRUNK_LOGIT_BAND = 2.0
-
-    @skip_not_sm103
-    def test_mtp2_acceptance_matches_reference(self, monkeypatch):
-        """The acceptance length the target measures matches the reference's (``_check_acceptance``).
-
-        The ~8K prompts' prefills run beside the short prompts' verify steps,
-        and AL_trt comes from the iteration statistics.
-        """
-        self._check_acceptance(monkeypatch)
-
-
-class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpAcceptance(_MtpAcceptance):
-    """nemotron4-nano-preview (text model) / sm_103 / tp4, MTP-Eagle draft 2.
-
-    The acceptance length against the checkpoint's own MTP layer, on 4 ranks
-    tensor parallel without attention DP. Every rank runs every request on its
-    quarter of the mixers' heads and of every MLP's and routed expert's
-    intermediate width, the MTP layer's included, and the all-reduces give
-    every rank the same bits; the lm_head is whole on every rank, so every rank
-    drafts the same tokens. MAX_BATCH_SIZE and the CUDA graphs are the
-    engine's, as on tp1.
-    """
-
-    # Tensor parallel over the 4 GPUs of one node without attention DP: the
-    # topology the tp4 target implements. Every step carries at most 8192
-    # tokens, where the per-rank GEMM and expert cells end and for which the
-    # all-reduce workspace is sized, so a ~8K prompt prefills in one step
-    # beside the other requests' verify rows, as on tp1.
-    ENGINE_ARGS = dict(tensor_parallel_size=4, moe_tensor_parallel_size=4, max_num_tokens=8192)
-
-    # How far the target's MTP logits can move a margin of the reference's
-    # drafts, per draft depth: the larger of the MTP module gate's worst |logit
-    # difference| against the reference's own drafting chain on the same trunk
-    # hidden states and its largest gain of any token on that chain's top-1,
-    # every rank alike (test_modeling_v2_tp4_mtp_layer.py; depth 1: 2.7225 and
-    # 2.6390, depth 2: 2.47151 and 2.47161, the gain, rounded up), plus the band
-    # on the target trunk's logits against the reference's: tp4's trunk passes
-    # check_goldens_tp4.py at tp1's free-running logits band, 2.0, plus its
-    # measured tensor-parallel term, 1.1922 (tp4 against tp1 on the same
-    # prompts, largest on an ~8K prompt).
-    MTP_LOGIT_ERROR = (2.7225, 2.4717)
-    TRUNK_LOGIT_BAND = 3.1922
-
-    def _engine_al(
-        self, stats: list[dict], walks: dict[str, list[tuple[int, int]]], ranks: dict[str, int]
-    ) -> tuple[float, int, dict]:
-        """AL_trt from the requests' own walks, which count each verify step once.
-
-        Every rank runs every request, so rank 0's iteration statistics see
-        them all, but they count a request once more after its last step when
-        the overlap scheduler had already scheduled it again
-        (``_MtpAcceptance._engine_al``). They are reported, not used: the
-        suite's estimator over them, and the steps they count beyond the
-        requests'.
-        """
-        spec_stats = [s["specDecodingStats"] for s in stats if s.get("specDecodingStats")]
-        stats_steps = sum(s["numRequestsWithDraftTokens"] for s in spec_stats)
-        return (
-            _al([a for walk in walks.values() for _, a in walk]),
-            0,
-            dict(
-                iteration_stats_al=round(acceptance_length_from_iteration_stats(stats), 4),
-                iteration_stats_steps=stats_steps,
-                iteration_stats_accepted=sum(s["numAcceptedTokens"] for s in spec_stats),
-                iteration_stats_extra_steps=stats_steps - sum(len(w) for w in walks.values()),
-            ),
-        )
-
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
-    def test_mtp2_acceptance_matches_reference(self, monkeypatch):
-        """The acceptance length the target measures matches the reference's (``_check_acceptance``).
-
-        Every rank verifies every request beside the ~8K prompts' prefills, and
-        AL_trt comes from the requests' own walks.
-        """
-        self._check_acceptance(monkeypatch)
