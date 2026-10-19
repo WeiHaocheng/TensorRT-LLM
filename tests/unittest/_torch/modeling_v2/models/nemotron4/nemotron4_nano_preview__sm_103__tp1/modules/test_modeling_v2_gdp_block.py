@@ -559,8 +559,9 @@ class _BlockWeights(dict):
 
 
 def _core(checkpoint: R.Checkpoint, layer: int):
-    """What the targets' constructors read off the core: the text config, the layer types and
-    the parameter mapping."""
+    """What the targets' constructors read off the core: the text config, the layer types, the
+    parameter mapping, and what the core sets without speculative decoding (no MTP layer, one
+    token a generation row)."""
     with open(os.path.join(checkpoint.path, "config.json")) as f:
         text = SimpleNamespace(**json.load(f)["text_config"])
     core = SimpleNamespace(
@@ -570,6 +571,8 @@ def _core(checkpoint: R.Checkpoint, layer: int):
             spec_config=None,
         ),
         layer_types=tuple(text.layer_types),
+        mtp_layer=None,
+        tokens_per_gen_step=1,
     )
     core.w = _BlockWeights(checkpoint, core, layer)
     return core

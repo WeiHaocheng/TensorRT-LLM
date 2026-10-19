@@ -158,6 +158,8 @@ def build_targets(checkpoint: R.Checkpoint, layers) -> tuple[M.PrefillTarget, M.
             dst.copy_(src)
         w[key] = nn.Parameter(param, requires_grad=False)
     core.w, core.layer_types = w, d.layer_types
+    # What the core sets without speculative decoding: no MTP layer, one token a generation row.
+    core.mtp_layer, core.tokens_per_gen_step = None, 1
     return M.PrefillTarget(core), M.DecodeTarget(core)
 
 
