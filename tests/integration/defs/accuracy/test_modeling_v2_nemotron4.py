@@ -227,8 +227,12 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
     # the engine's profiling forward, and the cache pools take this share of
     # the memory left after it. At the default 0.9 (44.96 GiB of pools at two
     # drafts) the first generation steps found too little left for one of
-    # their buffers, a recovered allocator OOM; 0.8 leaves about 5 GiB more.
-    MTP_KV = KvCacheConfig(free_gpu_memory_fraction=0.8)
+    # their buffers, a recovered allocator OOM. At 0.8 the three-draft leg
+    # (30.56 GiB of pools) logged the same: a mixed step's 946 rows of fp32
+    # logits (0.92 GiB) found 0.89 GiB free. 0.7 leaves about 4 GiB more. A
+    # GSM8K request is short (prompt and 256 tokens), and at every draft
+    # length the scores and acceptance lengths at 0.7 equal those at 0.8.
+    MTP_KV = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
     # The checkpoint's trained draft depth: its one MTP layer serves both
     # depths. MTPDecodingConfig defaults to a depth of 1, so it is stated.
@@ -670,10 +674,11 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Identity(_CudaGraphIdentity):
 
     # The near-tie band: the largest shift of a top gap between the CUDA-graph
     # and eager legs at matched positions, measured by this gate over every
-    # compared request (982 requests, 31 graph sizes): 1.2334; plus a quarter,
-    # rounded up. Where the legs parted, the CUDA-graph leg emitted the eager
-    # leg's runner-up at margins of 0.0006 to 0.4656.
-    NEAR_TIE_BAND = 1.55
+    # compared request (982 requests, 31 graph sizes): 1.1138; plus a quarter,
+    # rounded up. Where the legs parted, the CUDA-graph leg emitted a token
+    # 0.0017 to 0.1060 below the eager leg's top-1: its runner-up at 19 of the
+    # 20 partings, its third (top-1 / top-2 margin 0.0204) at the other.
+    NEAR_TIE_BAND = 1.40
 
     def _one_token(self, prompts) -> list[_Request]:
         return [_Request("one_token", prompts[0].token_ids[:1], self.MAX_TOKENS)]
@@ -1017,11 +1022,11 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpIdentity(_MtpIdentity):
     # top tokens: the verify's drift from decode -- tp1's verify test
     # (test_modeling_v2_verify_invariance.py, the drift) follows each fixed
     # prompt alone for the tokens this gate generates, MTP on along MTP off's
-    # own tokens, and measured a top-gap shift of at most 0.9300 over 6132
+    # own tokens, and measured a top-gap shift of at most 0.9255 over 6132
     # positions -- plus the decode step's drift across batches, since a decode
-    # row now moves with the batch it runs in (test_modeling_v2_decode_invariance.py:
-    # at most 0.4664); plus a quarter, rounded up.
-    NEAR_TIE_BAND = 1.75
+    # row moves with the batch it runs in (test_modeling_v2_decode_invariance.py:
+    # at most 0.4056); plus a quarter, rounded up.
+    NEAR_TIE_BAND = 1.67
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp3Identity(_MtpIdentity):
@@ -1040,11 +1045,10 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp3Identity(_MtpIdentity):
     # and another of its top tokens: tp1's verify test
     # (test_modeling_v2_verify_invariance.py) run with DRAFT = 3, following each
     # fixed prompt alone for the tokens this gate generates, four tokens a
-    # verify, measured at most 0.7819 over 6096 positions, the two-draft
-    # class's worst case on the same probe. Every probe's largest gap shift and
-    # logit difference, and every top-1 change, came out as at two drafts.
-    # Plus a quarter.
-    NEAR_TIE_BAND = 0.98
+    # verify, measured at most 0.9725 over 6096 positions; plus the decode
+    # step's drift across batches, as at two drafts (0.4056); plus a quarter,
+    # rounded up.
+    NEAR_TIE_BAND = 1.73
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp4Identity(_MtpIdentity):
@@ -1063,11 +1067,10 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp4Identity(_MtpIdentity):
     # and another of its top tokens: tp1's verify test
     # (test_modeling_v2_verify_invariance.py) run with DRAFT = 4, following each
     # fixed prompt alone for the tokens this gate generates, five tokens a
-    # verify, measured at most 0.7819 over 6120 positions, the two- and
-    # three-draft classes' worst case on the same probe. Every probe's largest
-    # gap shift and logit difference, and every top-1 change, came out as at
-    # two and three drafts. Plus a quarter.
-    NEAR_TIE_BAND = 0.98
+    # verify, measured at most 0.9593 over 6120 positions; plus the decode
+    # step's drift across batches, as at two drafts (0.4056); plus a quarter,
+    # rounded up.
+    NEAR_TIE_BAND = 1.71
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp5Identity(_MtpIdentity):
@@ -1086,11 +1089,10 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp5Identity(_MtpIdentity):
     # and another of its top tokens: tp1's verify test
     # (test_modeling_v2_verify_invariance.py) run with DRAFT = 5, following each
     # fixed prompt alone for the tokens this gate generates, six tokens a
-    # verify, measured at most 0.7819 over 6096 positions, the shorter drafts'
-    # worst case on the same probe. Every probe's largest gap shift and logit
-    # difference, and every top-1 change, came out as at two to four drafts.
-    # Plus a quarter.
-    NEAR_TIE_BAND = 0.98
+    # verify, measured at most 1.0944 over 6096 positions; plus the decode
+    # step's drift across batches, as at two drafts (0.4056); plus a quarter,
+    # rounded up.
+    NEAR_TIE_BAND = 1.88
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
@@ -1205,12 +1207,12 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
     # the target's MTP layer reads the target trunk's hidden states and the
     # reference's reads its own, at prefill rows and decode rows alike. The trunk
     # band gains two measured terms: the verify's drift from decode along the
-    # same tokens, 4.3650 (test_modeling_v2_verify_invariance.py, the drift over
+    # same tokens, 1.7959 (test_modeling_v2_verify_invariance.py, the drift over
     # 6132 positions of the fixed prompts), and the decode step's drift across
-    # batches, 1.1193 (test_modeling_v2_decode_invariance.py), since decode and
+    # batches, 0.9276 (test_modeling_v2_decode_invariance.py), since decode and
     # verify rows move with the batch they run in.
     MTP_LOGIT_ERROR = (2.6806, 2.4847)
-    TRUNK_LOGIT_BAND = 2.0 + 4.3650 + 1.1193
+    TRUNK_LOGIT_BAND = 2.0 + 1.7959 + 0.9276
 
     @skip_not_sm103
     def test_mtp2_acceptance_matches_reference(self, monkeypatch):
@@ -1238,12 +1240,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp3Acceptance(_MtpAcceptance):
     # (test_modeling_v2_mtp_layer.py; 2.6806 / 2.4847). The module gate drafts
     # two depths, so depth 3 is not measured there: it runs the same layer as
     # depth 2, one step further along its own KV, and takes the larger of the
-    # two measured depths. The trunk term is the two-draft class's: tp1's
-    # verify test run with DRAFT = 3 measured the same drift along the same
-    # tokens, |logit diff| at most 5.0471 over 6096 positions (four tokens a
-    # verify), on top of check_goldens.py's 2.0.
+    # two measured depths. The trunk term is built as at two drafts: tp1's
+    # verify test run with DRAFT = 3 measured the drift along the same tokens,
+    # |logit diff| at most 2.1281 over 6096 positions (four tokens a verify),
+    # plus the decode step's drift across batches, 0.9276, on top of
+    # check_goldens.py's 2.0.
     MTP_LOGIT_ERROR = (2.6806, 2.4847, 2.6806)
-    TRUNK_LOGIT_BAND = 2.0 + 5.0471
+    TRUNK_LOGIT_BAND = 2.0 + 2.1281 + 0.9276
 
     @skip_not_sm103
     def test_mtp3_acceptance_matches_reference(self, monkeypatch):
@@ -1271,12 +1274,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp4Acceptance(_MtpAcceptance):
     # (test_modeling_v2_mtp_layer.py; 2.6806 / 2.4847). The module gate drafts
     # two depths, so depths 3 and 4 are not measured there: they run the same
     # layer as depth 2, one and two steps further along its own KV, and take
-    # the larger of the two measured depths. The trunk term is the two- and
-    # three-draft classes': tp1's verify test run with DRAFT = 4 measured the
-    # same drift along the same tokens, |logit diff| at most 5.0471 over 6120
-    # positions (five tokens a verify), on top of check_goldens.py's 2.0.
+    # the larger of the two measured depths. The trunk term is built as at two
+    # drafts: tp1's verify test run with DRAFT = 4 measured the drift along
+    # the same tokens, |logit diff| at most 1.8349 over 6120 positions (five
+    # tokens a verify), plus the decode step's drift across batches, 0.9276,
+    # on top of check_goldens.py's 2.0.
     MTP_LOGIT_ERROR = (2.6806, 2.4847, 2.6806, 2.6806)
-    TRUNK_LOGIT_BAND = 2.0 + 5.0471
+    TRUNK_LOGIT_BAND = 2.0 + 1.8349 + 0.9276
 
     @skip_not_sm103
     def test_mtp4_acceptance_matches_reference(self, monkeypatch):
@@ -1304,12 +1308,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp5Acceptance(_MtpAcceptance):
     # (test_modeling_v2_mtp_layer.py; 2.6806 / 2.4847). The module gate drafts
     # two depths, so depths 3 to 5 are not measured there: they run the same
     # layer as depth 2, one to three steps further along its own KV, and take
-    # the larger of the two measured depths. The trunk term is the shorter
-    # drafts' classes': tp1's verify test run with DRAFT = 5 measured the same
-    # drift along the same tokens, |logit diff| at most 5.0471 over 6096
-    # positions (six tokens a verify), on top of check_goldens.py's 2.0.
+    # the larger of the two measured depths. The trunk term is built as at two
+    # drafts: tp1's verify test run with DRAFT = 5 measured the drift along
+    # the same tokens, |logit diff| at most 1.8560 over 6096 positions (six
+    # tokens a verify), plus the decode step's drift across batches, 0.9276,
+    # on top of check_goldens.py's 2.0.
     MTP_LOGIT_ERROR = (2.6806, 2.4847, 2.6806, 2.6806, 2.6806)
-    TRUNK_LOGIT_BAND = 2.0 + 5.0471
+    TRUNK_LOGIT_BAND = 2.0 + 1.8560 + 0.9276
 
     @skip_not_sm103
     def test_mtp5_acceptance_matches_reference(self, monkeypatch):
