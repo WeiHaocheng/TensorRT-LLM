@@ -224,10 +224,10 @@ class GdpVerify(OpWrapper):
     _NEMOTRON4_TP4 = dict(_NEMOTRON4, heads=6, proj_width=4632, conv_offset=384)
 
     # tokens is 1 + max_draft_len: 3 for the checkpoint's trained depth (draft
-    # length 2), 2 for draft length 1, 4 for draft length 3, which tp1 also runs
-    # (up to its max_batch_size). The batch sizes are the decode CUDA graphs the
-    # target captures plus the eager size 3; a graph batch ends in one
-    # PAD_SLOT_ID padding row.
+    # length 2), 2 for draft length 1, 4 to 6 for draft lengths 3 to 5, which
+    # tp1 also runs (up to its max_batch_size). The batch sizes are the decode
+    # CUDA graphs the target captures plus the eager size 3; a graph batch ends
+    # in one PAD_SLOT_ID padding row.
     # The pool is a GDP layer's view in one of the two hybrid managers: "v1"
     # (`CppMambaHybridCacheManager`) follows each slot's ssm state with its conv
     # state, a slot stride of 221952 floats; "v2" (`MambaHybridCacheManagerV2`,
@@ -381,6 +381,102 @@ class GdpVerify(OpWrapper):
             spec=dict(tokens=4, batch=512, pad_rows=1, pool="v2", **_NEMOTRON4),
         ),
         Cell(
+            why="draft 4, concurrency 1: one request, v2 pool",
+            spec=dict(tokens=5, batch=1, pad_rows=0, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 2: one request and a padding row, v1 pool",
+            spec=dict(tokens=5, batch=2, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, eager batch 3 (not a power of two), v2 pool",
+            spec=dict(tokens=5, batch=3, pad_rows=0, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 4 with a padding row, v1 pool",
+            spec=dict(tokens=5, batch=4, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 8 with a padding row, v2 pool",
+            spec=dict(tokens=5, batch=8, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 16 with a padding row, v1 pool",
+            spec=dict(tokens=5, batch=16, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 32 with a padding row, v2 pool",
+            spec=dict(tokens=5, batch=32, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 64 with a padding row, v1 pool",
+            spec=dict(tokens=5, batch=64, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 128 with a padding row, v2 pool",
+            spec=dict(tokens=5, batch=128, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 256 with a padding row, v1 pool",
+            spec=dict(tokens=5, batch=256, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 448 (tp1's max_batch_size), v2 pool",
+            spec=dict(tokens=5, batch=448, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 512: v2 slots past 2^31 elements",
+            spec=dict(tokens=5, batch=512, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, concurrency 1: one request, v1 pool",
+            spec=dict(tokens=6, batch=1, pad_rows=0, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 2: one request and a padding row, v2 pool",
+            spec=dict(tokens=6, batch=2, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, eager batch 3 (not a power of two), v1 pool",
+            spec=dict(tokens=6, batch=3, pad_rows=0, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 4 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=4, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 8 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=8, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 16 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=16, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 32 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=32, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 64 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=64, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 128 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=128, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 256 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 448 (tp1's max_batch_size), v1 pool",
+            spec=dict(tokens=6, batch=448, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 512: v2 slots past 2^31 elements",
+            spec=dict(tokens=6, batch=512, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
             why="tp4 rank, draft 2, concurrency 1: one request, v2 pool",
             spec=dict(tokens=3, batch=1, pad_rows=0, pool="v2", **_NEMOTRON4_TP4),
         ),
@@ -486,7 +582,7 @@ class GdpVerify(OpWrapper):
     may round apart, and Triton specializes each on its strides' divisibility
     by 16, which a request's stride and a decode row's need not share.
 
-    Uncertified: T other than 2, 3 and 4 (4 at tp1's geometry only), an
+    Uncertified: T other than 2 and 3 (and 4 to 6 at tp1's geometry only), an
     intermediate whose token dim exceeds T, a pool other than the two managers'
     layouts, and the shapes `gdp_recurrent` leaves uncertified. CUDA-graph
     capturable: no host sync and no allocation besides `out`.
