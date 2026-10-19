@@ -91,6 +91,15 @@ _TILES: dict[tuple[int, int], tuple[tuple[int, _Tile], ...]] = {
         (32, _swap(32, 128, 128, 4, True)),
         (_ANY, _persistent(256, 64, 8, 3, True)),
     ),
+    # a tp4 rank's GDP in_proj: 6 of the 24 heads
+    (3072, 4632): (
+        (16, _swap(16, 64, 256, 4, True)),
+        (64, _swap(32, 64, 256, 4, True)),
+        (128, _swap(64, 64, 128, 6, True)),
+        (256, _MID),
+        (512, _persistent(128, 128, 8, 3)),
+        (_ANY, _persistent(256, 64, 4, 4, True)),
+    ),
 }
 
 #: Any other (k, n): the same arithmetic, uncertified. Small enough for an fp32 epilogue.
@@ -102,7 +111,9 @@ _DEFAULT_TILES: tuple[tuple[int, _Tile], ...] = (
 #: nemotron4-nano-preview's dense GEMMs, one row per distinct (k, n, out_dtype): (call sites, k, n,
 #: out_dtype). All are bias-free on bf16 operands. The router and the lm_head ask for fp32 out because
 #: the checkpoint runs both as fp32 GEMMs on bf16 values; their products are exact in fp32, so fp32
-#: accumulation with fp32 out is that math up to summation order.
+#: accumulation with fp32 out is that math up to summation order. A tp4 rank runs a quarter of most of
+#: them; the one slice whose cuBLAS rows move with the row count -- its GDP in_proj -- is a row of
+#: its own, and the replicated router and fc1_latent_proj keep the whole model's rows.
 _NEMOTRON4_GEMMS: tuple[tuple[str, int, int, Optional[torch.dtype]], ...] = (
     ("GDP in_proj", 3072, 18528, None),
     ("GDP out_proj", 1536, 3072, None),
@@ -116,6 +127,7 @@ _NEMOTRON4_GEMMS: tuple[tuple[str, int, int, Optional[torch.dtype]], ...] = (
     ("shared expert up", 3072, 4096, None),
     ("MTP eh_proj", 6144, 3072, None),
     ("lm_head", 3072, 262272, torch.float32),
+    ("tp4 GDP in_proj", 3072, 4632, None),
 )
 
 #: The row counts every GEMM is certified at, and why each is a cell.

@@ -25,6 +25,9 @@ _GDP_NORM = dict(
     dtype=torch.bfloat16,
     proj_width=18528,
 )
+# A tp4 rank normalizes its 6 heads: 384 channels in 6 groups of 64, x a contiguous [T, 384] and z
+# the first 384 columns of its in_proj output [T, 4632] = [z 384 | conv 4224 | b 18 | a 6].
+_GDP_NORM_TP4 = dict(_GDP_NORM, num_heads=6, proj_width=4632)
 
 
 class GatedRmsnorm(OpWrapper):
@@ -45,20 +48,29 @@ class GatedRmsnorm(OpWrapper):
 
     # The token counts a GDP layer normalizes per call: a decode step of one request, one
     # request's MTP verify (1 + max_draft_len 2), the largest CUDA-graph decode batch, and the two
-    # prefill budgets. The kernel's grid is (rows, groups) with no tiling over rows, so the counts
-    # differ in the grid they launch, not in the path through the kernel.
+    # prefill budgets, at tp1's width and a tp4 rank's. The kernel's grid is (rows, groups) with no
+    # tiling over rows, so the counts differ in the grid they launch, not in the path through the
+    # kernel.
     CELLS: tuple[Cell, ...] = (
         Cell(why="decode: one token", spec=dict(tokens=1, **_GDP_NORM)),
         Cell(why="one request's MTP verify: 1 + 2 draft tokens", spec=dict(tokens=3, **_GDP_NORM)),
         Cell(why="the largest CUDA-graph decode batch, 1024", spec=dict(tokens=1024, **_GDP_NORM)),
         Cell(why="prefill: one max_num_tokens 8192 chunk", spec=dict(tokens=8192, **_GDP_NORM)),
         Cell(why="prefill: the larger 16384-token budget", spec=dict(tokens=16384, **_GDP_NORM)),
+        Cell(why="tp4 rank, decode: one token", spec=dict(tokens=1, **_GDP_NORM_TP4)),
+        Cell(why="tp4 rank, one request's MTP verify", spec=dict(tokens=3, **_GDP_NORM_TP4)),
+        Cell(why="tp4 rank, graph batch 1024", spec=dict(tokens=1024, **_GDP_NORM_TP4)),
+        Cell(why="tp4 rank, prefill: an 8192-token chunk", spec=dict(tokens=8192, **_GDP_NORM_TP4)),
+        Cell(
+            why="tp4 rank, prefill: a 16384-token chunk", spec=dict(tokens=16384, **_GDP_NORM_TP4)
+        ),
     )
 
     note = """
     Certified: `is_rms_norm=True`, `norm_before_gate=False`, the silu gate, no bias, no
-    `fp8_scale`, `weight_is_delta=False`, `group_size` 64 over 1536 channels, eps 1e-5, bf16 x, z
-    and weight, a contiguous x and z the in_proj column slice, no `out`. Not certified, because no
+    `fp8_scale`, `weight_is_delta=False`, `group_size` 64 over 1536 channels (tp1) or 384 (a tp4
+    rank), eps 1e-5, bf16 x, z and weight, a contiguous x and z the in_proj column slice at its
+    target's row stride, no `out`. Not certified, because no
     target here reaches it: the gate after the norm (the op's default, which also selects the
     multi-row kernel), LayerNorm, the sigmoid gate, a bias, fp8 output, a delta-form weight, other
     group sizes, an explicit `out`.

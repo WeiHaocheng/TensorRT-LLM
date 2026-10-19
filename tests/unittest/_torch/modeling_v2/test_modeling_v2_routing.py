@@ -63,6 +63,10 @@ _NEMOTRON4_DEP4_TARGET = (
     "models.nemotron4.nemotron4_nano_preview__sm_103__dep4.modeling."
     "ModelingV2Nemotron4NanoPreviewSm103Dep4"
 )
+_NEMOTRON4_TP4_TARGET = (
+    "models.nemotron4.nemotron4_nano_preview__sm_103__tp4.modeling."
+    "ModelingV2Nemotron4NanoPreviewSm103Tp4"
+)
 
 
 def _qualified(target) -> str:
@@ -173,6 +177,7 @@ _NGRAM = NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2)
 
 
 _DEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=True)
+_TP4 = dict(world_size=4, tp_size=4, moe_ep_size=1, moe_tp_size=4)
 
 
 @pytest.mark.parametrize("mode", [None, "off"], ids=["default", "off"])
@@ -554,14 +559,13 @@ def test_nemotron4_dep4_declines_other_speculative_decoding(make_spec_config, mi
     "mapping_kwargs, topology",
     [
         (dict(world_size=2, tp_size=2), "tp2"),
-        (dict(world_size=4, tp_size=4), "tp4"),
         (
             dict(world_size=2, tp_size=2, moe_ep_size=2, moe_tp_size=1, enable_attention_dp=True),
             "dep2",
         ),
         (dict(_DEP4, enable_attention_dp=False), "tep4"),
     ],
-    ids=["tp2", "tp4", "dep2", "tep4"],
+    ids=["tp2", "dep2", "tep4"],
 )
 def test_nemotron4_topologies_without_a_target_say_why(mapping_kwargs, topology):
     """The other layouts of one node the 8K/1K workload could use are declined by
@@ -575,6 +579,14 @@ def test_nemotron4_topologies_without_a_target_say_why(mapping_kwargs, topology)
     assert f", {topology} (world_size=" in message
     assert f"; {topology} is not implemented: on the 8K/1K performance model" in message
     assert "speculative decoding off;" in message
+
+
+def test_nemotron4_tep4_is_declined_for_tp4():
+    """tep4 splits the mixers' heads as tp4 does and keeps whole experts per rank;
+    the reason it has no target is tp4, measured faster at every concurrency."""
+    config = _model_config(_nemotron4_config(), **dict(_DEP4, enable_attention_dp=False))
+    with pytest.raises(ValueError, match=r"; tep4 is not implemented: .* below tp4 at every"):
+        modeling_v2_resolve(config, _llm_args("require"))
 
 
 @pytest.mark.parametrize(
@@ -629,3 +641,112 @@ def test_nemotron4_dep4_on_another_sm_names_it(monkeypatch):
     message = str(excinfo.value)
     assert "compute capability (10, 0)" in message
     assert ", dep4 (world_size=4 tp=4 pp=1 cp=1 attention_dp=True moe_ep=4 moe_tp=1)" in message
+
+
+# --- nemotron4 tp4: tensor parallel over 4 ranks, no attention DP -------------------
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "mapping_kwargs",
+    [_TP4, dict(world_size=4, tp_size=4)],
+    ids=["moe_tp4", "moe_split_by_default"],
+)
+def test_nemotron4_tp4_matches(mode, mapping_kwargs):
+    """Four ranks without attention DP, the experts' widths split with the heads. The
+    mapping's default MoE split for tensor parallelism alone is that same layout."""
+    config = _model_config(_nemotron4_config(), **mapping_kwargs)
+    assert config.mapping.moe_tp_size == 4 and config.mapping.moe_ep_size == 1
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _NEMOTRON4_TP4_TARGET
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "spec_kwargs",
+    [dict(max_draft_len=2), dict(max_draft_len=2, speculative_model=_DUMMY_MODEL)],
+    ids=["trained_depth", "speculative_model_is_the_checkpoint"],
+)
+def test_nemotron4_tp4_with_mtp_eagle_matches(mode, spec_kwargs):
+    """The same draft path as tp1's: the checkpoint's MTP layer, one-model MTP-Eagle."""
+    pretrained_config = _nemotron4_config()
+    spec_config = _as_loaded(pretrained_config, MTPDecodingConfig(**spec_kwargs))
+    config = _model_config(pretrained_config, spec_config=spec_config, **_TP4)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _NEMOTRON4_TP4_TARGET
+
+
+@pytest.mark.parametrize(
+    "make_spec_config, missed",
+    [
+        (
+            lambda: MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True),
+            r"tp4 \(.*\), speculative decoding MTPDecodingConfig \(MTP\), which the target "
+            "does not run: use_mtp_vanilla",
+        ),
+        (
+            lambda: NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2),
+            r"tp4 \(.*\), speculative decoding NGramDecodingConfig \(NGRAM\), which the "
+            "target does not run",
+        ),
+    ],
+    ids=["vanilla", "ngram"],
+)
+def test_nemotron4_tp4_declines_other_speculative_decoding(make_spec_config, missed):
+    """tp4 runs the draft paths tp1 runs and no other; the message names the
+    layout as tp4 and blames the speculative mode, not the topology."""
+    pretrained_config = _nemotron4_config()
+    spec_config = _as_loaded(pretrained_config, make_spec_config())
+    config = _model_config(pretrained_config, spec_config=spec_config, **_TP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed) as excinfo:
+        modeling_v2_resolve(config, _llm_args("require"))
+    assert "is not implemented" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, missed",
+    [
+        # experts split two ways and their widths two ways
+        (dict(world_size=4, tp_size=4, moe_ep_size=2, moe_tp_size=2), "moe_ep=2 moe_tp=2"),
+        # every expert whole on one cluster of four ranks
+        (dict(world_size=4, tp_size=4, moe_cluster_size=4), "moe_ep=1 moe_tp=1"),
+        # attention split two ways by heads and two ways by context
+        (
+            dict(
+                world_size=4,
+                tp_size=4,
+                attn_tp_size=2,
+                attn_cp_size=2,
+                cp_config={"cp_type": "HELIX"},
+            ),
+            "attn_tp=2 attn_cp=2",
+        ),
+        # two pipeline stages of tensor parallel over two ranks
+        (dict(world_size=4, tp_size=2, pp_size=2), "pp=2"),
+        # context parallel over two ranks of tensor parallel over two
+        (dict(world_size=4, tp_size=2, cp_size=2), "cp=2"),
+    ],
+    ids=["moe_ep2_tp2", "moe_cluster4", "attn_cp2", "pp2", "cp2"],
+)
+def test_nemotron4_tp4_near_misses_do_not_match(mapping_kwargs, missed):
+    """Four ranks without attention DP are tp4 only when every rank holds its quarter
+    of every head group and of every intermediate width, the routed experts' included:
+    anything else divided is another layout, with weights in other shapes, and names
+    itself as no topology."""
+    config = _model_config(_nemotron4_config(), **mapping_kwargs)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError) as excinfo:
+        modeling_v2_resolve(config, _llm_args("require"))
+    message = str(excinfo.value)
+    assert missed in message
+    assert ", parallel layout (world_size=" in message
+    assert "is not implemented" not in message
+
+
+def test_nemotron4_tp4_on_another_sm_names_it(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
+    config = _model_config(_nemotron4_config(), **_TP4)
+    with pytest.raises(ValueError) as excinfo:
+        modeling_v2_resolve(config, _llm_args("require"))
+    message = str(excinfo.value)
+    assert "compute capability (10, 0)" in message
+    assert ", tp4 (world_size=4 tp=4 pp=1 cp=1 attention_dp=False moe_ep=1 moe_tp=4)" in message

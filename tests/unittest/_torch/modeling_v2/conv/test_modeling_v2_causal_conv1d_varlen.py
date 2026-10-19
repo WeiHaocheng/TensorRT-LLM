@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the causal_conv1d_varlen entry of nemotron4_nano_preview__sm_103__tp1.
+"""GPU test for the causal_conv1d_varlen catalog entry, at nemotron4-nano-preview's tp1 and
+tp4-rank shapes.
 
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into the buffers a target hands the op -- an in_proj-shaped
@@ -44,11 +45,13 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     can only land on the neighbouring bf16 value, and only when its fp32 value sits on a rounding
     boundary. Measured over every cell: at most 5.9e-5 of the outputs differ at all (one of the
     1-token cell's 16896; about 4e-6 on the large cells), each by exactly one ulp of its own
-    magnitude.
+    magnitude. On a tp4 rank's 4224 channels, five seeds of each cell: the 1- and 7-token cells
+    bit-identical, at most 1.1e-5 of the outputs differ elsewhere, the worst element 1.46 ulp at
+    its row's scale and the relative RMS 0.0055.
 
     Three gates, a row being one token:
       * element, 2 ulp at the row scale: one ulp of an element's own magnitude reads as up to
-        two of the nominal 2**-8 at the row's largest magnitude (measured worst 1.18). A
+        two of the nominal 2**-8 at the row's largest magnitude (measured worst 1.46). A
         resumed sequence computed as if fresh misses by 210 to 260.
       * relative RMS, 0.1 ulp: measured worst 0.019, that single flip. Rounding the conv output
         to bf16 before SiLU, as the checkpoint's HF module does, sits at 0.74.

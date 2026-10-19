@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the gdp_gates entry of nemotron4_nano_preview__sm_103__tp1.
+"""GPU test for the gdp_gates catalog entry, at nemotron4-nano-preview's tp1 and tp4-rank shapes.
 
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into the in_proj output a target hands the op (b and a as column
-slices of one [T, 18528] buffer), drives every bf16 bit pattern through each gate, and holds the
-inputs the guard exists to refuse.
+slices of one [T, 18528] buffer, [T, 4632] on a tp4 rank), drives every bf16 bit pattern through
+each gate, and holds the inputs the guard exists to refuse.
 """
 
 import zlib
@@ -23,6 +23,9 @@ assert torch.cuda.is_available(), "gdp_gates requires a CUDA device"
 
 BF16 = torch.bfloat16
 
+#: Each certified geometry's 1-token cell: tp1's 24 heads and a tp4 rank's 6.
+GEOMETRIES = [c for c in op.CELLS if c.spec["tokens"] == 1]
+
 #: Scale of the cells' Gaussian in_proj outputs. The b and a columns of the checkpoint's in_proj
 #: output sit within a few units of zero; 4 also reaches sigmoid's saturated tails and softplus'
 #: linear stretch above the threshold (a + dt_bias > 20) on every large cell. Every bf16 value
@@ -34,21 +37,33 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.view({2: torch.int16, 4: torch.int32}[t.element_size()])
 
 
-def _flushed(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """Where HF's value is an fp32 subnormal and the kernel's a zero of the same sign.
+def _flushed(out: torch.Tensor, ref: torch.Tensor, neg_a: torch.Tensor) -> torch.Tensor:
+    """Where the kernel's decay is a zero of HF's sign because it flushed a subnormal softplus.
 
-    The kernel's libdevice calls flush subnormal results to zero. In g that happens only where
-    HF's decay is itself subnormal -- below 2^-126 in magnitude, a + dt_bias under about -84 --
-    and the recurrences take g through exp(), which maps both to exactly 1.0.
+    libdevice's exp flushes a subnormal result to zero: where exp(a + dt_bias) falls below 2^-126
+    -- a + dt_bias under about -87.3 -- the kernel's softplus is zero, and so is its decay. HF
+    keeps the subnormal softplus and multiplies it by exp(A_log), so its decay is below
+    2^-126 * exp(A_log): subnormal where exp(A_log) < 1, a normal number where it is larger (up to
+    2.2e-37 at the checkpoint's largest A_log). Measured over every bf16 a at both head counts:
+    the kernel's decay is zero exactly where HF's softplus is subnormal, and a subnormal decay
+    made from a normal softplus comes back bit-exact. The recurrences take g through exp(),
+    which maps both to exactly 1.0.
     """
     tiny = torch.finfo(torch.float32).tiny
-    subnormal = (ref != 0) & (ref.abs() < tiny)
-    return subnormal & (out == 0) & (torch.signbit(out) == torch.signbit(ref))
+    small = (ref != 0) & (ref.abs() < tiny * neg_a.abs())
+    return small & (out == 0) & (torch.signbit(out) == torch.signbit(ref))
 
 
-def _assert_bitwise(name: str, x: torch.Tensor, out: torch.Tensor, ref: torch.Tensor) -> int:
+def _assert_bitwise(
+    name: str,
+    x: torch.Tensor,
+    out: torch.Tensor,
+    ref: torch.Tensor,
+    neg_a: torch.Tensor | None = None,
+) -> int:
     """The same bits as HF's ops wherever they give a number, and NaN wherever they give NaN;
-    returns how many fp32 subnormals the kernel flushed to zero (`_flushed`), the one exception.
+    returns how many decays the kernel flushed to zero (`_flushed`, given g's `neg_a`), the one
+    exception.
 
     There is no band to derive: kernel and reference run the same fp32 operations in the same
     order -- `1 / (1 + expf(-x))` rounded to bf16 for beta; the fp32 sum `a + dt_bias`, the
@@ -59,7 +74,7 @@ def _assert_bitwise(name: str, x: torch.Tensor, out: torch.Tensor, ref: torch.Te
     assert out.shape == ref.shape and out.dtype == ref.dtype, (name, out.shape, ref.shape)
     ref_nan = torch.isnan(ref)
     assert torch.equal(torch.isnan(out), ref_nan), f"{name}: NaN where HF has a number, or reverse"
-    flushed = _flushed(out, ref) if out.dtype == torch.float32 else torch.zeros_like(ref_nan)
+    flushed = torch.zeros_like(ref_nan) if neg_a is None else _flushed(out, ref, neg_a)
     if bool(flushed.any()):
         assert torch.equal(torch.exp(out[flushed]), torch.exp(ref[flushed])), name
     differ = (_bits(out) != _bits(ref)) & ~ref_nan & ~flushed
@@ -89,7 +104,7 @@ def _parameters(spec, g):
 
 
 def _build(spec, seed):
-    """b and a as the in_proj output's column slices: row stride 18528, no copy."""
+    """b and a as the in_proj output's column slices: row stride `proj_width`, no copy."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     proj = torch.randn(spec["tokens"], spec["proj_width"], generator=g, device="cuda")
     proj = proj.mul_(INPUT_SCALE).to(BF16)
@@ -108,7 +123,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     assert all(torch.equal(t, b) for t, b in zip(args, before)), "the op must not write its inputs"
     ref_beta, ref_g = op.reference(*args)
     _assert_bitwise("beta", args[0], beta, ref_beta)
-    _assert_bitwise("g", args[1], g, ref_g)
+    _assert_bitwise("g", args[1], g, ref_g, neg_a=args[2])
 
 
 def _every_bf16() -> torch.Tensor:
@@ -124,21 +139,23 @@ def _rows(values: torch.Tensor, width: int, rows: int) -> torch.Tensor:
     return values.repeat(repeats)[: rows * width].view(rows, width)
 
 
-def test_every_bf16_input(certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
-    """The whole input domain of each gate, through the op and through HF's ops.
+@pytest.mark.parametrize("geometry", GEOMETRIES, ids=lambda c: f"{c.spec['heads']} heads")
+def test_every_bf16_input(geometry, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
+    """The whole input domain of each gate, through the op and through HF's ops, at each
+    certified head count.
 
     beta depends on b alone, so every b value is driven once. g depends on a and on the head's
-    dt_bias and -exp(A_log); every a value is driven once, at one of 24 heads with parameters
+    dt_bias and -exp(A_log); every a value is driven once, at one of the heads with parameters
     spread over the checkpoint's ranges, so a + dt_bias crosses the softplus threshold, its log1p
-    stretch and its underflow -- where HF's decay goes subnormal and the kernel's flushes to zero
-    (`_flushed`).
+    stretch and its underflow -- where the softplus goes subnormal and the kernel's flushes to
+    zero (`_flushed`).
 
     The controls show that bitwise agreement is a claim these inputs can refute: sigmoid kept in
     fp32 to the end (no bf16 rounding of beta) and softplus' threshold dropped (log1p(exp(.))
     everywhere) each move outputs that the kernel matches.
     """
     certifying(op)
-    heads, householder = 24, 3
+    heads, householder = geometry.spec["heads"], geometry.spec["householder"]
     every = _every_bf16()
     rows = -(-every.numel() // heads)  # every a value once; b repeats from the start
     b = _rows(every, householder * heads, rows)
@@ -149,8 +166,9 @@ def test_every_bf16_input(certifying) -> None:  # noqa: F811 — pytest resolves
     beta, g = op(b, a, neg_a, dt_bias)
     ref_beta, ref_g = op.reference(b, a, neg_a, dt_bias)
     _assert_bitwise("beta", b, beta, ref_beta)
-    # Measured: 24 of the 65544 decays are subnormal in HF and flushed here.
-    assert _assert_bitwise("g", a, g, ref_g) <= 64
+    # Measured: 24 of the 65544 decays at 24 heads and 31 of the 65538 at 6 are flushed here; at 6
+    # heads one of HF's is a normal number, -7.4e-38, a subnormal softplus times exp(A_log) = 18.2.
+    assert _assert_bitwise("g", a, g, ref_g, neg_a=neg_a) <= 64
 
     finite_beta = torch.isfinite(ref_beta)
     unrounded = b.float().sigmoid().reshape(ref_beta.shape)
@@ -162,13 +180,14 @@ def test_every_bf16_input(certifying) -> None:  # noqa: F811 — pytest resolves
     assert g_moves >= 100, f"softplus' threshold changed only {g_moves} outputs"
 
 
-def test_rows_do_not_depend_on_the_batch() -> None:
+@pytest.mark.parametrize("geometry", GEOMETRIES, ids=lambda c: f"{c.spec['heads']} heads")
+def test_rows_do_not_depend_on_the_batch(geometry) -> None:
     """A token's gates come back as the same bits whatever batch it rides in.
 
     CUDA-graph padding and MTP verify change T for the same request, and the identity gates
     compare such runs bitwise. One program per token, this holds by construction; it is pinned.
     """
-    spec = dict(op.CELLS[3].spec)
+    spec = dict(geometry.spec, tokens=1024)
     b, a, neg_a, dt_bias = _build(spec, seed=5)
     full_beta, full_g = op(b, a, neg_a, dt_bias)
     for start, stop in ((0, 1), (37, 40), (1021, 1024)):
@@ -177,9 +196,10 @@ def test_rows_do_not_depend_on_the_batch() -> None:
         assert torch.equal(g, full_g[start:stop]), (start, stop)
 
 
-def test_a_captured_graph_replays_bitwise() -> None:
+@pytest.mark.parametrize("geometry", GEOMETRIES, ids=lambda c: f"{c.spec['heads']} heads")
+def test_a_captured_graph_replays_bitwise(geometry) -> None:
     """Captured once, replayed on new inputs, the same bits as eager and as HF's ops."""
-    spec = dict(op.CELLS[0].spec, tokens=64)
+    spec = dict(geometry.spec, tokens=64)
     static = _build(spec, seed=6)
     op(*static)  # compile outside the capture
     torch.cuda.synchronize()
@@ -195,7 +215,7 @@ def test_a_captured_graph_replays_bitwise() -> None:
         assert torch.equal(static_beta, beta) and torch.equal(static_g, g), f"replay (seed {seed})"
         ref_beta, ref_g = op.reference(*fresh)
         _assert_bitwise("beta", fresh[0], static_beta, ref_beta)
-        _assert_bitwise("g", fresh[1], static_g, ref_g)
+        _assert_bitwise("g", fresh[1], static_g, ref_g, neg_a=fresh[2])
 
 
 def test_zero_tokens_launch_nothing() -> None:

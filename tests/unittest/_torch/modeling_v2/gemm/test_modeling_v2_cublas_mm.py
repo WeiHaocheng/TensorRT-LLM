@@ -33,13 +33,14 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     bf16 out: 4 ulp (2^-8) element-wise against the row scale, 2 of relative
     RMS. The two fp32 sums agree to ~1e-6 relative, so what remains visible
     is a rounding flip -- one bf16 spacing, at most 2 of these ulps at the top
-    binade of a row. Measured worst across the cells: 1.94 element (that
-    flip), 0.068 RMS. A wrong product misses by orders.
+    binade of a row. Measured worst across the cells, a tp4 rank's slices
+    included: 1.98 element (that flip), 0.068 RMS. A wrong product misses by
+    orders.
 
     fp32 out (the routers and the lm_head): 1024 ulp (2^-23) element-wise,
     512 of relative RMS. Here the fp32 sums are the output. Measured worst:
     62 element and 28 RMS at k 3072 and 7168, with the kernel the less
-    accurate side (33-39 ulp from a float64 product, the reference within
+    accurate side (31-42 ulp from a float64 product, the reference within
     21). A result rounded to bf16 and widened scores at least 16484 and 13819,
     so this gate refuses it by 16x; a band in bf16 ulp would let it through.
     """

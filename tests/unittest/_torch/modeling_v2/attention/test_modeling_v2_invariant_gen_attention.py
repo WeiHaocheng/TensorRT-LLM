@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the invariant_gen_attention entry of nemotron4-nano-preview's tp1 target.
+"""GPU test for the invariant_gen_attention catalog entry, at nemotron4-nano-preview's 16 query
+heads (the tp1 and dep4 targets) and at a tp4 rank's 4.
 
 Every call runs over a real paged pool laid out as the C++ KV cache manager
 lays one out: page p of layer l holds K then V, each `[kv heads, 32, 256]`;
@@ -36,6 +37,8 @@ assert torch.cuda.is_available(), "invariant_gen_attention requires a CUDA devic
 _LAYERS, _LAYER = 2, 1
 #: The page every unused page-table entry points at: all NaN, never written.
 _POISON_PAGE = 0
+#: The query heads the cells run at: the tp1 and dep4 targets', and a tp4 rank's.
+HEADS = (16, 4)
 
 
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -46,7 +49,8 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     fp64 transcription the kernel sits within 1.31 ulp of the row scale (0.58
     of relative RMS) and the fp32 reference within 1.00 (0.44), so the two land
     at most one bf16 step apart at the top of a row's range. Measured over the
-    27 cells x 3 seeds: 2.00 element-wise, 0.64 of relative RMS.
+    27 cells x 3 seeds: 2.00 element-wise, 0.64 of relative RMS; over a tp4
+    rank's 27 at 4 heads x 3 seeds: 2.00 and 0.65.
 
     So: 4 ulp element-wise (two such steps) and 1.0 of relative RMS. The
     mistakes this gate exists for land outside it in every cell -- the next
@@ -237,8 +241,12 @@ def _check(call: _Call, out: torch.Tensor, before: torch.Tensor) -> None:
     )
 
 
-def _cell(tokens: int, batch: int):
-    return next(c for c in op.CELLS if (c.spec["tokens"], c.spec["batch"]) == (tokens, batch))
+def _cell(tokens: int, batch: int, heads: int = 16):
+    return next(
+        c
+        for c in op.CELLS
+        if (c.spec["tokens"], c.spec["batch"], c.spec["num_heads"]) == (tokens, batch, heads)
+    )
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -251,12 +259,13 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     _check(call, out, before)
 
 
+@pytest.mark.parametrize("heads", HEADS, ids=lambda h: f"{h} heads")
 @pytest.mark.parametrize("tokens,batch", [(1, 1024), (2, 512), (3, 512)])
-def test_a_request_does_not_depend_on_its_batch(tokens, batch) -> None:
+def test_a_request_does_not_depend_on_its_batch(tokens, batch, heads) -> None:
     """Bit-identical rows and appends for requests run alone, in an eager batch
     of three and inside the padded graph batch: a row's arithmetic is fixed by
     the kernels' split and tile, never by the batch around it."""
-    call = _Call(_cell(tokens, batch).spec, seed=batch + tokens)
+    call = _Call(_cell(tokens, batch, heads).spec, seed=batch + tokens)
     full = op(**call.args()).clone()
     pool_after = call.pool.clone()
     for rows in (slice(0, 1), slice(1, 4), slice(7, 8), slice(batch - 3, batch - 2)):
@@ -277,13 +286,14 @@ def test_a_request_does_not_depend_on_its_batch(tokens, batch) -> None:
         )
 
 
+@pytest.mark.parametrize("heads", HEADS, ids=lambda h: f"{h} heads")
 @pytest.mark.parametrize("tokens", [2, 3])
-def test_verify_row_equals_decode_of_the_same_token(tokens) -> None:
+def test_verify_row_equals_decode_of_the_same_token(tokens, heads) -> None:
     """Row j of a T-token group gives the bits the same token gives as a decode
     row (T = 1) over the same keys: a verified token's attention is the one
     MTP-off decode computes. The groups straddle page (32) and split (512)
     boundaries."""
-    spec = _cell(tokens, 64).spec
+    spec = _cell(tokens, 64, heads).spec
     gen = torch.Generator().manual_seed(tokens)
     ends = [31, 32, 33, 511, 512, 513, 1023, 1024, 1025, 4097, 8704, 9344, tokens]
     lens = ends + [min(n + 1000, 9344) for n in ends]
@@ -312,12 +322,13 @@ def test_verify_row_equals_decode_of_the_same_token(tokens) -> None:
         )
 
 
-def test_cuda_graph_replays_on_new_lengths_and_inputs() -> None:
+@pytest.mark.parametrize("heads", HEADS, ids=lambda h: f"{h} heads")
+def test_cuda_graph_replays_on_new_lengths_and_inputs(heads) -> None:
     """One capture at B = 64, T = 3; two replays after every length grew on the
     device (as the overlap scheduler corrects it) and new tokens arrived. Each
     replay is checked against `reference` and against the eager call on the
     same state, bit for bit."""
-    spec = _cell(3, 64).spec
+    spec = _cell(3, 64, heads).spec
     gen = torch.Generator().manual_seed(64)
     lens = torch.randint(
         3, spec["max_seq_len"] - 6 + 1, (spec["batch"] - spec["pad_rows"],), generator=gen
@@ -349,8 +360,9 @@ def test_cuda_graph_replays_on_new_lengths_and_inputs() -> None:
         )
 
 
+@pytest.mark.parametrize("heads", HEADS, ids=lambda h: f"{h} heads")
 @pytest.mark.parametrize("tokens", [1, 3])
-def test_appends_match_thop_attention(tokens) -> None:
+def test_appends_match_thop_attention(tokens, heads) -> None:
     """The pool after this entry's call is, byte for byte, the pool after
     `thop_attention`'s generation call on the same state -- so the two share
     one pool -- and both outputs sit within the band of `reference`.
@@ -359,7 +371,7 @@ def test_appends_match_thop_attention(tokens) -> None:
     request's length in its last page, thop's generation kernels return whole
     requests as NaN (measured at T = 1 and T = 3, only requests whose last page
     is partly filled), so they read those slots."""
-    spec = dict(_cell(tokens, 8).spec, pad_rows=0)
+    spec = dict(_cell(tokens, 8, heads).spec, pad_rows=0)
     call = _Call(spec, seed=80 + tokens, lens=[9344, 4097, 513, 512, 33, 32, tokens + 1, 2000])
     call.pool.nan_to_num_(0.0)
     thop_out, thop_pool = _thop_generation(call, call.pool.clone())
@@ -372,10 +384,11 @@ def test_appends_match_thop_attention(tokens) -> None:
     _compare(thop_out, call.reference())
 
 
-def test_generation_rows_after_context_rows() -> None:
+@pytest.mark.parametrize("heads", HEADS, ids=lambda h: f"{h} heads")
+def test_generation_rows_after_context_rows(heads) -> None:
     """With context entries first in `sequence_length` and the page table, the
     call reads its rows from `num_contexts` on, as `thop_attention` does."""
-    call = _Call(_cell(3, 8).spec, seed=5, num_contexts=3)
+    call = _Call(_cell(3, 8, heads).spec, seed=5, num_contexts=3)
     before = call.pool.clone()
     _check(call, op(**call.args()), before)
 

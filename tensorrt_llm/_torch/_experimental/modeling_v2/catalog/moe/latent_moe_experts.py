@@ -24,6 +24,7 @@ def _cell(
     offset: int = 0,
     count: int = 512,
     out_dtype: torch.dtype | None = None,
+    intermediate: int = _LATENT_MOE["intermediate"],
 ) -> Cell:
     return Cell(
         why=why,
@@ -32,7 +33,7 @@ def _cell(
             local_expert_offset=offset,
             num_local_experts=count,
             out_dtype=out_dtype,
-            **_LATENT_MOE,
+            **dict(_LATENT_MOE, intermediate=intermediate),
         ),
     )
 
@@ -70,6 +71,35 @@ def _ep_cells() -> tuple[Cell, ...]:
         )
         for rank in _EP_RANKS
         for tokens, load in _EP_LOADS.items()
+        for out_dtype, name in _EP_OUT_DTYPES.items()
+    )
+
+
+# A tensor-parallel rank over 4 ranks holds every expert with a quarter of its intermediate
+# width, up_proj[:, 1024 r : 1024 (r + 1)] and down_proj[:, :, 1024 r : 1024 (r + 1)], and runs
+# every slot of its own tokens: the full window at intermediate 1024. Its output is the rank's
+# partial sum over that slice, so both output dtypes are certified, as the EP ranks' are.
+_TP4_INTERMEDIATE = _LATENT_MOE["intermediate"] // 4
+_TP4_LOADS = {
+    1: "decode, one token: ten experts, one row each",
+    8: "decode 8: ~75 experts touched, mostly one row each",
+    64: "decode 64: ~370 experts, the weight stream dominates",
+    256: "decode 256: every expert touched, ~5 rows each",
+    1024: "decode 1024, the largest CUDA-graph batch: ~20 rows each",
+    8192: "prefill 8192, the max_num_tokens baseline: ~160 rows each",
+}
+
+
+def _tp4_cells() -> tuple[Cell, ...]:
+    return tuple(
+        _cell(
+            f"tp4 rank, {tokens} token{'s' if tokens > 1 else ''}, {name} out, intermediate "
+            f"1024 of 4096: {load}",
+            tokens,
+            out_dtype=out_dtype,
+            intermediate=_TP4_INTERMEDIATE,
+        )
+        for tokens, load in _TP4_LOADS.items()
         for out_dtype, name in _EP_OUT_DTYPES.items()
     )
 
@@ -538,7 +568,9 @@ class LatentMoeExperts(OpWrapper):
     already normalized and scaled), `up_proj` [n, intermediate, latent] and `down_proj`
     [n, latent, intermediate] bf16 -- the window's experts, `experts.up_proj[offset:offset + n]`
     as stored. On tp1 the window is every expert, (0, 512); an expert-parallel rank passes its
-    own, gets its experts' partial sums, and a slot outside the window adds nothing.
+    own, gets its experts' partial sums, and a slot outside the window adds nothing. A
+    tensor-parallel rank passes every expert's slice of the intermediate dimension (up_proj's
+    rows, down_proj's columns) and gets its slice's partial sums.
 
     `out_dtype` None (the default) returns x's dtype, bf16: the sum rounded once.
     `torch.float32` returns the fp32 sum itself, the same additions without that rounding, so
@@ -563,7 +595,9 @@ class LatentMoeExperts(OpWrapper):
     # Token counts the tp1 target runs this block at, each a different load on the grouped
     # GEMMs: rows per expert go from one (decode, latency-bound) to ~320 (a 16K prefill,
     # compute-bound), and the experts touched from 10 to all 512. Then a 4-rank expert-parallel
-    # target's: the end windows at each gathered size, as bf16 and as fp32 partial sums.
+    # target's: the end windows at each gathered size, as bf16 and as fp32 partial sums. Then a
+    # 4-rank tensor-parallel target's: every expert at a quarter of the intermediate width,
+    # which changes the grouped GEMMs' n and k, at its decode and prefill sizes, in both dtypes.
     CELLS: tuple[Cell, ...] = (
         _cell("decode, one token: ten experts, one row each, latency-bound", 1),
         _cell("decode 8: ~75 experts touched, mostly one row each", 8),
@@ -581,17 +615,28 @@ class LatentMoeExperts(OpWrapper):
             count=128,
         ),
         *_ep_cells(),
+        *_tp4_cells(),
     )
 
     note = """
     Certified: bf16 x and weights, fp32 routing weights, int32 ids, top-10 of 512, latent 768,
     intermediate 4096, clamp 16, the window (0, 512) up to 16384 tokens, and the 4-rank
     expert-parallel windows (128 r, 128): r = 0 and 3 from 4 to 32768 gathered tokens with bf16
-    and fp32 outputs, r = 1 at 256 tokens. Not certified, because no target here reaches it:
-    another top-k or width, another window size, fp16 or fp64 outputs, a zero-token batch, and
-    a token that names the same expert twice (the checkpoint's `index_add_` gives no order for
-    that case either). A window none of the batch's slots fall into returns zeros (tested, not
-    a cell).
+    and fp32 outputs, r = 1 at 256 tokens. Also intermediate 1024, a 4-rank tensor-parallel
+    rank's slice of every expert, over the window (0, 512) from 1 to 8192 tokens with bf16 and
+    fp32 outputs. Not certified, because no target here reaches it: another top-k, latent or
+    intermediate width, another window size, a window at intermediate 1024, fp16 or fp64
+    outputs, a zero-token batch, and a token that names the same expert twice (the checkpoint's
+    `index_add_` gives no order for that case either). A window none of the batch's slots fall
+    into returns zeros (tested, not a cell).
+
+    Tensor parallelism: on a rank's slice, each slot's down-projection row is the sum over the
+    rank's 1024 intermediate channels, rounded to bf16 there, where the full width rounds the
+    sum over all 4096 once. So the four ranks' outputs add up to the full width's result only up
+    to those extra roundings. Measured: the four bf16 outputs added in fp32 and rounded once sit
+    0.93 to 0.99 ulp of relative RMS from the full width's bf16 result, and the four fp32
+    outputs 0.81 to 0.82, since the per-slot roundings stay either way. That is a property of
+    slicing the down projection, not of this entry.
 
     Expert parallelism: a window gives each of its slots the bits the full-window call gives
     it, so the four windows' fp32 partial sums, added in fp32, differ from the full window's

@@ -112,14 +112,29 @@ _GDP = dict(
     pool_ssm_bytes=24 * 64 * 128 * 4,
     window_positions=3,
 )
+# A tp4 rank's conv: its 6 of the 24 GDP heads, 4224 channels, the conv columns of its in_proj
+# output [z 384 | conv 4224 | beta 18 | decay 6] = 4632 wide; a v1 slot holds the rank's
+# [6, 64, 128] fp32 recurrent state before the conv state.
+_GDP_TP4 = dict(_GDP, dim=4224, proj_width=4632, proj_offset=384, pool_ssm_bytes=6 * 64 * 128 * 4)
 
 
-def _cell(why: str, tokens: int, batch: int, pad_rows: int, pool: str, graph: bool = False) -> Cell:
+def _cell(
+    why: str,
+    tokens: int,
+    batch: int,
+    pad_rows: int,
+    pool: str,
+    graph: bool = False,
+    geometry: dict = _GDP,
+) -> Cell:
     """`batch` rows of `tokens` tokens each, the last `pad_rows` rows CUDA-graph padding; `pool` is
-    "v1" or "v2" (above); `graph` also captures the call in a CUDA graph and replays it."""
+    "v1" or "v2" (above); `graph` also captures the call in a CUDA graph and replays it;
+    `geometry` is tp1's conv or a tp4 rank's."""
     return Cell(
         why=why,
-        spec=dict(tokens=tokens, batch=batch, pad_rows=pad_rows, pool=pool, graph=graph, **_GDP),
+        spec=dict(
+            tokens=tokens, batch=batch, pad_rows=pad_rows, pool=pool, graph=graph, **geometry
+        ),
     )
 
 
@@ -176,6 +191,46 @@ class CausalConv1dVerify(OpWrapper):
         _cell("T=2, graph batch 256 holding 129 requests: 127 padding rows", 2, 256, 127, "v1"),
         _cell("T=2, graph batch 512: around tp1's max_batch_size", 2, 512, 1, "v2"),
         _cell("T=2, graph batch 1024: a DP rank's largest batch", 2, 1024, 1, "v2"),
+        _cell("tp4 rank, T=3, graph batch 1: one request", 3, 1, 0, "v2", geometry=_GDP_TP4),
+        _cell("tp4 rank, T=3, graph batch 2 with a padding row", 3, 2, 1, "v1", geometry=_GDP_TP4),
+        _cell("tp4 rank, T=3, eager batch 3", 3, 3, 0, "v1", geometry=_GDP_TP4),
+        _cell("tp4 rank, T=3, graph batch 8 holding 5 requests", 3, 8, 3, "v2", geometry=_GDP_TP4),
+        _cell(
+            "tp4 rank, T=3, graph batch 64, also captured and replayed",
+            3,
+            64,
+            1,
+            "v1",
+            graph=True,
+            geometry=_GDP_TP4,
+        ),
+        _cell(
+            "tp4 rank, T=3, graph batch 256 with a padding row", 3, 256, 1, "v2", geometry=_GDP_TP4
+        ),
+        _cell(
+            "tp4 rank, T=3, graph batch 512 with a padding row", 3, 512, 1, "v1", geometry=_GDP_TP4
+        ),
+        _cell(
+            "tp4 rank, T=3, graph batch 1024 with a padding row",
+            3,
+            1024,
+            1,
+            "v2",
+            geometry=_GDP_TP4,
+        ),
+        _cell("tp4 rank, T=2, graph batch 1: one request", 2, 1, 0, "v1", geometry=_GDP_TP4),
+        _cell("tp4 rank, T=2, eager batch 3", 2, 3, 0, "v2", geometry=_GDP_TP4),
+        _cell(
+            "tp4 rank, T=2, graph batch 64 with a padding row", 2, 64, 1, "v2", geometry=_GDP_TP4
+        ),
+        _cell(
+            "tp4 rank, T=2, graph batch 1024 with a padding row",
+            2,
+            1024,
+            1,
+            "v1",
+            geometry=_GDP_TP4,
+        ),
     )
 
     note = """
@@ -206,7 +261,8 @@ class CausalConv1dVerify(OpWrapper):
     checkpoint's `Nemotron4GDPMixer` rounds it to bf16 before SiLU too (see that entry's note).
 
     Certified: T = 2 and 3; x as the in_proj output's conv columns, `[batch, 16896, T]` with
-    channel stride 1 and token stride 18528; both pool forms; the window buffer as one layer's
+    channel stride 1 and token stride 18528 (tp1), or `[batch, 4224, T]` with token stride 4632
+    (a tp4 rank's 6 heads); both pool forms; the window buffer as one layer's
     view of the manager's dense `intermediate_conv_states`; padding rows at the end; one call
     captured in a CUDA graph and replayed on new inputs, slots and states. Not certified: T > 3
     (draft lengths beyond the checkpoint's 2), T = 1 (a decode step, which `causal_conv1d_update`

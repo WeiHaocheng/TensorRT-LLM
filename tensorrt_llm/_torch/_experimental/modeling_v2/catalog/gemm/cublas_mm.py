@@ -46,14 +46,45 @@ _NEMOTRON4_LM_HEAD_ROWS = (
     (3072, "1024 requests verifying two drafts each"),
 )
 
+#: The tp4 target's per-rank slices of those GEMMs. Column-parallel projections
+#: keep k and take a quarter of n, row-parallel ones a quarter of k; GDP in_proj
+#: keeps its six heads of every segment ([z | V | K | Q | b | a] at 6 of 24
+#: heads). The single KV head is replicated, so the fused qkv is 4 query heads
+#: plus the whole k and v: 4 * 256 + 256 + 256. The dense MLP's up and down
+#: projections are both 3072 -> 3072 per rank, and o_proj and the shared
+#: expert's down projection both 1024 -> 3072. The router, both latent
+#: projections and MTP eh_proj are replicated, at the shapes above.
+_NEMOTRON4_TP4_GEMMS: tuple[tuple[str, int, int, torch.dtype | None], ...] = (
+    ("GDP in_proj", 3072, 4632, None),
+    ("GDP out_proj", 384, 3072, None),
+    ("attention qkv", 3072, 1536, None),
+    ("o_proj and shared down", 1024, 3072, None),
+    ("MLP up and down", 3072, 3072, None),
+    ("shared expert up", 3072, 1024, None),
+)
 
-def _nemotron4_cells() -> tuple[Cell, ...]:
-    """One cell per (GEMM, row count) that nemotron4's forward runs."""
-    plan = [(gemm, _NEMOTRON4_LAYER_ROWS) for gemm in _NEMOTRON4_GEMMS]
-    plan.append((_NEMOTRON4_LM_HEAD, _NEMOTRON4_LM_HEAD_ROWS))
+#: tp4's lm_head is vocab-parallel: each rank computes its quarter of the
+#: vocabulary's fp32 logits, at the row counts tp1's lm_head runs plus 8192
+#: rows, above any batch the target verifies.
+_NEMOTRON4_TP4_LM_HEAD = ("lm_head", 3072, 65568, torch.float32)
+_NEMOTRON4_TP4_LM_HEAD_ROWS = (
+    *_NEMOTRON4_LM_HEAD_ROWS,
+    (8192, "8192 rows, above any verify batch"),
+)
+
+
+def _nemotron4_cells(
+    target: str,
+    gemms: tuple[tuple[str, int, int, torch.dtype | None], ...],
+    lm_head: tuple[str, int, int, torch.dtype | None],
+    lm_head_rows: tuple[tuple[int, str], ...],
+) -> tuple[Cell, ...]:
+    """One cell per (GEMM, row count) that a nemotron4 target's forward runs."""
+    plan = [(gemm, _NEMOTRON4_LAYER_ROWS) for gemm in gemms]
+    plan.append((lm_head, lm_head_rows))
     return tuple(
         Cell(
-            why=f"nemotron4 {site} m={m}: {k} -> {n}{', fp32 out' if out_dtype else ''}, {rows}",
+            why=f"{target} {site} m={m}: {k} -> {n}{', fp32 out' if out_dtype else ''}, {rows}",
             spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
         )
         for (site, k, n, out_dtype), row_counts in plan
@@ -75,7 +106,8 @@ class CublasMm(OpWrapper):
     # (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
     # projections), and an out_dtype that is not the input's (deepseek's router
     # asks for fp32 logits). The nemotron4 cells after them differ in size: each
-    # of its distinct GEMMs at each row count its forward runs.
+    # of its distinct GEMMs at each row count its forward runs, for the tp1
+    # target and then for a tp4 rank's slices.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="gpt-oss qkv with fused bias: hidden 2880 -> (64 + 8 + 8) * 64",
@@ -95,7 +127,15 @@ class CublasMm(OpWrapper):
             why="decode-shaped: one token, the shape every projection sees per step",
             spec=dict(m=1, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
         ),
-        *_nemotron4_cells(),
+        *_nemotron4_cells(
+            "nemotron4", _NEMOTRON4_GEMMS, _NEMOTRON4_LM_HEAD, _NEMOTRON4_LM_HEAD_ROWS
+        ),
+        *_nemotron4_cells(
+            "nemotron4 tp4",
+            _NEMOTRON4_TP4_GEMMS,
+            _NEMOTRON4_TP4_LM_HEAD,
+            _NEMOTRON4_TP4_LM_HEAD_ROWS,
+        ),
     )
 
     note = """

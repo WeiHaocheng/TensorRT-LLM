@@ -49,10 +49,13 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     Now and then that tips an h or an o across a bf16 rounding boundary, and the activation
     (slope 2c, up to 32 at the clamp) carries a flipped h into y. Measured over every cell on
     these inputs: at most 1.95 ulp element-wise against the row scale and 0.160 ulp of relative
-    RMS over the whole expert range (other seeds: up to 2.63 and 0.159), and 2.74 and 0.123 on
+    RMS over the whole expert range (other seeds: up to 2.63 and 0.159), 2.74 and 0.123 on
     the expert-parallel windows (five other seeds each: up to 3.28, and 0.203 at 4 tokens,
-    where 3072 values make the RMS noisy) -- and the checkpoint's own loop, its GEMMs on
-    cuBLAS, sits the same distance from this reference (1.95 and 0.158; 2.74 and 0.118).
+    where 3072 values make the RMS noisy), and 1.86 and 0.115 at a tensor-parallel rank's
+    quarter of the intermediate width (five other seeds each: up to 1.95 and 0.236) -- and the
+    checkpoint's own loop, its GEMMs on cuBLAS, sits the same distance from this reference
+    (1.95 and 0.158; 2.74 and 0.118; on the tensor-parallel slice it gives the entry's own
+    bits, measured on every such cell).
 
     So: 6 ulp element-wise, 0.4 of relative RMS. A window's row sums two or three experts
     rather than ten, so one flipped o is a larger share of the row's scale, and a 32768-token
@@ -74,11 +77,12 @@ def _compare_fp32_sum(out: torch.Tensor, ref: torch.Tensor) -> None:
     own rounding on top. Scored in bf16 ulp rather than fp32's: every operand is bf16, so
     fp32's ulp would measure the container. Measured over every fp32 cell on these inputs: at
     most 1.95 ulp element-wise and 0.107 of relative RMS (five other seeds each: up to 2.02 and
-    0.133); the checkpoint's own loop on cuBLAS, its fp32 buffer taken before the rounding, sits
-    at 1.95 and 0.102.
+    0.133), 0.92 and 0.066 at a tensor-parallel rank's slice (other seeds: up to 1.49 and
+    0.130); the checkpoint's own loop on cuBLAS, its fp32 buffer taken before the rounding, sits
+    at 1.95 and 0.102 (0.92 and 0.066 on the slice).
 
     So: 4 ulp element-wise, 0.3 of relative RMS. Without the output rounding the plausible
-    wrong order moves less too -- weighting after down_proj measures 0.67 to 0.76 ulp of RMS --
+    wrong order moves less too -- weighting after down_proj measures 0.66 to 0.77 ulp of RMS --
     so the RMS gate sits lower than `_compare`'s, about 2.2 times from either side.
     """
     assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=0.3, ulp=ULP[torch.bfloat16])
@@ -301,17 +305,18 @@ def test_the_activation_pass_is_the_checkpoints_on_every_bf16_value(weight) -> N
 
 
 @pytest.mark.parametrize(
-    "offset, count, out_dtype",
-    [(0, 512, None), (384, 128, torch.float32)],
-    ids=["tp1 window, bf16", "dep4 rank 3 window, fp32"],
+    "offset, count, out_dtype, intermediate",
+    [(0, 512, None, 4096), (384, 128, torch.float32, 4096), (0, 512, None, 1024)],
+    ids=["tp1 window, bf16", "dep4 rank 3 window, fp32", "tp4 rank's slice, bf16"],
 )
-def test_a_rows_result_does_not_depend_on_its_batch(offset, count, out_dtype) -> None:
+def test_a_rows_result_does_not_depend_on_its_batch(offset, count, out_dtype, intermediate) -> None:
     """The first n tokens computed alone and inside a larger batch: bit-identical.
 
     Batch composition and CUDA-graph padding change what surrounds a request, and with it the
     grouped GEMMs' group sizes -- and on an expert-parallel rank, every other rank's tokens
     join the gathered batch too. A row whose bits moved with them would make greedy decoding
-    depend on its neighbours, so this is measured rather than assumed.
+    depend on its neighbours, so this is measured rather than assumed, at each intermediate
+    width a target runs: a tensor-parallel rank's quarter changes both grouped GEMMs' shapes.
 
     The batch is twice the fused path's largest, so it takes the grouped-GEMM path, while every
     part up to that largest takes the fused one: the comparison crosses the switch between the
@@ -324,6 +329,7 @@ def test_a_rows_result_does_not_depend_on_its_batch(offset, count, out_dtype) ->
         local_expert_offset=offset,
         num_local_experts=count,
         out_dtype=out_dtype,
+        intermediate=intermediate,
     )
     args = _build(spec, seed=123)
     assert not _takes_fused_path(args)
@@ -340,17 +346,29 @@ def test_a_rows_result_does_not_depend_on_its_batch(offset, count, out_dtype) ->
 
 
 @pytest.mark.parametrize(
-    "tokens, offset, count, out_dtype",
+    "tokens, offset, count, out_dtype, intermediate",
     [
-        (1, 0, 512, None),
-        (64, 0, 512, None),
-        (256, 0, 512, None),
-        (64, 384, 128, torch.float32),
-        (_FUSED_MOST + 1, 0, 512, None),
+        (1, 0, 512, None, 4096),
+        (64, 0, 512, None, 4096),
+        (256, 0, 512, None, 4096),
+        (64, 384, 128, torch.float32, 4096),
+        (_FUSED_MOST + 1, 0, 512, None, 4096),
+        (1, 0, 512, None, 1024),
+        (64, 0, 512, None, 1024),
     ],
-    ids=["1", "64", "256", "64 gathered, dep4 rank 3, fp32", "past the fused path"],
+    ids=[
+        "1",
+        "64",
+        "256",
+        "64 gathered, dep4 rank 3, fp32",
+        "past the fused path",
+        "1, tp4 slice",
+        "64, tp4 slice",
+    ],
 )
-def test_a_captured_graph_replays_the_eager_result(tokens, offset, count, out_dtype) -> None:
+def test_a_captured_graph_replays_the_eager_result(
+    tokens, offset, count, out_dtype, intermediate
+) -> None:
     """Captured once at a decode size, replayed on new activations and routing: bitwise the
     eager call. Nothing on either path syncs the host or sizes a buffer from device data; the
     last batch is past the fused path, as an MTP verify step of many rows can be."""
@@ -360,6 +378,7 @@ def test_a_captured_graph_replays_the_eager_result(tokens, offset, count, out_dt
         local_expert_offset=offset,
         num_local_experts=count,
         out_dtype=out_dtype,
+        intermediate=intermediate,
     )
     static = _build(spec, seed=7)
     side = torch.cuda.Stream()
