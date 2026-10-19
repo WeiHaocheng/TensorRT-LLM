@@ -81,16 +81,16 @@ class ThopAttention(OpWrapper):
     # kernel the op picks changes with batch size and history length -- and
     # with the query heads per KV head, so tp4's 4 have cells of their own. Its
     # decode steps (one query token a request, at the CUDA-graph batch sizes 1,
-    # 2, 4, 8 to 128 by 8, then 192 to 1024 by 64) reach four generation kernel
-    # families, measured at both head counts: a multi-CTA KV split, with a CTA
-    # cluster at 32 and from 56 to 72 and without one elsewhere up to 72, one CTA
-    # per KV range from 80 to 128, and a persistent kernel from 192. The decode
-    # cells sit in each: B = 1, 64, 128 and 1024. Its verify steps (3 query
-    # tokens a request, at the same sizes up to 512) reach five, measured at both
-    # head counts: a multi-CTA KV split up to 8 requests, the same without a CTA
-    # cluster around 16 to 48 and with one around 32 to 72, one CTA per KV range
-    # from 80 to 128, and a persistent kernel from 192. The verify cells sit in
-    # each: B = 1, 16, 64, 128 and 512.
+    # 2, 4, 8 to 128 by 8, then 192 to 1024 by 64) run dense-mask kernels of
+    # four kinds, measured at both head counts: a multi-CTA KV split up to 24
+    # requests (and at 48), the same with a CTA cluster at 32, 40 and 56 to 72,
+    # one CTA per KV range from 80 to 128, and a persistent kernel from 192. The
+    # decode cells sit in each: B = 1, 64, 128 and 1024. Its verify steps (3
+    # query tokens a request, at the same sizes up to 512) reach five generation
+    # kernel families, measured at both head counts: a multi-CTA KV split up to
+    # 8 requests, the same without a CTA cluster around 16 to 48 and with one
+    # around 32 to 72, one CTA per KV range from 80 to 128, and a persistent
+    # kernel from 192. The verify cells sit in each: B = 1, 16, 64, 128 and 512.
     # Its steps reach 16384 tokens per rank: a fresh 8192-token prompt beside
     # the largest decode or verify batch, or two fresh prompts in one step.
     CELLS: tuple[Cell, ...] = (
@@ -169,7 +169,7 @@ class ThopAttention(OpWrapper):
             spec=dict(contexts=(), generations=64, gen_tokens=1, **_NEMOTRON4),
         ),
         Cell(
-            why="nemotron4 decode B=128: one CTA per KV range",
+            why="nemotron4 decode B=128: one CTA per KV range, which no other decode cell reaches",
             spec=dict(contexts=(), generations=128, gen_tokens=1, **_NEMOTRON4),
         ),
         Cell(
@@ -237,7 +237,7 @@ class ThopAttention(OpWrapper):
             spec=dict(contexts=(), generations=64, gen_tokens=1, **_NEMOTRON4_TP4),
         ),
         Cell(
-            why="nemotron4 tp4 decode B=128: one CTA per KV range",
+            why="nemotron4 tp4 decode B=128: one CTA per KV range, which no other decode cell reaches",
             spec=dict(contexts=(), generations=128, gen_tokens=1, **_NEMOTRON4_TP4),
         ),
         Cell(
