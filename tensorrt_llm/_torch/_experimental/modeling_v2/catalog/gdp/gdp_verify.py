@@ -13,8 +13,8 @@ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from .._op import Arch, Cell, OpWrapper
 
 # The decode entry's tile, warp count and grid cap. Each token's update has to
-# round exactly as one `gdp_recurrent` call does, and the order of its two
-# reductions over K follows from the tile and the warps.
+# round exactly as one `gdp_recurrent` call does, and the order of its
+# reductions over K follows from the tile's K extent and the warps.
 from .gdp_recurrent import _BLOCK_V, _MAX_GRID_ROWS, _NUM_WARPS
 
 
@@ -75,7 +75,10 @@ def _gdp_verify_kernel(
     The state tile is loaded once from the request's slot and carried through
     the T tokens in fp32 registers. Each token is `_gdp_recurrent_kernel`'s
     body, statement for statement; the state after it goes to
-    `intermediate[request, token]`, and the slot itself is never written.
+    `intermediate[request, token]`, and the slot itself is never written. A
+    padding row's masks are off: it loads zeros and stores nothing. The slot
+    and the snapshots are each touched once, so the load is evict-first and the
+    stores streaming.
     """
     i_v = tl.program_id(0)
     i_row = tl.program_id(1)
@@ -97,10 +100,10 @@ def _gdp_verify_kernel(
             + o_k[:, None] * stride_s_k
             + o_v[None, :] * stride_s_v
         )
-        b_h = tl.zeros([BK, BV], dtype=tl.float32)
-        if slot >= 0:
-            tl.device_assert(slot < num_slots, "slot out of range")
-            b_h = tl.load(p_state, mask=mask_kv, other=0.0).to(tl.float32)
+        tl.device_assert(slot < num_slots, "slot out of range")
+        b_h = tl.load(
+            p_state, mask=mask_kv & (slot >= 0), other=0.0, eviction_policy="evict_first"
+        ).to(tl.float32)
 
         for t in tl.static_range(T):
             b_g = tl.load(g + i_n * stride_g_n + t * stride_g_t + i_h * stride_g_h).to(tl.float32)
@@ -145,16 +148,20 @@ def _gdp_verify_kernel(
                 b_o.to(out.dtype.element_ty),
                 mask=mask_v,
             )
-            if slot >= 0:
-                p_snapshot = (
-                    intermediate
-                    + i_n * stride_i_n
-                    + t * stride_i_t
-                    + i_h * stride_i_h
-                    + o_k[:, None] * stride_i_k
-                    + o_v[None, :] * stride_i_v
-                )
-                tl.store(p_snapshot, b_h.to(intermediate.dtype.element_ty), mask=mask_kv)
+            p_snapshot = (
+                intermediate
+                + i_n * stride_i_n
+                + t * stride_i_t
+                + i_h * stride_i_h
+                + o_k[:, None] * stride_i_k
+                + o_v[None, :] * stride_i_v
+            )
+            tl.store(
+                p_snapshot,
+                b_h.to(intermediate.dtype.element_ty),
+                mask=mask_kv & (slot >= 0),
+                cache_modifier=".cs",
+            )
         i_row += tl.num_programs(1)
 
 
@@ -334,10 +341,12 @@ class GdpVerify(OpWrapper):
     states, for every real request: each token is that kernel's body with its
     tile and warp count, and the state between tokens stays in fp32 registers,
     the value the pool round trip would have stored and reloaded. A change to
-    either kernel's arithmetic or tiling breaks that, and so can a change in
-    how Triton compiles the same statements: the token loop rolled
-    (`tl.range`) instead of unrolled moved the snapshots' bits at a single
-    request. The entry's test compares the two bit for bit. A padding row
+    either kernel's arithmetic, or to how its tile spreads K over lanes and
+    warps, breaks that, and so can a change in how Triton compiles the same
+    statements: the token loop rolled (`tl.range`) instead of unrolled moved
+    the snapshots' bits at a single request. The tile's width does not: it only
+    sets how many columns one program reduces side by side. The entry's test
+    compares the two bit for bit. A padding row
     differs from its second token on, since a decode call restarts it from
     zero and keeps nothing.
 
