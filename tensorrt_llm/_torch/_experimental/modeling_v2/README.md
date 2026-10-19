@@ -196,7 +196,7 @@ Perf is measured, never gated.
 
 **Every entry is certified on sm_103, and both targets are gated there.**
 
-The 19 entries -- 9 shared, 7 owned by deepseek, 3 by gpt-oss -- each drive
+The 32 entries -- 22 shared, 7 owned by deepseek, 3 by gpt-oss -- each drive
 their cells through `__call__` and `reference` in pre-merge CI, plus the two
 4-rank collective matrices. Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,
