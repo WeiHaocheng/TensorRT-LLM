@@ -5520,24 +5520,33 @@ def _element_ulp(out: torch.Tensor, ref: torch.Tensor) -> float:
     return ((o - r).abs() / scale).max().item() / ULP[torch.bfloat16]
 
 
-@pytest.mark.parametrize("geometry", [N4, N4_TP4], ids=["16q", "tp4-4q"])
+#: A history that ends the step at max_seq_len: the longest one a verify row reaches.
+_LONGEST = -1
+
+
+@pytest.mark.parametrize(
+    "geometry, step", [(N4, 3), (N4_TP4, 3), (N4, 4)], ids=["16q", "tp4-4q", "16q-T4"]
+)
 @pytest.mark.parametrize(
     "batch, histories",
     [
         (1, (1,)),
-        (1, (N4["max_seq_len"] - 3,)),
-        (6, (1, 30, 1000, N4["max_seq_len"] - 3)),
+        (1, (_LONGEST,)),
+        (6, (1, 30, 1000, _LONGEST)),
         (64, (1, 5, 13)),
-        (64, (N4["max_seq_len"] - 3,)),
-        (512, (1, 30, 1000, N4["max_seq_len"] - 3)),
+        (64, (_LONGEST,)),
+        (512, (1, 30, 1000, _LONGEST)),
     ],
     ids=["b1-short", "b1-longest", "b6-mixed", "b64-short", "b64-longest", "b512-mixed"],
 )
-def test_nemotron4_verify_rows_are_causal_within_their_group(batch, histories, geometry) -> None:
-    """Read a 3-token verify step's attention weights out of its output.
+def test_nemotron4_verify_rows_are_causal_within_their_group(
+    batch, histories, geometry, step
+) -> None:
+    """Read a verify step's attention weights out of its output: 3 tokens a
+    request (two drafts), and 4 at tp1's 16 query heads (its three drafts).
 
-    The cached histories carry V = 0 and the step's three tokens carry one-hot
-    V rows (dims 0, 1, 2), so output row t of a request, in every head, is the
+    The cached histories carry V = 0 and the step's tokens carry one-hot V rows
+    (dims 0 .. step - 1), so output row t of a request, in every head, is the
     weight that row put on each token of its own group. Causal within the
     group: row t reads exactly zero at dims t+1.. and a positive weight at
     0..t. The kernel the op picks changes with batch and history -- SwapsAb at
@@ -5549,10 +5558,10 @@ def test_nemotron4_verify_rows_are_causal_within_their_group(batch, histories, g
     element ulp from the output, two gate-widths, where short histories put it
     hundreds away.
     """
-    step = 3
     hq, hkv, dim = geometry["num_heads"], geometry["num_kv_heads"], geometry["head_size"]
     gen = torch.Generator().manual_seed(batch)
     torch.manual_seed(batch)
+    histories = [geometry["max_seq_len"] - step if h == _LONGEST else h for h in histories]
     rows = [(histories[i % len(histories)], step, 1) for i in range(batch)]
     env = _pool(rows, geometry)
     _seed_histories(env, rows, gen, zero_v=True)

@@ -102,7 +102,8 @@ def _causal_conv1d_verify_kernel(
 # `causal_conv1d_update` certifies ("v1" packed per slot after the recurrent state, "v2" one page
 # per GDP layer). The window buffer is one layer's view of the manager's
 # `intermediate_conv_states` [GDP layers, max_batch_size, 1 + max_draft_len, 16896, 3]: with
-# max_draft_len 2 every row has three positions, of which a T = 2 step fills two.
+# max_draft_len 2 every row has three positions, of which a T = 2 step fills two; with the
+# max_draft_len 3 tp1 also runs, four (`_GDP_DRAFT3`).
 _GDP = dict(
     dim=16896,
     width=4,
@@ -116,6 +117,8 @@ _GDP = dict(
 # output [z 384 | conv 4224 | beta 18 | decay 6] = 4632 wide; a v1 slot holds the rank's
 # [6, 64, 128] fp32 recurrent state before the conv state.
 _GDP_TP4 = dict(_GDP, dim=4224, proj_width=4632, proj_offset=384, pool_ssm_bytes=6 * 64 * 128 * 4)
+# tp1's conv under max_draft_len 3: four positions a row in the window buffer.
+_GDP_DRAFT3 = dict(_GDP, window_positions=4)
 
 
 def _cell(
@@ -159,10 +162,11 @@ class CausalConv1dVerify(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # The verify shapes of the targets' CUDA-graph batches: T = 1 + max_draft_len tokens per row
-    # (3 for the checkpoint's trained depth, 2 for one draft token), at every decode batch size
-    # the targets capture -- tp1 up to its max_batch_size, 1024 for a DP rank's batch -- each with
-    # its padding rows at the end, plus 3, a size no graph is captured at, which runs eagerly
-    # without padding. Each batch size meets both pool forms, one per T.
+    # (3 for the checkpoint's trained depth, 2 for one draft token, 4 for the three drafts tp1
+    # also runs), at every decode batch size the targets capture -- tp1 up to its max_batch_size,
+    # 1024 for a DP rank's batch -- each with its padding rows at the end, plus 3, a size no graph
+    # is captured at, which runs eagerly without padding. Each batch size meets both pool forms,
+    # one per T.
     CELLS: tuple[Cell, ...] = (
         _cell("T=3, graph batch 1: one request, no padding row", 3, 1, 0, "v1"),
         _cell("T=3, graph batch 2: one request and a padding row", 3, 2, 1, "v2"),
@@ -188,6 +192,71 @@ class CausalConv1dVerify(OpWrapper):
         _cell("T=2, graph batch 256 holding 129 requests: 127 padding rows", 2, 256, 127, "v1"),
         _cell("T=2, graph batch 512: around tp1's max_batch_size", 2, 512, 1, "v2"),
         _cell("T=2, graph batch 1024: a DP rank's largest batch", 2, 1024, 1, "v2"),
+        _cell(
+            "T=4, graph batch 1: one request, no padding row", 4, 1, 0, "v2", geometry=_GDP_DRAFT3
+        ),
+        _cell(
+            "T=4, graph batch 2: one request and a padding row", 4, 2, 1, "v1", geometry=_GDP_DRAFT3
+        ),
+        _cell("T=4, eager batch 3: no graph is captured at 3", 4, 3, 0, "v1", geometry=_GDP_DRAFT3),
+        _cell(
+            "T=4, graph batch 4: three requests and a padding row",
+            4,
+            4,
+            1,
+            "v2",
+            geometry=_GDP_DRAFT3,
+        ),
+        _cell(
+            "T=4, graph batch 8 holding 5 requests: 3 padding rows",
+            4,
+            8,
+            3,
+            "v1",
+            geometry=_GDP_DRAFT3,
+        ),
+        _cell(
+            "T=4, graph batch 16: 15 requests and a padding row",
+            4,
+            16,
+            1,
+            "v2",
+            geometry=_GDP_DRAFT3,
+        ),
+        _cell(
+            "T=4, graph batch 32: 31 requests and a padding row",
+            4,
+            32,
+            1,
+            "v1",
+            geometry=_GDP_DRAFT3,
+        ),
+        _cell(
+            "T=4, graph batch 64, also captured and replayed",
+            4,
+            64,
+            1,
+            "v1",
+            graph=True,
+            geometry=_GDP_DRAFT3,
+        ),
+        _cell(
+            "T=4, graph batch 128: 127 requests and a padding row",
+            4,
+            128,
+            1,
+            "v2",
+            geometry=_GDP_DRAFT3,
+        ),
+        _cell(
+            "T=4, graph batch 256 holding 129 requests: 127 padding rows",
+            4,
+            256,
+            127,
+            "v1",
+            geometry=_GDP_DRAFT3,
+        ),
+        _cell("T=4, graph batch 448: tp1's max_batch_size", 4, 448, 1, "v2", geometry=_GDP_DRAFT3),
         _cell("tp4 rank, T=3, graph batch 1: one request", 3, 1, 0, "v2", geometry=_GDP_TP4),
         _cell("tp4 rank, T=3, graph batch 2 with a padding row", 3, 2, 1, "v1", geometry=_GDP_TP4),
         _cell("tp4 rank, T=3, eager batch 3", 3, 3, 0, "v1", geometry=_GDP_TP4),
@@ -254,13 +323,13 @@ class CausalConv1dVerify(OpWrapper):
     this rounds the conv output once; the checkpoint's `Nemotron4GDPMixer` rounds it to bf16
     before SiLU too (see that entry's note).
 
-    Certified: T = 2 and 3; x as the in_proj output's conv columns, `[batch, 16896, T]` with
-    channel stride 1 and token stride 18528 (tp1), or `[batch, 4224, T]` with token stride 4632
-    (a tp4 rank's 6 heads); both pool forms; the window buffer as one layer's
-    view of the manager's dense `intermediate_conv_states`; padding rows at the end; one call
-    captured in a CUDA graph and replayed on new inputs, slots and states. Not certified: T > 3
-    (draft lengths beyond the checkpoint's 2), T = 1 (a decode step, which `causal_conv1d_update`
-    covers), other widths, a bias, SiLU off, fp16 and fp32.
+    Certified: T = 2 and 3, and T = 4 (tp1's three drafts) at tp1's width; x as the in_proj
+    output's conv columns, `[batch, 16896, T]` with channel stride 1 and token stride 18528
+    (tp1), or `[batch, 4224, T]` with token stride 4632 (a tp4 rank's 6 heads); both pool forms;
+    the window buffer as one layer's view of the manager's dense `intermediate_conv_states`;
+    padding rows at the end; one call captured in a CUDA graph and replayed on new inputs, slots
+    and states. Not certified: T > 4, T = 4 at a tp4 rank's width, T = 1 (a decode step, which
+    `causal_conv1d_update` covers), other widths, a bias, SiLU off, fp16 and fp32.
 
     Time: one launch, 6 * (1 + T) + 4 * T bytes of traffic per channel and row. GPU time per
     call under CUDA-graph replay, buffers rotated past L2, measured at T = 3 (T = 2): 3.3 (3.1)
