@@ -79,7 +79,9 @@ class ThopAttention(OpWrapper):
     # context and generation against the same pool; nemotron4 is single-KV-head
     # GQA, decoded at batches of 1 to 1024 and verified at 1 to 512, where the
     # kernel the op picks changes with batch size and history length -- and
-    # with the query heads per KV head, so tp4's 4 have cells of their own.
+    # with the query heads per KV head, so tp4's 4 have cells of their own. Its
+    # steps reach 16384 tokens per rank: a fresh 8192-token prompt beside the
+    # largest decode or verify batch, or two fresh prompts in one step.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="gpt-oss sliding layer: GQA 64q/8kv d64, sinks, window 128",
@@ -178,6 +180,18 @@ class ThopAttention(OpWrapper):
             ),
         ),
         Cell(
+            why="nemotron4 prefill beside decodes: a fresh 8192-token prompt and B=1024",
+            spec=dict(contexts=((0, 8192),), generations=1024, gen_tokens=1, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 prefill beside verifies: a fresh 8192-token prompt and 512 x 3",
+            spec=dict(contexts=((0, 8192),), generations=512, gen_tokens=3, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 16384-token step: two fresh 8192-token prompts",
+            spec=dict(contexts=((0, 8192), (0, 8192)), generations=0, gen_tokens=1, **_NEMOTRON4),
+        ),
+        Cell(
             why="nemotron4 tp4 prefill: one fresh 8192-token prompt, 4 q heads",
             spec=dict(contexts=((0, 8192),), generations=0, gen_tokens=1, **_NEMOTRON4_TP4),
         ),
@@ -219,6 +233,20 @@ class ThopAttention(OpWrapper):
             why="nemotron4 tp4 mixed verify: two contexts beside 6 three-token rows",
             spec=dict(
                 contexts=((0, 1000), (4096, 2048)), generations=6, gen_tokens=3, **_NEMOTRON4_TP4
+            ),
+        ),
+        Cell(
+            why="nemotron4 tp4 prefill beside decodes: a fresh 8192-token prompt and B=1024",
+            spec=dict(contexts=((0, 8192),), generations=1024, gen_tokens=1, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 prefill beside verifies: a fresh 8192-token prompt and 512 x 3",
+            spec=dict(contexts=((0, 8192),), generations=512, gen_tokens=3, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 16384-token step: two fresh 8192-token prompts",
+            spec=dict(
+                contexts=((0, 8192), (0, 8192)), generations=0, gen_tokens=1, **_NEMOTRON4_TP4
             ),
         ),
     )
