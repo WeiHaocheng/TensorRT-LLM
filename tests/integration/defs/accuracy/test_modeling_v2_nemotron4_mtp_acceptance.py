@@ -43,6 +43,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 
 import pytest
@@ -51,7 +52,7 @@ import torch
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi import CudaGraphConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, MTPDecodingConfig, SchedulingParams
 
 from ..conftest import llm_models_root, unittest_path
 from .accuracy_core import LlmapiAccuracyTestHarness, acceptance_length_from_iteration_stats
@@ -160,10 +161,12 @@ def _al(accepted: list[int]) -> float:
     return (sum(accepted) + len(accepted)) / len(accepted)
 
 
-class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTestHarness):
-    """nemotron4-nano-preview (text model) / sm_103 / tp1, MTP-Eagle draft 2.
+class _MtpAcceptance(LlmapiAccuracyTestHarness):
+    """The legs and checks every nemotron4 target's MTP acceptance gate shares.
 
-    The acceptance length against the checkpoint's own MTP layer.
+    A target's class states its topology and the serve settings it needs, where
+    each prompt runs, how far its MTP logits can be from the reference's, and
+    how it reads its acceptance length off the engine.
     """
 
     MODEL_PATH = f"{llm_models_root()}/nemotron4-nano-preview"
@@ -186,23 +189,23 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
     SHORT_MAX_TOKENS = 256
     LONG_MAX_TOKENS = 1024
 
-    # How far the target's MTP logits can be from the reference's, per draft
-    # depth: the MTP module gate's measured worst |logit difference| against the
-    # reference's own drafting chain on the same trunk hidden states
-    # (test_modeling_v2_mtp_layer.py, 49,877 depth-1 and 4,098 depth-2 rows; the
-    # largest gain of any token on the reference's top-1 there is 2.619 / 2.430),
-    # plus the band on the target trunk's logits against the reference's
-    # (check_goldens.py: free-running logits over the whole vocabulary, 2.0, the
-    # larger of its two logit bands; the decode-step one is 1.25), because here
-    # the target's MTP layer reads the target trunk's hidden states and the
-    # reference's reads its own, at prefill rows and decode rows alike.
-    MTP_LOGIT_ERROR = (2.6806, 2.4847)
-    TRUNK_LOGIT_BAND = 2.0
-
     # A collapsed draft path accepts nothing (1.0). The reference's own drafts
     # give about 2.8 over the target's outputs of the fixed prompts, 2.27-2.97
     # per prompt.
     MIN_ACCEPTANCE_LENGTH = 2.0
+
+    # The target's topology and the serve settings it needs, as LLM arguments.
+    ENGINE_ARGS: dict = {}
+
+    # How far the target's MTP logits can move a margin of the reference's
+    # drafts, per draft depth, and how far the target trunk's logits can be
+    # from the reference's: each target states its own, and where they were
+    # measured.
+    MTP_LOGIT_ERROR: tuple[float, float]
+    TRUNK_LOGIT_BAND: float
+
+    # How long the GPU may take to come back once the engine has exited.
+    RELEASE_SECONDS = 60
 
     def _epsilon(self) -> tuple[float, ...]:
         return tuple(error + self.TRUNK_LOGIT_BAND for error in self.MTP_LOGIT_ERROR)
@@ -210,11 +213,44 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
     def _max_tokens(self, prompt) -> int:
         return self.LONG_MAX_TOKENS if prompt.long else self.SHORT_MAX_TOKENS
 
-    def _engine_leg(self, prompts) -> tuple[dict[str, _EngineRun], list[dict]]:
+    def _ranks(self, prompts) -> dict[str, int]:
+        """The attention-DP rank each prompt is pinned to; none without attention DP."""
+        return {}
+
+    def _engine_al(
+        self, stats: list[dict], walks: dict[str, list[tuple[int, int]]], ranks: dict[str, int]
+    ) -> tuple[float, int, dict]:
+        """AL_trt, the verify steps it counts beyond the requests' own, and what to report of it.
+
+        AL_trt comes from the iteration statistics, as every acceptance gate of
+        the suite reads it. They count steps the requests do not: when a
+        request's last step starts with two or more tokens left, the overlap
+        scheduler has already scheduled it for one more iteration, and that
+        iteration's statistics count the request again with its last accepted
+        count (at most one per request). The request's own counters do not, so
+        the extra steps are the iteration statistics' step count less the
+        requests'.
+        """
+        spec_stats = [s["specDecodingStats"] for s in stats if s.get("specDecodingStats")]
+        stats_steps = sum(s["numRequestsWithDraftTokens"] for s in spec_stats)
+        request_steps = sum(len(walk) for walk in walks.values())
+        return (
+            acceptance_length_from_iteration_stats(stats),
+            abs(stats_steps - request_steps),
+            dict(
+                iteration_stats_steps=stats_steps,
+                iteration_stats_accepted=sum(s["numAcceptedTokens"] for s in spec_stats),
+            ),
+        )
+
+    def _engine_leg(
+        self, prompts, ranks: dict[str, int]
+    ) -> tuple[dict[str, _EngineRun], list[dict]]:
         """All prompts in one batch through the target, streamed; and the run's iteration stats.
 
         The executor answers a streaming request once per iteration, so the
-        sizes of the responses are the request's verify steps.
+        sizes of the responses are the request's verify steps. A prompt with a
+        rank runs there and nowhere else.
         """
         # The target checks its step contract on the first forward and only when
         # asked; it travels as ``env_overrides`` because the check runs on the
@@ -236,6 +272,7 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
             speculative_config=MTPDecodingConfig(max_draft_len=self.MTP_DRAFT_LEN),
             enable_iter_perf_stats=True,
             max_stats_len=-1,
+            **self.ENGINE_ARGS,
         ) as llm:
             futures = [
                 llm.generate_async(
@@ -244,6 +281,11 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
                         max_tokens=self._max_tokens(p), temperature=0.0, ignore_eos=True
                     ),
                     streaming=True,
+                    scheduling_params=SchedulingParams(
+                        attention_dp_rank=ranks[p.name], attention_dp_relax=False
+                    )
+                    if p.name in ranks
+                    else None,
                 )
                 for p in prompts
             ]
@@ -271,7 +313,12 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
 
         Both MTP-Eagle (the semantics the engine runs) and HF's per-depth MTP.
         """
+        # The engine's processes give their memory back as they exit.
+        deadline = time.monotonic() + self.RELEASE_SECONDS
         free, _ = torch.cuda.mem_get_info()
+        while free < 200 * 2**30 and time.monotonic() < deadline:
+            time.sleep(2.0)
+            free, _ = torch.cuda.mem_get_info()
         assert free >= 200 * 2**30, (
             f"the reference needs ~190 GiB of the GPU after the engine exits; "
             f"{free / 2**30:.1f} GiB is free"
@@ -305,16 +352,15 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
         torch.cuda.empty_cache()
         return out
 
-    @skip_not_sm103
-    def test_mtp2_acceptance_matches_reference(self, monkeypatch):
+    def _check_acceptance(self, monkeypatch) -> None:
         """The acceptance length the target measures matches the reference's.
 
         Leg 1 runs the fixed prompt set (6 short prompts x 256 tokens, 4 of ~8K
-        tokens x 1024) through the target with MTP-Eagle draft 2, the overlap
-        scheduler and CUDA graphs on: AL_trt from the iteration statistics, as
-        every acceptance gate of the suite reads it. Leg 2 runs the reference
-        teacher-forced over each prompt and the target's own output: AL_ref, its
-        greedy walk pooled with the same estimator.
+        tokens x 1024) through the target in one batch with MTP-Eagle draft 2,
+        the overlap scheduler and CUDA graphs on: AL_trt, read as the target's
+        class reads it (``_engine_al``). Leg 2 runs the reference teacher-forced
+        over each prompt and the target's own output: AL_ref, its greedy walk
+        pooled with the same estimator.
 
         **Tolerance.** At a verify step the two sides' accepted counts differ
         only if the deciding draft's outcome flips, which needs some token to
@@ -332,12 +378,7 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
 
         - the engine's last step of an output whose window passes the last
           token, which the reference cannot score (at most one per request);
-        - the iteration statistics' extra steps. When a request's last step
-          starts with two or more tokens left, the overlap scheduler has already
-          scheduled it for one more iteration, and that iteration's statistics
-          count the request again with its last accepted count (at most one per
-          request). The request's own counters do not, so the extra steps are
-          the iteration statistics' step count less the requests'.
+        - the steps AL_trt counts beyond the requests' own (``_engine_al``).
 
         **At the engine's own positions.** The streamed responses give the
         engine's walk step by step, so the reference scores each of the
@@ -354,26 +395,37 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
         prompts_module = _unittest_module("_nemotron4_prompts")
         reference = _unittest_module("_nemotron4_reference")
         prompts = prompts_module.prompt_set(prompts_module.load_tokenizer(self.MODEL_PATH))
+        ranks = self._ranks(prompts)
 
-        runs, stats = self._engine_leg(prompts)
-        al_trt = acceptance_length_from_iteration_stats(stats)
-        spec_stats = [s["specDecodingStats"] for s in stats if s.get("specDecodingStats")]
-        stats_steps = sum(s["numRequestsWithDraftTokens"] for s in spec_stats)
-        stats_accepted = sum(s["numAcceptedTokens"] for s in spec_stats)
+        runs, stats = self._engine_leg(prompts, ranks)
+        walks = {
+            p.name: _engine_walk(p.name, len(p.token_ids), runs[p.name], self.MTP_DRAFT_LEN)
+            for p in prompts
+        }
+        al_trt, extra_steps, engine_report = self._engine_al(stats, walks, ranks)
+        # Iterations of a rank that ran context rows beside generation rows.
+        batches = [
+            (s.get("attentionDpRank", 0), s.get("inflightBatchingStats") or {}) for s in stats
+        ]
+        mixed_steps = Counter(
+            rank
+            for rank, batch in batches
+            if batch.get("numContextRequests", 0) > 0 and batch.get("numGenRequests", 0) > 0
+        )
         gc.collect()
         torch.cuda.empty_cache()
 
         refs = self._reference_leg(reference, prompts, runs)
 
         epsilon = self._epsilon()
-        rows, offenders = [], []
+        rows, flips_all, offenders = [], [], []
         pooled = dict(ref_accepted=[], ref_hf_accepted=[], trt_accepted=[], k1=0, k2=0)
-        flips_total = boundary_total = 0
+        boundary_total = 0
         for p in prompts:
             run, ref = runs[p.name], refs[p.name]
             eagle, hf = ref["eagle"], ref["hf"]
             seq = list(p.token_ids) + run.output
-            walk = _engine_walk(p.name, len(p.token_ids), run, self.MTP_DRAFT_LEN)
+            walk = walks[p.name]
 
             # The reference's own walk and its near-ties (the tolerance).
             k1 = k2 = 0
@@ -415,6 +467,7 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
             al_trt_request = _al([a for _, a in walk])
             row = dict(
                 prompt=p.name,
+                **({"rank": ranks[p.name]} if p.name in ranks else {}),
                 prompt_tokens=len(p.token_ids),
                 output_tokens=len(run.output),
                 trt_steps=len(walk),
@@ -440,7 +493,7 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
             pooled["trt_accepted"] += [a for _, a in walk]
             pooled["k1"] += k1
             pooled["k2"] += k2
-            flips_total += len(flips)
+            flips_all += flips
             boundary_total += boundary
 
         n = len(pooled["ref_accepted"])
@@ -448,13 +501,12 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
         al_ref_hf = _al(pooled["ref_hf_accepted"])
         al_trt_requests = _al(pooled["trt_accepted"])
         request_steps = len(pooled["trt_accepted"])
-        unpaired = boundary_total + abs(stats_steps - request_steps)
+        unpaired = boundary_total + extra_steps
         tol = (2 * pooled["k1"] + pooled["k2"] + 2 * unpaired) / n
         summary = dict(
             al_trt=round(al_trt, 4),
             al_trt_from_requests=round(al_trt_requests, 4),
-            iteration_stats_steps=stats_steps,
-            iteration_stats_accepted=stats_accepted,
+            **engine_report,
             request_steps=request_steps,
             request_accepted=sum(pooled["trt_accepted"]),
             al_ref=round(al_ref, 4),
@@ -466,10 +518,15 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
             epsilon=[round(e, 4) for e in epsilon],
             tol=round(tol, 4),
             delta=round(al_trt - al_ref, 4),
-            flips=flips_total,
+            flips=len(flips_all),
+            max_flip_margin=[
+                max((f["margin"] for f in flips_all if f["depth"] == depth), default=None)
+                for depth in range(1, self.MTP_DRAFT_LEN + 1)
+            ],
             boundary_steps=boundary_total,
             unpaired_steps=unpaired,
             off_near_tie=len(offenders),
+            mixed_steps_by_rank=dict(sorted(mixed_steps.items())),
         )
         print(f"[modeling_v2] mtp acceptance pooled {json.dumps(summary)}")
         report_path = os.environ.get(REPORT_ENV)
@@ -492,3 +549,132 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(LlmapiAccuracyTest
             f"AL_trt {al_trt:.4f} vs AL_ref {al_ref:.4f}: |delta| {abs(al_trt - al_ref):.4f} > "
             f"tol {tol:.4f} = (2 * {pooled['k1']} + {pooled['k2']} + 2 * {unpaired}) / {n}"
         )
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
+    """nemotron4-nano-preview (text model) / sm_103 / tp1, MTP-Eagle draft 2.
+
+    The acceptance length against the checkpoint's own MTP layer.
+    """
+
+    # How far the target's MTP logits can be from the reference's, per draft
+    # depth: the MTP module gate's measured worst |logit difference| against the
+    # reference's own drafting chain on the same trunk hidden states
+    # (test_modeling_v2_mtp_layer.py, 49,877 depth-1 and 4,098 depth-2 rows; the
+    # largest gain of any token on the reference's top-1 there is 2.619 / 2.430),
+    # plus the band on the target trunk's logits against the reference's
+    # (check_goldens.py: free-running logits over the whole vocabulary, 2.0, the
+    # larger of its two logit bands; the decode-step one is 1.25), because here
+    # the target's MTP layer reads the target trunk's hidden states and the
+    # reference's reads its own, at prefill rows and decode rows alike.
+    MTP_LOGIT_ERROR = (2.6806, 2.4847)
+    TRUNK_LOGIT_BAND = 2.0
+
+    @skip_not_sm103
+    def test_mtp2_acceptance_matches_reference(self, monkeypatch):
+        """The acceptance length the target measures matches the reference's (``_check_acceptance``).
+
+        The ~8K prompts' prefills run beside the short prompts' verify steps,
+        and AL_trt comes from the iteration statistics.
+        """
+        self._check_acceptance(monkeypatch)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_MtpAcceptance):
+    """nemotron4-nano-preview (text model) / sm_103 / dep4, MTP-Eagle draft 2.
+
+    The acceptance length against the checkpoint's own MTP layer, on 4 ranks
+    with attention DP. Each rank drafts and verifies its own requests, and the
+    ranks meet in every routed MoE block, the MTP layer's included; a rank with
+    no request left runs the attention-DP dummy. Every prompt is pinned to a
+    rank, and MAX_BATCH_SIZE and the CUDA graphs are per rank.
+    """
+
+    # Attention DP over the 4 GPUs of one node with the routed experts split
+    # four ways: the topology the dep4 target implements. Every rank-step
+    # carries at most 2048 tokens, inside the routed MoE's certified all-gather
+    # and reduce-scatter cells, so the ~8K prompts prefill in 2048-token chunks.
+    ENGINE_ARGS = dict(
+        tensor_parallel_size=4,
+        moe_expert_parallel_size=4,
+        enable_attention_dp=True,
+        max_num_tokens=2048,
+        enable_chunked_prefill=True,
+    )
+    RANKS = 4
+
+    # How far the target's MTP logits can move a margin of the reference's
+    # drafts, per draft depth: the larger of the MTP module gate's worst |logit
+    # difference| against the reference's own drafting chain on the same trunk
+    # hidden states and its largest gain of any token on that chain's top-1,
+    # over the 4 ranks, each running the prompt set in its own rotation
+    # (test_modeling_v2_dep4_mtp_layer.py; depth 1: 2.6806 and 2.619, depth 2:
+    # 2.8998 and 4.5655, the gain rank 3's), plus the band on the target trunk's
+    # logits against the reference's: dep4's trunk passes check_goldens_dep4.py
+    # with tp1's bands, whose free-running logits band is 2.0.
+    MTP_LOGIT_ERROR = (2.6806, 4.5655)
+    TRUNK_LOGIT_BAND = 2.0
+
+    def _ranks(self, prompts) -> dict[str, int]:
+        """One long prompt per rank, the short ones dealt round-robin.
+
+        Submitted in the prompt set's order, the short prompts first, so a
+        rank's long prompt prefills in chunks while the rank's short requests
+        verify.
+        """
+        longs = [p.name for p in prompts if p.long]
+        shorts = [p.name for p in prompts if not p.long]
+        assert len(longs) == self.RANKS, f"{len(longs)} long prompts for {self.RANKS} ranks"
+        ranks = {name: rank for rank, name in enumerate(longs)}
+        ranks.update({name: i % self.RANKS for i, name in enumerate(shorts)})
+        return ranks
+
+    def _engine_al(
+        self, stats: list[dict], walks: dict[str, list[tuple[int, int]]], ranks: dict[str, int]
+    ) -> tuple[float, int, dict]:
+        """AL_trt from the requests' own walks, which are exact on every rank.
+
+        Under attention DP the iteration statistics hold one row per rank and
+        iteration, and every row carries rank 0's speculative-decoding counts
+        (``ADPIterStatsBuffer._make_rank_iter_stats``): they count rank 0's
+        requests once per rank and the other ranks' requests never. They are
+        reported, not used: the suite's estimator over them, how many
+        iterations' rows agree, and rank 0's rows against rank 0's requests.
+        """
+        rows = [s for s in stats if (s.get("specDecodingStats") or {}).get("numDraftTokens", 0) > 0]
+        by_iteration = defaultdict(list)
+        for s in rows:
+            by_iteration[s["iter"]].append(s["specDecodingStats"])
+        rank0_rows = [s["specDecodingStats"] for s in rows if s["attentionDpRank"] == 0]
+        rank0_walks = [walks[name] for name, rank in ranks.items() if rank == 0]
+        return (
+            _al([a for walk in walks.values() for _, a in walk]),
+            0,
+            dict(
+                iteration_stats_al=round(acceptance_length_from_iteration_stats(stats), 4),
+                iteration_stats_rows_by_rank=dict(
+                    sorted(Counter(s["attentionDpRank"] for s in rows).items())
+                ),
+                iterations_with_drafts=len(by_iteration),
+                iterations_whose_rows_agree=sum(
+                    all(row == group[0] for row in group) for group in by_iteration.values()
+                ),
+                iteration_stats_rank0_steps=sum(
+                    s["numRequestsWithDraftTokens"] for s in rank0_rows
+                ),
+                iteration_stats_rank0_accepted=sum(s["numAcceptedTokens"] for s in rank0_rows),
+                rank0_request_steps=sum(len(walk) for walk in rank0_walks),
+                rank0_request_accepted=sum(a for walk in rank0_walks for _, a in walk),
+            ),
+        )
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_mtp2_acceptance_matches_reference(self, monkeypatch):
+        """The acceptance length the target measures matches the reference's (``_check_acceptance``).
+
+        Each rank verifies its requests beside its long prompt's prefill chunks
+        and beside ranks that verify, prefill or idle, and AL_trt comes from the
+        requests' own walks.
+        """
+        self._check_acceptance(monkeypatch)
