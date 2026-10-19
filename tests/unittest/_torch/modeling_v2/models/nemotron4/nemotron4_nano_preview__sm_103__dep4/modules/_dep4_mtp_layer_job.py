@@ -31,10 +31,10 @@ drafts are accepted -- runs the attention-DP dummy's draft step (a generation ro
 over its own history), as an idle serving rank does, until every rank is done.
 
 Beside the gates, the EP term: on every MTP-layer call, the layer's MoE output against the same
-composition with the routed experts in one full-window call (`latent_moe_experts` over all 512
-experts, rounding once, HF's order of the ten partial sums) -- what dep4's four fp32 window
-partials, added in the reduce-scatter's order and then rounded, change. Rank 0 writes every rank's
-records to `--out` as JSON.
+composition with the routed experts in one full-window call (`latent_moe_experts_fused_act` --
+`latent_moe_experts`' bits -- over all 512 experts, rounding once, HF's order of the ten partial
+sums) -- what dep4's four fp32 window partials, added in the combine's (or the reduce-scatter's)
+order and then rounded, change. Rank 0 writes every rank's records to `--out` as JSON.
 
 Not a pytest module: everything that imports `tensorrt_llm` is imported inside the rank body (an
 MPI-initialized process cannot start `mpirun`).
@@ -414,7 +414,7 @@ def _rank_body(out_path: str, checkpoint_path: str, trunk_cache: str) -> None:
         """The MTP layer's MoE on this call's own inputs and routing, the routed experts in one
         call over all 512 (tp1's composition); everything else as dep4 runs it."""
         latent = M.cublas_mm(call["routed"], m.moe.fc1_latent)
-        experts = M.latent_moe_experts(
+        experts = M.latent_moe_experts_fused_act(
             latent,
             call["ids"],
             call["weights"],

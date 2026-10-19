@@ -5,14 +5,16 @@ GPUs of one node.
 
 dep4's MTP layer is the checkpoint's `Nemotron4MultiTokenPredictionLayer` on every rank for that
 rank's requests, its KV in the rank's one hybrid cache manager (global layer 44 at that manager's
-index) and its MoE across the ranks: each rank routes its own tokens, every rank's latents are
-gathered, each rank runs its window of 128 of the layer's 512 experts with fp32 partial sums, and
-the partials come back reduce-scattered and rounded once -- with collectives sized by the counts
+index) and its MoE across the ranks: each rank routes its own tokens, the latents reach the
+windows that hold their experts (the one-sided all-to-all on a balanced draft step, the all-gather
+on a ragged one), each rank runs its window of 128 of the layer's 512 experts with fp32 partial
+sums, and the partials come back summed and rounded once -- with collectives sized by the counts
 the engine's worker hands each draft step. It is held to what the tp1 target's MTP layer is held
 to (`_nemotron4_mtp_layer`: the same campaign of cells through the worker's own draft loop, the
 same references -- the plain-torch transcription of `modeling_nemotron4.py` and HF's own numerics
 -- the same bands, the same six planted mistakes), on every rank, plus the EP term: what the four
-windows' fp32 partials, added in the reduce-scatter's order, change against one full-window call.
+windows' fp32 partials, added in the combine's or the reduce-scatter's order, change against one
+full-window call.
 
 The measurement runs once, as a 4-rank MPI job (`_dep4_mtp_layer_job.py`, which says what each rank
 builds and how the ranks keep their collectives in lockstep); this module starts it and gates every
@@ -175,8 +177,8 @@ def test_the_gates_refuse_plausible_wrong_layers(measured, rival):
 @pytest.mark.gpu4
 def test_the_ep_term(measured):
     """The EP term on every MTP-layer call of every cell and rank: the MoE output of dep4's four
-    fp32 window partials, reduce-scattered and rounded once, against the same composition with
-    one full-window call. It is reported per cell and depth, and the share of rows it moves is
+    fp32 window partials, combined (or reduce-scattered) and rounded once, against the same
+    composition with one full-window call. It is reported per cell and depth, and the share of rows it moves is
     held to `EP_ROWS_BAND`."""
     rows = differing = 0
     for r in measured["ranks"]:

@@ -582,10 +582,11 @@ class GdpVerify(OpWrapper):
     may round apart, and Triton specializes each on its strides' divisibility
     by 16, which a request's stride and a decode row's need not share.
 
-    Uncertified: T other than 2 and 3 (and 4 to 6 at tp1's geometry only), an
-    intermediate whose token dim exceeds T, a pool other than the two managers'
-    layouts, and the shapes `gdp_recurrent` leaves uncertified. CUDA-graph
-    capturable: no host sync and no allocation besides `out`.
+    Uncertified: T other than 2 and 3 (and 4 to 6 at tp1's geometry only, which
+    a dep4 rank shares), an intermediate whose token dim exceeds T, a pool other
+    than the two managers' layouts, and the shapes `gdp_recurrent` leaves
+    uncertified. CUDA-graph capturable: no host sync and no allocation besides
+    `out`.
     """
 
     def __call__(

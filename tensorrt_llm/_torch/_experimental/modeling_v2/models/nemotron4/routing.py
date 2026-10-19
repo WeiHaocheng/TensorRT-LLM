@@ -133,9 +133,9 @@ _DRAFT_LEN = 2
 
 #: The draft lengths a target runs beyond `_DRAFT_LEN`. tp1 also runs three to
 #: five: the repeated layer drafts a third, fourth and fifth depth, and a verify
-#: step carries 4, 5 or 6 tokens per request, lengths its own MTP identity and
-#: acceptance gates run.
-_MORE_DRAFT_LENS = {"tp1": (3, 4, 5)}
+#: step carries 4, 5 or 6 tokens per request; dep4 also runs three. Each length
+#: is one its target's own MTP identity and acceptance gates run.
+_MORE_DRAFT_LENS = {"tp1": (3, 4, 5), "dep4": (3,)}
 
 
 def _draft_lens(topology: Optional[str]) -> tuple[int, ...]:
@@ -204,9 +204,10 @@ def _speculation_declined(spec_config: Optional[Any], topology: Optional[str]) -
     lengths = _draft_lens(topology)
     if spec_config.max_draft_len not in lengths:
         verify = _drafts(tuple(1 + n for n in lengths))
+        next_depths = "next one" if len(lengths) == 2 else "next ones"
         why = f"the target runs {_drafts(lengths)} drafts, " + (
-            "the checkpoint's trained depth and the repeated layer's next ones, which are the "
-            "lengths its gates certify and the verify lengths thop_attention's cells cover "
+            f"the checkpoint's trained depth and the repeated layer's {next_depths}, which are "
+            "the lengths its gates certify and the verify lengths thop_attention's cells cover "
             f"({verify} query tokens a request)"
             if len(lengths) > 1
             else "the checkpoint's trained depth, which is the length its gates certify and the "
@@ -307,6 +308,6 @@ def route(
         "divided) and tp4 (4 ranks, no attention DP, the mixers' heads and every MLP's and "
         "routed expert's intermediate width split four ways), each with one-model MTP-Eagle "
         f"on the checkpoint's MTP layer at max_draft_len={_DRAFT_LEN} (tp1 also "
-        f"{_drafts(_MORE_DRAFT_LENS['tp1'])}) without a draft_len_schedule, or without "
-        "speculative decoding"
+        f"{_drafts(_MORE_DRAFT_LENS['tp1'])}, dep4 also {_drafts(_MORE_DRAFT_LENS['dep4'])}) "
+        "without a draft_len_schedule, or without speculative decoding"
     )
