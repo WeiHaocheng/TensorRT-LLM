@@ -70,6 +70,7 @@ from ..conftest import llm_models_root
 from ._nemotron4_cuda_graph_identity import _CudaGraphIdentity, _Request
 from ._nemotron4_mtp_acceptance import _al, _MtpAcceptance
 from ._nemotron4_mtp_identity import _MtpIdentity
+from ._nemotron4_mtp_identity import _Request as _MtpRequest
 from .accuracy_core import (
     GSM8K,
     LlmapiAccuracyTestHarness,
@@ -765,6 +766,59 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4Identity(
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpIdentity(_MtpIdentity):
     """nemotron4-nano-preview (text model) / sm_103 / tp1: MTP-Eagle on against off."""
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
+    """nemotron4-nano-preview (text model) / sm_103 / dep4: MTP-Eagle on against off, on 4 ranks.
+
+    Attention DP over the 4 GPUs of one node: every rank runs its own
+    requests, and the ranks meet in every routed MoE block, the MTP layer's
+    included. Each prompt is pinned to a rank, the same one in both legs: the
+    MoE's reduce-scatter adds a token's four partial sums in an order that ends
+    at the token's own rank, so the rank is part of what a token computes.
+
+    Alone, the prompt's rank runs it and the other three run the attention-DP
+    dummy, a generation row of 1 + D tokens with MTP on and of one token with
+    it off. That changes only how many rows every routed MoE block gathers
+    from the other ranks, and the target gives a token the same bits whatever
+    those rows are: the expert window computes each row by itself, and the
+    reduce-scatter's order does not depend on the ranks' counts.
+    """
+
+    pytestmark = pytest.mark.skip_less_device(4)
+
+    # The parallel topology the dep4 target implements: attention DP over the
+    # 4 GPUs of one node, the routed experts split four ways.
+    PARALLEL = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
+    RANKS = 4
+
+    # Every step at most 2048 tokens a rank, as dep4's CUDA-graph identity gate
+    # runs, inside the routed MoE's certified all-gather and reduce-scatter
+    # cells: the ~8K prompts prefill in 2048-token chunks, the same chunks in
+    # both legs, and the batched report's requests are chunked the same way.
+    ALONE_MAX_NUM_TOKENS = 2048
+    CHUNKED_PREFILL = True
+    BATCH_MAX_NUM_TOKENS = 2048
+
+    def _ranks(self, prompts) -> dict[str, int]:
+        """One long prompt per rank, the short ones dealt round-robin."""
+        longs = [p.name for p in prompts if p.long]
+        shorts = [p.name for p in prompts if not p.long]
+        assert len(longs) == self.RANKS, f"{len(longs)} long prompts for {self.RANKS} ranks"
+        ranks = {name: rank for rank, name in enumerate(longs)}
+        ranks.update({name: i % self.RANKS for i, name in enumerate(shorts)})
+        return ranks
+
+    def _batch_order(self, requests: list[_MtpRequest]) -> list[_MtpRequest]:
+        """The long prompts first, one per rank, then the short ones.
+
+        The idle executor wakes on the first request alone, and the others
+        arrive while its first chunk runs. A rank's long prompt then takes the
+        rank's token budget for its first chunks, and the scheduler, first come
+        first served, holds the rank's short prompts behind it whatever the
+        arrival times.
+        """
+        return sorted(requests, key=lambda r: r.max_tokens != self.LONG_TOKENS)
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):

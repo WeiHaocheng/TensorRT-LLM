@@ -22,18 +22,20 @@ Greedy one-model MTP-Eagle accepts a draft token only where it equals the
 target's own greedy token, so with MTP on the engine emits the target's greedy
 text -- provided each position of a verify step computes the bits the MTP-off
 decode step computes for the same token, and the recurrent and conv state a
-verify leaves behind is the state after its last accepted token. The tp1
-target builds both: its verify runs the decode step's row-invariant GEMMs and
-generation attention over 1 + D tokens per request, and the engine's commit
-promotes the per-position GDP and conv state of the last accepted token, which
-rolls back the rejected drafts. So the gate is literal: MTP on emits the same
-tokens as MTP off.
+verify leaves behind is the state after its last accepted token. The targets
+build both: a verify runs the decode step's row-invariant GEMMs and generation
+attention over 1 + D tokens per request, and the engine's commit promotes the
+per-position GDP and conv state of the last accepted token, which rolls back
+the rejected drafts. So the gate is literal: MTP on emits the same tokens as
+MTP off.
 
 Each prompt of the fixed set runs alone (``max_batch_size`` 1). Its prefill is
-then the same step in both legs, and only the speculative path differs: one
+then the same steps in both legs, and only the speculative path differs: one
 verify of 1 + D tokens against up to D + 1 decode steps. The ~8K-token prompts
 generate 1K tokens each, a few hundred verify steps that reject drafts and roll
-the state back.
+the state back. Under attention DP a prompt is pinned to one rank, the same in
+both legs, and it is alone on the engine: the other ranks run the attention-DP
+dummy beside it.
 
 A batched run of the same prompts is reported, not gated. In a batch, a
 prefill step carries the generation rows of the requests already running, and
@@ -55,21 +57,23 @@ built-in implementation of this architecture, and ``"require"`` makes a
 routing decline raise with its reason instead of finding no model class.
 """
 
+import contextlib
+import datetime
 import json
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi import CudaGraphConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig, SchedulingParams
 
 from ..conftest import llm_models_root
 from ._nemotron4_cuda_graph_identity import _prompt_module
-from .accuracy_core import LlmapiAccuracyTestHarness, acceptance_length_from_iteration_stats
+from .accuracy_core import LlmapiAccuracyTestHarness
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
@@ -82,40 +86,84 @@ skip_not_sm103 = pytest.mark.skipif(
 # classified partings), for comparing runs offline.
 REPORT_DIR_ENV = "NEMOTRON4_MTP_IDENTITY_REPORT_DIR"
 
+# How the executor stamps the time an iteration began (`IterationStats.timestamp`).
+_STATS_TIME_FORMAT = "%m-%d-%Y %H:%M:%S.%f"
+
 
 @dataclass(frozen=True)
 class _Request:
-    """One request: a name, its prompt ids and its output length."""
+    """One request: a name, its prompt ids, its output length and its rank.
+
+    Under attention DP the request is pinned to ``rank``; None lets the engine
+    place it.
+    """
 
     name: str
     token_ids: tuple[int, ...]
     max_tokens: int
+    rank: int | None = None
 
 
 @dataclass
 class _Output:
-    """What a request emitted: its tokens and, with MTP off, the top raw logprobs of each.
+    """What a request emitted, and the request's own counters.
 
-    ``top`` holds, per emitted token, the (token, raw logprob) pairs of the
-    highest logprobs, best first; greedy, the first is the emitted token.
+    ``top`` holds, with MTP off, per emitted token the (token, raw logprob)
+    pairs of the highest logprobs, best first; greedy, the first is the emitted
+    token. ``decoding_iter`` counts the iterations that gave the request tokens:
+    its last context chunk, then each generation step. ``verify_steps`` counts
+    the generation steps that verified drafts and ``accepted`` the drafts they
+    accepted, both 0 with MTP off.
     """
 
     token_ids: list[int]
     top: list[list[tuple[int, float]]] | None
+    decoding_iter: int = 0
+    verify_steps: int = 0
+    accepted: int = 0
+
+
+# One iteration as every rank ran it, in rank order: per rank (context requests,
+# context tokens, generation requests), or None when the rank published no row.
+_Step = tuple[tuple[int, int, int] | None, ...]
 
 
 @dataclass
 class _Call:
-    """One ``generate`` call: what each request emitted, and the call's iterations.
+    """One ``generate`` call: its requests, what each emitted, and the iterations that ran them.
 
-    ``steps`` holds one (context requests, context tokens, generation requests)
-    triple per iteration; ``acceptance_length`` is the engine's estimator over
-    the call's iterations with draft tokens, None without any.
+    ``start`` is when the call began to submit, on the clock the executor
+    stamps its iterations with, and ``stats`` the iteration statistics read
+    once the call had ended, some of them earlier calls'. ``steps`` holds the
+    iterations `_attribute_steps` gives the call.
     """
 
+    requests: list[_Request]
     outputs: dict[str, _Output]
-    steps: list[tuple[int, int, int]]
-    acceptance_length: float | None
+    start: datetime.datetime
+    stats: list[dict]
+    steps: list[_Step] = field(default_factory=list)
+
+    @property
+    def acceptance_length(self) -> float | None:
+        """The engine's estimator over the call's requests, None when no step verified drafts.
+
+        Tokens per verify step, (verify steps + accepted drafts) / verify steps,
+        from the requests' own counters. The iteration statistics would count
+        only rank 0's requests under attention DP: every rank's row of an
+        iteration carries rank 0's speculative-decoding counts.
+        """
+        steps = sum(o.verify_steps for o in self.outputs.values())
+        accepted = sum(o.accepted for o in self.outputs.values())
+        return (steps + accepted) / steps if steps else None
+
+
+@dataclass
+class _Engine:
+    """An LLM and every ``generate`` call made on it, in order."""
+
+    llm: LLM
+    calls: list[_Call] = field(default_factory=list)
 
 
 @dataclass
@@ -201,6 +249,75 @@ def _parting(on: list[int], off: _Output, offset: int = 0) -> _Parting | None:
     )
 
 
+def _attribute_steps(calls: list[_Call]) -> None:
+    """Give every call made on an engine the iterations that ran its requests.
+
+    An iteration's statistics can reach the client during a later call: under
+    attention DP, rank 0 publishes the rows of every rank for an iteration only
+    at a later rank-state all-gather, one iteration per executor loop, so the
+    last iterations of a call wait for the next call's loops. Every row carries
+    the time rank 0 began the iteration, on the client's clock (one node). The
+    calls are separated by idle pauses, so a call's iterations all begin after
+    it began to submit and before the next call did; rows from before the first
+    call are the engine's start-up.
+    """
+    rows: dict[int, dict[int, tuple[int, int, int]]] = {}
+    began: dict[int, datetime.datetime] = {}
+    for call in calls:
+        for stat in call.stats:
+            batching = stat["inflightBatchingStats"]
+            rows.setdefault(stat["iter"], {})[stat.get("attentionDpRank", 0)] = (
+                batching["numContextRequests"],
+                batching["numCtxTokens"],
+                batching["numGenRequests"],
+            )
+            began[stat["iter"]] = datetime.datetime.strptime(stat["timestamp"], _STATS_TIME_FORMAT)
+    num_ranks = 1 + max((rank for ranks in rows.values() for rank in ranks), default=0)
+    by_start = sorted(calls, key=lambda call: call.start)
+    for it in sorted(rows):
+        owner = None
+        for call in by_start:
+            if call.start <= began[it]:
+                owner = call
+        if owner is not None:
+            owner.steps.append(tuple(rows[it].get(rank) for rank in range(num_ranks)))
+
+
+def _generation_iterations(call: _Call) -> int:
+    """How many of the call's iterations ran a generation row on some rank."""
+    return sum(1 for step in call.steps if any(row and row[2] for row in step))
+
+
+def _alone_gaps(call: _Call) -> list[str]:
+    """Where the iterations of a one-request call show other work than that request alone.
+
+    The request's rank must run every one of its prompt tokens as context and
+    never more than the one request in an iteration, and no other rank may run
+    a request. The statistics leave dummies out, so an idle rank under
+    attention DP reads as idle while it runs the attention-DP dummy.
+    """
+    (request,) = call.requests
+    own = request.rank or 0
+    gaps = []
+    context_tokens = 0
+    for i, step in enumerate(call.steps):
+        for rank, row in enumerate(step):
+            if row is None:
+                gaps.append(f"iteration {i}: rank {rank} published no row")
+            elif rank == own:
+                context_tokens += row[1]
+                if row[0] + row[2] > 1:
+                    gaps.append(f"iteration {i}: rank {rank} ran {row}")
+            elif any(row):
+                gaps.append(f"iteration {i}: rank {rank} ran {row}, the request is on rank {own}")
+    if context_tokens != len(request.token_ids):
+        gaps.append(
+            f"rank {own} ran {context_tokens} context tokens of a {len(request.token_ids)}-token "
+            "prompt"
+        )
+    return gaps
+
+
 class _MtpIdentity(LlmapiAccuracyTestHarness):
     """The two legs and their comparisons; a subclass per target sets the topology."""
 
@@ -226,6 +343,7 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
     # Each prompt alone: prefill is unchunked, so every fixed prompt is one
     # context step of its full length, the same step in both legs.
     ALONE_MAX_NUM_TOKENS = 8192
+    CHUNKED_PREFILL = False
 
     # The batched report: every fixed prompt at once, CUDA graphs padded up to
     # this batch. Prefill is unchunked as the benchmark serves it, so a step
@@ -233,6 +351,7 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
     # all but one of its output tokens, under MAX_SEQ_LEN) beside a full batch
     # of verify rows.
     BATCH_MAX_BATCH_SIZE = 16
+    BATCH_MAX_NUM_TOKENS = MAX_SEQ_LEN + BATCH_MAX_BATCH_SIZE * (1 + MTP_DRAFT_LEN)
 
     # How many times the classifier restarts the MTP-off run per prompt.
     MAX_REANCHORS = 32
@@ -253,14 +372,21 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
 
     # The executor drains its request queue once per iteration and reports an
     # iteration's statistics after its responses: a pause after every call
-    # lets the call's last iteration end before its statistics are read.
+    # lets the call's last iteration end before its statistics are read, and
+    # before the next call begins.
     SETTLE_SECONDS = 1.0
+
+    # Output tokens of the last call on every engine, compared with nothing:
+    # its iterations make the executor publish the statistics of the calls
+    # before it, and with MTP these are still more iterations than the
+    # executor holds back.
+    FLUSH_TOKENS = 32
 
     def _llm(self, *, max_batch_size: int, max_num_tokens: int, mtp: bool) -> LLM:
         # Built fresh for each leg; the legs of a test differ in
         # speculative_config only.
         #
-        # env_overrides is applied on the rank before the model is built:
+        # env_overrides is applied on every rank before the model is built:
         # - the target checks its step contract on its first forward;
         # - Triton autotune results go through the on-disk cache. The prefill's
         #   GDP chunk kernel (the vendored FLA `chunk_fwd_kernel_o`) is
@@ -269,14 +395,14 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         #   processes could pick configs whose prefill outputs differ in the
         #   last bit. With the cache, the second engine reads the first one's
         #   choice. (When the suite's session reuse hands both legs the same
-        #   worker process, they share the in-memory choice as well.) Printing
-        #   shows which leg benchmarked and which read the cache.
+        #   worker processes, they share the in-memory choice as well.)
+        #   Printing shows which leg benchmarked and which read the cache.
         #
         # trust_remote_code: the checkpoint's config class is its own
         # configuration_nemotron4.py. The overlap scheduler is on by default;
         # it is stated because the gate is defined with it on. Every
         # iteration's stats are kept (``max_stats_len=-1``): the per-call
-        # compositions and acceptance lengths come from them.
+        # compositions come from them.
         variant = {}
         if mtp:
             variant["speculative_config"] = MTPDecodingConfig(max_draft_len=self.MTP_DRAFT_LEN)
@@ -292,7 +418,7 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
             max_seq_len=self.MAX_SEQ_LEN,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
-            enable_chunked_prefill=False,
+            enable_chunked_prefill=self.CHUNKED_PREFILL,
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=max_batch_size),
             enable_iter_perf_stats=True,
@@ -301,40 +427,89 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
             **self.PARALLEL,
         )
 
+    @contextlib.contextmanager
+    def _engine(self, flush: _Request, *, max_batch_size: int, max_num_tokens: int, mtp: bool):
+        """An engine that records its calls; on a clean exit, a last call, then every call's steps.
+
+        ``flush`` is the last call's request: its iterations push out the
+        statistics of the calls before it (`FLUSH_TOKENS`).
+        """
+        with self._llm(
+            max_batch_size=max_batch_size, max_num_tokens=max_num_tokens, mtp=mtp
+        ) as llm:
+            engine = _Engine(llm)
+            yield engine
+            self._generate(engine, [flush], logprobs=False)
+        _attribute_steps(engine.calls)
+
+    def _ranks(self, prompts) -> dict[str, int]:
+        """Where each fixed prompt runs, by name; a prompt left out is placed by the engine."""
+        return {}
+
+    def _batch_order(self, requests: list[_Request]) -> list[_Request]:
+        """The order the batched report submits the fixed prompts in."""
+        return requests
+
     def _requests(self, monkeypatch) -> list[_Request]:
-        """The fixed prompt set with its output lengths, checked to fit the context."""
+        """The fixed prompt set with its output lengths and ranks, checked to fit the context."""
         monkeypatch.setenv("LLM_MODELS_ROOT", llm_models_root())
         module = _prompt_module()
         prompts = module.prompt_set(module.load_tokenizer(self.MODEL_PATH))
+        ranks = self._ranks(prompts)
         requests = [
-            _Request(p.name, p.token_ids, self.LONG_TOKENS if p.long else self.SHORT_TOKENS)
+            _Request(
+                p.name,
+                p.token_ids,
+                self.LONG_TOKENS if p.long else self.SHORT_TOKENS,
+                ranks.get(p.name),
+            )
             for p in prompts
         ]
+        block = KvCacheConfig().tokens_per_block
         for r in requests:
             total = len(r.token_ids) + r.max_tokens + self.MTP_DRAFT_LEN
             print(
                 f"[modeling_v2] mtp identity prompt {r.name}: {len(r.token_ids)} tokens, "
-                f"{r.max_tokens} generated"
+                f"{r.max_tokens} generated{_on_rank(r)}"
             )
-            # Unchunked, a prompt is one context step of its full length. A final
-            # one-token chunk would run as a promoted decode row in one leg's
-            # graphs, so none of the fixed prompts may be one token long.
-            assert 1 < len(r.token_ids) <= self.ALONE_MAX_NUM_TOKENS, (
-                f"{r.name} ({len(r.token_ids)} tokens) does not run as one context step of more "
-                f"than one token at max_num_tokens {self.ALONE_MAX_NUM_TOKENS}"
-            )
+            if self.CHUNKED_PREFILL:
+                # Chunked prefill cuts a prompt into chunks of whole KV blocks
+                # but the last, so a final one-token chunk needs a length of one
+                # more than a whole number of blocks. Such a chunk runs as a
+                # promoted decode row in one leg's graphs, so none of the fixed
+                # prompts may have that length.
+                assert len(r.token_ids) > 1 and len(r.token_ids) % block != 1, (
+                    f"{r.name} ({len(r.token_ids)} tokens) can end in a one-token context chunk "
+                    f"with {block}-token KV blocks"
+                )
+            else:
+                # Unchunked, a prompt is one context step of its full length. A
+                # final one-token chunk would run as a promoted decode row in one
+                # leg's graphs, so none of the fixed prompts may be one token long.
+                assert 1 < len(r.token_ids) <= self.ALONE_MAX_NUM_TOKENS, (
+                    f"{r.name} ({len(r.token_ids)} tokens) does not run as one context step of "
+                    f"more than one token at max_num_tokens {self.ALONE_MAX_NUM_TOKENS}"
+                )
             assert total <= self.MAX_SEQ_LEN, (
                 f"{r.name}: {len(r.token_ids)} prompt + {r.max_tokens} output + "
                 f"{self.MTP_DRAFT_LEN} draft tokens exceed max_seq_len {self.MAX_SEQ_LEN}"
             )
         return requests
 
-    def _generate(self, llm: LLM, requests: list[_Request], *, logprobs: bool) -> _Call:
+    def _flush_request(self, requests: list[_Request]) -> _Request:
+        """The last call's request: the shortest fixed prompt, on its rank."""
+        shortest = min(requests, key=lambda r: len(r.token_ids))
+        return replace(shortest, name="flush", max_tokens=self.FLUSH_TOKENS)
+
+    def _generate(self, engine: _Engine, requests: list[_Request], *, logprobs: bool) -> _Call:
         """Submit the requests in order, as one call, and collect what each emitted.
 
-        Greedy, past any end id. With ``logprobs``, the TOP_LOGPROBS highest raw
-        logprobs of every emitted token come back too; one-model speculative
-        decoding rejects logprobs, so only the MTP-off leg asks for them.
+        Greedy, past any end id; a request with a rank is pinned there. With
+        ``logprobs``, the TOP_LOGPROBS highest raw logprobs of every emitted
+        token come back too; one-model speculative decoding rejects logprobs,
+        so only the MTP-off leg asks for them. The statistics available once
+        the call has ended are read with it; `_attribute_steps` sorts them into
+        calls when the engine closes.
         """
         params = [
             SamplingParams(
@@ -345,13 +520,21 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
             )
             for r in requests
         ]
+        start = datetime.datetime.now()
         futures = [
-            llm.generate_async({"prompt_token_ids": list(r.token_ids)}, p)
+            engine.llm.generate_async(
+                {"prompt_token_ids": list(r.token_ids)},
+                p,
+                scheduling_params=None
+                if r.rank is None
+                else SchedulingParams(attention_dp_rank=r.rank, attention_dp_relax=False),
+            )
             for r, p in zip(requests, params)
         ]
         outputs = {}
         for r, future in zip(requests, futures):
-            out = future.result().outputs[0]
+            result = future.result()
+            out = result.outputs[0]
             top = None
             if logprobs:
                 top = [
@@ -360,30 +543,32 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
                     ]
                     for pos in out.logprobs
                 ]
-            outputs[r.name] = _Output(list(out.token_ids), top)
-        time.sleep(self.SETTLE_SECONDS)
-        stats = llm.get_stats(timeout=2)
-        steps = [
-            (
-                s["inflightBatchingStats"]["numContextRequests"],
-                s["inflightBatchingStats"]["numCtxTokens"],
-                s["inflightBatchingStats"]["numGenRequests"],
+            # Per draft position i, the verify steps that drafted it and those
+            # that accepted it: every verify step drafts position 0.
+            drafted = result.per_pos_drafted or [0]
+            outputs[r.name] = _Output(
+                list(out.token_ids),
+                top,
+                decoding_iter=result.decoding_iter,
+                verify_steps=drafted[0],
+                accepted=sum(result.per_pos_accepted or ()),
             )
-            for s in stats
-        ]
-        drafted = any(
-            (s.get("specDecodingStats") or {}).get("numDraftTokens", 0) > 0 for s in stats
-        )
-        return _Call(
-            outputs, steps, acceptance_length_from_iteration_stats(stats) if drafted else None
-        )
+        time.sleep(self.SETTLE_SECONDS)
+        call = _Call(requests, outputs, start, engine.llm.get_stats(timeout=2))
+        engine.calls.append(call)
+        return call
 
     def _alone_leg(self, requests: list[_Request], mtp: bool) -> dict[str, _Call]:
-        """Each request alone, one call each, in an engine that holds one request."""
+        """Each request alone, one call each, in an engine that holds one request a rank."""
         calls = {}
-        with self._llm(max_batch_size=1, max_num_tokens=self.ALONE_MAX_NUM_TOKENS, mtp=mtp) as llm:
+        with self._engine(
+            self._flush_request(requests),
+            max_batch_size=1,
+            max_num_tokens=self.ALONE_MAX_NUM_TOKENS,
+            mtp=mtp,
+        ) as engine:
             for r in requests:
-                calls[r.name] = self._generate(llm, [r], logprobs=not mtp)
+                calls[r.name] = self._generate(engine, [r], logprobs=not mtp)
         return calls
 
     def _write_report(self, name: str, report: dict) -> None:
@@ -418,12 +603,13 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         partings = {}
         for r in requests:
             call_off, call_on = off[r.name], on[r.name]
-            # One request per iteration is what makes the prefill the same step
-            # in both legs.
+            # One request in the engine is what makes the prefill the same
+            # steps in both legs.
             for leg, call in (("MTP off", call_off), ("MTP on", call_on)):
-                crowded = [s for s in call.steps if s[0] + s[2] > 1]
-                assert not crowded, (
-                    f"{r.name}, {leg}: iterations with more than one request {crowded[:4]}"
+                gaps = _alone_gaps(call)
+                assert not gaps, (
+                    f"{r.name}, {leg}: the iterations show other work than the request alone on "
+                    f"its rank: {gaps[:4]}"
                 )
             out_off, out_on = call_off.outputs[r.name], call_on.outputs[r.name]
             for leg, out in (("MTP off", out_off), ("MTP on", out_on)):
@@ -434,11 +620,11 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
             if parting is not None:
                 partings[r.name] = parting
             print(
-                f"[modeling_v2] mtp identity {r.name}: {r.max_tokens} tokens, "
+                f"[modeling_v2] mtp identity {r.name}{_on_rank(r)}: {r.max_tokens} tokens, "
                 f"{'identical' if parting is None else f'parts at token {parting.token}'}; "
                 f"acceptance length {_show(call_on.acceptance_length)} over "
-                f"{sum(1 for s in call_on.steps if s[2])} generation steps "
-                f"(MTP off: {sum(1 for s in call_off.steps if s[2])})"
+                f"{out_on.verify_steps} verify steps; iterations with generation rows "
+                f"{_generation_iterations(call_on)} (MTP off: {_generation_iterations(call_off)})"
             )
 
         self._write_report(
@@ -447,8 +633,12 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
                 "legs": {
                     leg: {
                         name: {
+                            "rank": call.requests[0].rank,
                             "token_ids": call.outputs[name].token_ids,
                             "top": call.outputs[name].top,
+                            "decoding_iter": call.outputs[name].decoding_iter,
+                            "verify_steps": call.outputs[name].verify_steps,
+                            "accepted": call.outputs[name].accepted,
                             "steps": call.steps,
                             "acceptance_length": call.acceptance_length,
                         }
@@ -482,20 +672,19 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         that every output is whole and every parting was reached; the table and
         the classes are what it reports.
         """
-        requests = self._requests(monkeypatch)
-        batch = self.BATCH_MAX_BATCH_SIZE
-        assert len(requests) <= batch
+        requests = self._batch_order(self._requests(monkeypatch))
+        assert len(requests) <= self.BATCH_MAX_BATCH_SIZE
         engine = dict(
-            max_batch_size=batch,
-            max_num_tokens=self.MAX_SEQ_LEN + batch * (1 + self.MTP_DRAFT_LEN),
+            max_batch_size=self.BATCH_MAX_BATCH_SIZE, max_num_tokens=self.BATCH_MAX_NUM_TOKENS
         )
-        with self._llm(mtp=True, **engine) as llm:
-            on = self._generate(llm, requests, logprobs=False)
-        with self._llm(mtp=False, **engine) as llm:
-            off = self._generate(llm, requests, logprobs=True)
-            alone = {r.name: self._generate(llm, [r], logprobs=True) for r in requests}
+        flush = self._flush_request(requests)
+        with self._engine(flush, mtp=True, **engine) as mtp_engine:
+            on = self._generate(mtp_engine, requests, logprobs=False)
+        with self._engine(flush, mtp=False, **engine) as off_engine:
+            off = self._generate(off_engine, requests, logprobs=True)
+            alone = {r.name: self._generate(off_engine, [r], logprobs=True) for r in requests}
             noise, noise_at = self._batch_shape_noise(requests, off, alone)
-            partings, uncovered = self._classify(llm, requests, on, off, noise)
+            partings, uncovered = self._classify(off_engine, requests, on, off, noise)
 
         for r in requests:
             for leg, out in (("MTP on", on.outputs[r.name]), ("MTP off", off.outputs[r.name])):
@@ -505,23 +694,23 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         # Which requests shared a prefill step: a verify row takes 1 + D tokens
         # of a mixed step, so the same composition still runs other GEMM shapes.
         prefills = {
-            leg: [(i, s) for i, s in enumerate(call.steps) if s[0]]
+            leg: [(i, s) for i, s in enumerate(call.steps) if any(row and row[0] for row in s)]
             for leg, call in (("MTP on", on), ("MTP off", off))
         }
         print(
             f"[modeling_v2] mtp batched: acceptance length {_show(on.acceptance_length)}; "
             f"batch-shape noise {noise:.6f} ({noise_at}); iterations MTP on {len(on.steps)}, "
-            f"MTP off {len(off.steps)}; prefill iterations as (index, (context requests, context "
-            f"tokens, generation requests)): {prefills}"
+            f"MTP off {len(off.steps)}; prefill iterations as (index, per rank (context requests, "
+            f"context tokens, generation requests)): {prefills}"
         )
         for r in requests:
             alone_parts = _parting(alone[r.name].outputs[r.name].token_ids, off.outputs[r.name])
             within = sum(bool(p.near_tie) for p in partings[r.name])
             witnessed = sum(p.witness is not None for p in partings[r.name])
             print(
-                f"[modeling_v2] mtp batched {r.name}: {len(partings[r.name])} partings, {within} "
-                f"within the noise, {witnessed} witnessed; MTP off alone vs batch: "
-                f"{'identical' if alone_parts is None else f'parts at {alone_parts.token}'}"
+                f"[modeling_v2] mtp batched {r.name}{_on_rank(r)}: {len(partings[r.name])} "
+                f"partings, {within} within the noise, {witnessed} witnessed; MTP off alone vs "
+                f"batch: {'identical' if alone_parts is None else f'parts at {alone_parts.token}'}"
             )
             for p in partings[r.name]:
                 if p.near_tie:
@@ -543,7 +732,10 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
                 "steps": {"mtp": on.steps, "off": off.steps},
                 "outputs": {
                     r.name: {
+                        "rank": r.rank,
                         "mtp": on.outputs[r.name].token_ids,
+                        "mtp_verify_steps": on.outputs[r.name].verify_steps,
+                        "mtp_accepted": on.outputs[r.name].accepted,
                         "off": off.outputs[r.name].token_ids,
                         "off_top": off.outputs[r.name].top,
                         "alone": alone[r.name].outputs[r.name].token_ids,
@@ -582,7 +774,7 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         return noise, noise_at
 
     def _witness(
-        self, llm: LLM, request: _Request, mtp_tokens: list[int], token: int
+        self, engine: _Engine, request: _Request, mtp_tokens: list[int], token: int
     ) -> int | None:
         """The first of WITNESS_SPLITS at which MTP off itself emits MTP on's token.
 
@@ -594,15 +786,19 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         for j in self.WITNESS_SPLITS:
             if j > token:
                 break
-            run = _Request(request.name, request.token_ids + tuple(mtp_tokens[: token - j]), j + 1)
-            emitted = self._generate(llm, [run], logprobs=False).outputs[request.name].token_ids
+            run = replace(
+                request,
+                token_ids=request.token_ids + tuple(mtp_tokens[: token - j]),
+                max_tokens=j + 1,
+            )
+            emitted = self._generate(engine, [run], logprobs=False).outputs[request.name].token_ids
             if emitted == mtp_tokens[token - j : token + 1]:
                 return j
         return None
 
     def _classify(
         self,
-        llm: LLM,
+        engine: _Engine,
         requests: list[_Request],
         on: _Call,
         off: _Call,
@@ -615,7 +811,7 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         token t, the MTP-off engine runs the prompt followed by MTP on's tokens
         up to and including t, greedy, for the rest of the output, and the next
         parting is looked for in that run. The restarts of all prompts run as
-        one call per round.
+        one call per round, each on its prompt's rank.
         """
         partings = {r.name: [] for r in requests}
         # name -> (offset into the MTP-on output, the MTP-off run from there).
@@ -634,7 +830,7 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
                 parting.reanchor = reanchor
                 parting.near_tie = parting.gap is not None and parting.gap <= noise
                 if not parting.near_tie:
-                    parting.witness = self._witness(llm, r, mtp_tokens, parting.token)
+                    parting.witness = self._witness(engine, r, mtp_tokens, parting.token)
                 partings[r.name].append(parting)
                 resume = parting.token + 1
                 if resume == len(mtp_tokens):
@@ -643,16 +839,20 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
                     uncovered.append(f"{r.name} (from token {resume})")
                     continue
                 restarts.append(
-                    _Request(
-                        r.name,
-                        r.token_ids + tuple(mtp_tokens[:resume]),
-                        len(mtp_tokens) - resume,
+                    replace(
+                        r,
+                        token_ids=r.token_ids + tuple(mtp_tokens[:resume]),
+                        max_tokens=len(mtp_tokens) - resume,
                     )
                 )
                 offsets[r.name] = resume
             if not restarts:
                 break
-            call = self._generate(llm, restarts, logprobs=True)
+            call = self._generate(engine, restarts, logprobs=True)
             for req in restarts:
                 pending[req.name] = (offsets[req.name], call.outputs[req.name])
         return partings, uncovered
+
+
+def _on_rank(request: _Request) -> str:
+    return "" if request.rank is None else f" on rank {request.rank}"
