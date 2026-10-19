@@ -63,7 +63,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.softclamp_relu2 import (
+    softclamp_relu2,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
+    latent_moe_experts,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
@@ -73,12 +79,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_na
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1 import (  # noqa: E501
     weights as W,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.activation.softclamp_relu2 import (  # noqa: E501
-    softclamp_relu2,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1.ops.moe.latent_moe_experts import (  # noqa: E501
-    latent_moe_experts,
 )
 
 __extra_import_path__ = ["../..", "../../../.."]

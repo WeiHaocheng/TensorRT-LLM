@@ -7,8 +7,9 @@ What runs is the target itself: the whole text model on one GPU, built as the en
 ``post_load_weights``), the engine's own hybrid cache manager (``_create_kv_cache_manager``) and the
 engine's TRTLLM attention metadata (``build_attention_metadata``) filled per step as the executor's
 runner fills it. Its forward is never edited: the attention and dense-MLP blocks are observed through
-the module globals the flat forward calls (``wide_residual``, ``cublas_mm``, ``thop_attention``),
-each call attributed to its layer by the weight operand it was handed.
+the module globals the flat forward calls (``wide_residual``, ``cublas_mm`` and ``thop_attention``,
+and in decode steps ``invariant_mm`` and ``invariant_gen_attention``), each call attributed to its
+layer by the weight operand it was handed.
 
 The blocks under test, with the stream reads and writes around them:
 
@@ -286,19 +287,27 @@ class BlockObserver:
     """Wraps the module globals the target's forward calls and keeps, per layer under test, what
     its block read and wrote in the last forward.
 
-    Calls are attributed by their weight operand: a GEMM by its ``mat_b`` (a ``.t()`` view of one
-    of the target's parameters), a ``wide_residual`` call by the read factors and the retention it
-    was handed, a ``thop_attention`` call by its ``local_layer_idx``. Every recorded tensor is a copy
-    taken at the call (``wide_residual`` writes the streams in place). A target that runs these
-    blocks through other entries (another GEMM or attention entry) needs those names wrapped here
-    too; until then a block's record misses that output and the campaign says which.
+    Calls are attributed by their weight operand: a GEMM by the target parameter it multiplies
+    (``cublas_mm``'s ``mat_b``, a ``.t()`` view of it; ``invariant_mm``'s ``weight``, the parameter
+    as stored), a ``wide_residual`` call by the read factors and the retention it was handed, an
+    attention call (``thop_attention``, or ``invariant_gen_attention`` in decode) by its
+    ``local_layer_idx``. Every recorded tensor is a copy taken at the call (``wide_residual`` writes
+    the streams in place). A target that runs these blocks through other entries (another GEMM or
+    attention entry) needs those names wrapped here too; until then a block's record misses that
+    output and the campaign says which.
     """
+
+    WRAPPED = (
+        "wide_residual",
+        "cublas_mm",
+        "invariant_mm",
+        "thop_attention",
+        "invariant_gen_attention",
+    )
 
     def __init__(self, module, core, manager):
         self.module = module
-        self.orig = {
-            name: getattr(module, name) for name in ("wide_residual", "cublas_mm", "thop_attention")
-        }
+        self.orig = {name: getattr(module, name) for name in self.WRAPPED}
         w = core.w
         kinds = core.layer_types
         self.attention_layers = [i for i, t in enumerate(kinds) if t in ATTENTION_KINDS]
@@ -318,9 +327,8 @@ class BlockObserver:
         self.record: dict[int, dict] = defaultdict(dict)
 
     def install(self, monkeypatch) -> None:
-        monkeypatch.setattr(self.module, "wide_residual", self.wide_residual)
-        monkeypatch.setattr(self.module, "cublas_mm", self.cublas_mm)
-        monkeypatch.setattr(self.module, "thop_attention", self.thop_attention)
+        for name in self.WRAPPED:
+            monkeypatch.setattr(self.module, name, getattr(self, name))
 
     def take(self) -> dict[int, dict]:
         record, self.record = self.record, defaultdict(dict)
@@ -341,21 +349,35 @@ class BlockObserver:
                 self.record[i][role] = normed.clone()
         return out
 
-    def cublas_mm(self, mat_a, mat_b, *args, **kwargs):
-        out = self.orig["cublas_mm"](mat_a, mat_b, *args, **kwargs)
-        tag = self.gemm.get(mat_b.data_ptr())
+    def _gemm(self, x, weight, out) -> None:
+        tag = self.gemm.get(weight.data_ptr())
         if tag is not None:
             i, role = tag
             if role == "update":
-                self.record[i]["update_in"] = mat_a.clone()
+                self.record[i]["update_in"] = x.clone()
             self.record[i][role] = out.clone()
+
+    def cublas_mm(self, mat_a, mat_b, *args, **kwargs):
+        out = self.orig["cublas_mm"](mat_a, mat_b, *args, **kwargs)
+        self._gemm(mat_a, mat_b, out)
         return out
 
-    def thop_attention(self, **kwargs):
-        out = self.orig["thop_attention"](**kwargs)
+    def invariant_mm(self, x, weight, *args, **kwargs):
+        out = self.orig["invariant_mm"](x, weight, *args, **kwargs)
+        self._gemm(x, weight, out)
+        return out
+
+    def _attention(self, name, kwargs):
+        out = self.orig[name](**kwargs)
         i = self.layer_of_kv[kwargs["local_layer_idx"]]
         self.record[i]["attention"] = out.clone()
         return out
+
+    def thop_attention(self, **kwargs):
+        return self._attention("thop_attention", kwargs)
+
+    def invariant_gen_attention(self, **kwargs):
+        return self._attention("invariant_gen_attention", kwargs)
 
 
 # ------------------------------------------------------------------------------------------------
