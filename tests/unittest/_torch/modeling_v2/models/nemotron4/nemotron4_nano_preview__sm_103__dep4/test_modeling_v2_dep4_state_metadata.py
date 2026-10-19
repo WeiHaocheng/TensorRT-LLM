@@ -44,12 +44,13 @@ class _HybridManager:
 
     Each pool is the first half of a [slots, 2, *state] block, so its slot stride
     is twice one state, and a write that strays past a state lands in the other
-    half, where `changed_slots` sees it.
+    half, where `changed_slots` sees it. Like the default hybrid manager, it does
+    not state a draft length: the runner's padding dummy is named for the step's
+    draft length (`draft_len`), which only the target knows.
     """
 
     def __init__(self, slot_of: dict[int, int], draft_len: int = 0) -> None:
         self.slot_of = {_ADP: _ADP_SLOT, **slot_of, _PAD - draft_len: _PADDING_SLOT}
-        self.speculative_num_draft_tokens = draft_len
         self.mamba_layer_offsets = {layer: i for i, layer in enumerate(_GDP_LAYERS)}
         g = torch.Generator(device="cuda").manual_seed(1234)
         # Every slot non-zero, so a reset is visible.
@@ -141,20 +142,55 @@ def test_an_idle_rank_runs_its_dummy_on_pad_slot_id():
     assert manager.changed_slots(before) == set()
 
 
-def test_padding_ids_shift_by_the_draft_length():
+def test_padding_ids_shift_by_the_target_draft_length():
     """With draft tokens the padding dummy's id is CUDA_GRAPH_DUMMY_REQUEST_ID
-    less the draft length, as `Mamba2Metadata.prepare` reads it."""
+    less the step's draft length. The manager does not state it, so the shell
+    binds the target's `max_draft_len` (`for_draft_len`); unbound, the class
+    would take such a padding row for a request. A step at a shorter runtime
+    draft length (a `draft_len_schedule`) names its dummy within that range."""
+    metadata_cls = Nemotron4StateMetadata.for_draft_len(2)
+    assert metadata_cls.max_draft_len == 2 and Nemotron4StateMetadata.max_draft_len == 0
+    assert metadata_cls.__name__ == Nemotron4StateMetadata.__name__
+    for draft_len in (2, 1):
+        manager = _HybridManager({17: 4}, draft_len=draft_len)
+        md = metadata_cls(_MAX_BATCH, 128, max_num_tokens=8192)
+        md.prepare(_step(manager, [17, _PAD - draft_len], [1, 1], 0, [40, 0]))
+        assert md.state_slots[:2].tolist() == [4, PAD_SLOT_ID], draft_len
+
     manager = _HybridManager({17: 4}, draft_len=2)
-    md = Nemotron4StateMetadata(_MAX_BATCH, 128, max_num_tokens=8192)
-    md.prepare(_step(manager, [17, _PAD - 2], [1, 1], 0, [40, 0]))
-    assert md.state_slots[:2].tolist() == [4, PAD_SLOT_ID]
+    unbound = Nemotron4StateMetadata(_MAX_BATCH, 128, max_num_tokens=8192)
+    unbound.prepare(_step(manager, [17, _PAD - 2], [1, 1], 0, [40, 0]))
+    assert unbound.state_slots[:2].tolist() == [4, _PADDING_SLOT]
+
+
+def test_verify_rows_and_both_dummies_under_mtp():
+    """An MTP verify step: every generation row carries 1 + D tokens, the
+    attention-DP dummy's and the padding dummy's included. Real rows keep their
+    slots (they have cached tokens, so none is reset); the dummy rows -- on an idle
+    rank, the attention-DP dummy padded up to the graph batch -- get PAD_SLOT_ID,
+    while `state_indices` keeps the engine's slots for the worker's commit."""
+    metadata_cls = Nemotron4StateMetadata.for_draft_len(2)
+    manager = _HybridManager({17: 4, 13: 1}, draft_len=2)
+    md = metadata_cls(_MAX_BATCH, 128, max_num_tokens=8192)
+    before = manager.snapshot()
+    md.prepare(_step(manager, [17, 13, _PAD - 2, _PAD - 2], [3] * 4, 0, [40, 41, 2, 2]))
+    torch.cuda.synchronize()
+    assert md.state_slots[:4].tolist() == [4, 1, PAD_SLOT_ID, PAD_SLOT_ID]
+    assert md.state_indices[:4].tolist() == [4, 1, _PADDING_SLOT, _PADDING_SLOT]
+    assert manager.changed_slots(before) == set()
+
+    md.prepare(_step(manager, [_ADP, _PAD - 2, _PAD - 2, _PAD - 2], [3] * 4, 0, [2, 2, 2, 2]))
+    torch.cuda.synchronize()
+    assert md.state_slots[:4].tolist() == [PAD_SLOT_ID] * 4
+    assert md.state_indices[:4].tolist() == [_ADP_SLOT] + [_PADDING_SLOT] * 3
+    assert manager.changed_slots(before) == set()
 
 
 def test_a_placeholder_row_between_real_rows_is_marked_where_it_sits():
     """Placeholders are marked row by row, not as a trailing block: a padding row
     ordered before a real one keeps the real rows' slots on either side."""
     manager = _HybridManager({17: 4, 18: 5}, draft_len=2)
-    md = Nemotron4StateMetadata(_MAX_BATCH, 128, max_num_tokens=8192)
+    md = Nemotron4StateMetadata.for_draft_len(2)(_MAX_BATCH, 128, max_num_tokens=8192)
     before = manager.snapshot()
     md.prepare(_step(manager, [17, _PAD - 2, 18, _PAD - 2], [1] * 4, 0, [40, 0, 41, 0]))
     torch.cuda.synchronize()
