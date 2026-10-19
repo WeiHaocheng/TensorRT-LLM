@@ -1290,7 +1290,8 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpAcceptance(_MtpAcceptance):
     tensor parallel without attention DP. Every rank runs every request on its
     quarter of the mixers' heads and of every MLP's and routed expert's
     intermediate width, the MTP layer's included, and the all-reduces give
-    every rank the same bits; the lm_head is whole on every rank, so every rank
+    every rank the same bits; every rank forms the same logits over the whole
+    vocabulary (vocab-parallel and gathered for a few rows), so every rank
     drafts the same tokens. MAX_BATCH_SIZE and the CUDA graphs are the
     engine's, as on tp1.
     """

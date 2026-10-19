@@ -114,9 +114,10 @@ def test_reference_rows_are_real(report):
 
 @pytest.mark.no_xdist
 def test_every_rank_forms_the_same_logits_and_kv(report):
-    """Every rank forms each probe's logits from the same hidden state with the whole lm_head and
-    appends the K/V of the one KV head every rank keeps: the four ranks agree bit for bit, alone
-    here and in every batch of the tests below."""
+    """Every rank forms each probe's logits over the whole vocabulary from the same hidden state
+    (vocab-parallel and gathered for a few rows, the whole lm_head above) and appends the K/V of
+    the one KV head every rank keeps: the four ranks agree bit for bit, alone here and in every
+    batch of the tests below."""
     failures = _failures(report, "every_rank_forms_the_same_logits_and_kv")
     assert not failures, "\n".join(failures)
 

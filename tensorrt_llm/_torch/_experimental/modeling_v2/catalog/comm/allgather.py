@@ -47,6 +47,17 @@ _NEMOTRON4_SERVING_SPLITS = (
 )
 
 
+#: nemotron4-nano-preview's tp4 logits: each rank's fp32 slice of the vocabulary, 262272 / 4
+#: columns, gathered at the row counts the target forms vocab-parallel, as (rows, what they are).
+_NEMOTRON4_TP4_LOGITS_WIDTH = 262272 // 4
+_NEMOTRON4_TP4_LOGITS_ROWS = (
+    (1, "one decode row or one draft row"),
+    (3, "one request's MTP verify, its token and two drafts"),
+    (48, "MTP verify at 16 requests"),
+    (64, "the most rows the tp4 target gathers"),
+)
+
+
 def _nemotron4_dispatch(why: str, rows: int, sizes: Optional[List[int]] = None) -> Cell:
     return Cell(
         why=why,
@@ -84,6 +95,11 @@ class Allgather(OpWrapper):
     # position. The reduce-scatter entry certifies the same per-rank counts,
     # because one step's gather and reduce-scatter carry them both. The serving
     # cells carry those counts up to the step budgets its serve configs set.
+    #
+    # nemotron4-nano-preview at tp4 gathers each rank's fp32 slice of the
+    # vocabulary's logits, up to its vocab-parallel row limit
+    # (`_VOCAB_PARALLEL_ROWS`). Every rank forms logits for the same rows, so its
+    # cells are the padded form.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one row per rank, hidden 7168",
@@ -101,21 +117,34 @@ class Allgather(OpWrapper):
             _nemotron4_dispatch(f"nemotron4 dep4 {what}, packed dispatch rows", rows, sizes)
             for rows, sizes, what in _NEMOTRON4_DISPATCH_SPLITS + _NEMOTRON4_SERVING_SPLITS
         ),
+        *(
+            Cell(
+                why=f"nemotron4 tp4 logits, {what}",
+                spec=dict(
+                    rows=rows,
+                    trailing=(_NEMOTRON4_TP4_LOGITS_WIDTH,),
+                    dtype=torch.float32,
+                    sizes=None,
+                ),
+            )
+            for rows, what in _NEMOTRON4_TP4_LOGITS_ROWS
+        ),
     )
 
     note = """
-    Certified dtypes: bf16 rows, and the uint8 bytes of nemotron4's packed
-    dispatch row. fp16, fp32, int32 and fp8 move bitwise in the op matrix, but
-    no target passes them, so they are not cells. A packed row is only bytes to
-    this op. The caller takes the fields back as views of the gathered rows:
+    Certified dtypes: bf16 rows, the uint8 bytes of nemotron4's packed
+    dispatch row, and the fp32 rows of nemotron4 tp4's logits. fp16, int32 and
+    fp8 move bitwise in the op matrix, but no target passes them, so they are
+    not cells. A packed row is only bytes to this op. The caller takes the
+    fields back as views of the gathered rows:
     `[:, :1536].view(torch.bfloat16)`, `[:, 1536:1576].view(torch.int32)` and
     `[:, 1576:].view(torch.float32)`. Those views are strided, with one row
     every 1616 bytes, not contiguous.
 
     Every cell is certified on both symbols `process_group` selects: the `_pg`
     symbol, by ranks that rendezvous over torch.distributed with MPI disabled,
-    and the MPI-session symbol (`process_group=None`, the call a dep4 serving
-    world makes), by ranks that `mpirun` starts. On each, a cell is driven
+    and the MPI-session symbol (`process_group=None`, the call a dep4 or tp4
+    serving world makes), by ranks that `mpirun` starts. On each, a cell is driven
     eagerly and replayed from a CUDA graph on fresh rows.
 
     CUDA graph behaviour -- capture at every engine batch size, replays

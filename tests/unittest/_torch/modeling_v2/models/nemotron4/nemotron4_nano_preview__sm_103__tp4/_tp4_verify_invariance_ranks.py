@@ -925,9 +925,10 @@ def check_reference_rows_are_real(h: Harness) -> dict:
 
 
 def check_every_rank_forms_the_same_logits_and_kv(h: Harness) -> dict:
-    """Every rank forms each probe's decode logits and its verify logits from the same hidden
-    state with the whole lm_head, and appends the K/V of the one KV head every rank keeps: the
-    four ranks' bits must agree."""
+    """Every rank forms each probe's decode logits and its verify logits over the whole
+    vocabulary from the same hidden state (vocab-parallel and gathered for a few rows, the whole
+    lm_head above), and appends the K/V of the one KV head every rank keeps: the four ranks'
+    bits must agree."""
     mine = {}
     for r in h.probes:
         logits = h.eager([r])

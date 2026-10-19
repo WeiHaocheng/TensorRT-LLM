@@ -12,8 +12,9 @@ records); this module starts it, reads the records and gates them. The blocks: t
 (6 of 24 heads per rank, out_proj row-parallel), attention (4 of 16 query heads over the whole
 KV head, o_proj row-parallel), the dense MLP and the shared expert (column / row parallel), the
 routed experts (every expert's intermediate sliced, the latent partial all-reduced with the
-shared partial before `fc2_norm`), and the lm_head, which the target keeps whole on every rank:
-there is no vocab-parallel head or logits all-gather in it to measure.
+shared partial before `fc2_norm`), and the lm_head, whole on every rank and vocab-parallel for
+a few rows (every step here): each rank's quarter of the rows, the four slices' fp32 logits
+all-gathered and laid side by side.
 
 The bands are the tp1 module tests' (the GDP, attention / dense-MLP and MoE block tests), plus
 the TP rounding term. Every all-reduce here sums bf16 partials -- each rank's GEMM rounds its
@@ -402,7 +403,8 @@ def test_every_allreduce_is_its_certified_sum_on_every_rank(measured) -> None:
     their fp32 sum in rank order, rounded once -- bit for bit; every rank holds the same bits of
     every replicated output (the all-reduces', the reads after them, the MoE block's, the
     logits); the MoE's packed call carries the two partials end to end and `fc2_norm` and the
-    add read its two halves; lm_head reads the final hidden and the forward returns its GEMM.
+    add read its two halves; lm_head reads the final hidden, and the forward returns its GEMM,
+    or every rank's lm_head slice side by side.
     Each rival reduction differs from the certified sum."""
     flags = [
         r
@@ -635,10 +637,11 @@ def test_the_moe_block_is_within_the_tp1_bands_plus_the_tp_term(measured) -> Non
 
 @pytest.mark.gpu4
 def test_the_lm_head_is_the_fp32_gemm_of_the_final_hidden(measured) -> None:
-    """lm_head, whole on every rank: its fp32 logits against an IEEE-fp32 GEMM of the same hidden
-    rows with the checkpoint's lm_head, in fp32 ulps (the band `cublas_mm` certifies its
-    fp32-output cells with, `K.LOGITS_BAND`). That every rank forms the same logits, that the
-    forward returns this GEMM and that it reads the final hidden are flags."""
+    """lm_head: each rank's fp32 logits -- its quarter of the vocabulary when vocab-parallel --
+    against an IEEE-fp32 GEMM of the same hidden rows with the checkpoint's lm_head rows of
+    them, in fp32 ulps (the band `cublas_mm` certifies its fp32-output cells with,
+    `K.LOGITS_BAND`). That the forward returns this GEMM, or every rank's slice side by side,
+    the same on every rank, and that it reads the final hidden are flags."""
     records = _records(measured, kind="lm_head", comparison="op", output="logits")
     assert records
     print(f"logits: {_worst(records)} fp32 ulp")
