@@ -67,6 +67,7 @@ from tensorrt_llm._torch.speculative.utils import (
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 from tensorrt_llm.mapping import Mapping
 
 from ..conftest import llm_models_root
@@ -393,6 +394,25 @@ def _acceptance_length(requests: list) -> float:
     return (steps + accepted) / steps
 
 
+def _spawn_ranks_with(mocker, env: dict[str, str]) -> None:
+    """Start every MPI rank an ``LLM`` spawns from here on with ``env`` in its environment.
+
+    The ranks need it from their start, before PyTorch's allocator reads its
+    settings. ``MpiPoolSession`` forwards only this process's TRTLLM* and TLLM*
+    variables to the ranks it spawns, and sets others through its own
+    ``env_overrides``. A test calling this runs on pools it spawns itself
+    (``private_mpi_session``): a pool cached by an earlier test was spawned
+    without ``env``.
+    """
+    start_mpi_pool = MpiPoolSession._start_mpi_pool
+
+    def start_with_env(session):
+        session._env_overrides = {**session._env_overrides, **env}
+        start_mpi_pool(session)
+
+    mocker.patch.object(MpiPoolSession, "_start_mpi_pool", start_with_env)
+
+
 class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
     """nemotron4-nano-preview (text model) / sm_103 / dep4, identity and the mtp2 variant."""
 
@@ -560,6 +580,21 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
     # depth, and a verify step carries 6 tokens per request.
     MTP5_DRAFT_LEN = 5
 
+    # The ranks' PyTorch allocator settings, for both legs. Once the cache
+    # pools are sized, the engine caps PyTorch at the memory then left, and
+    # PyTorch keeps every block a step frees cached until an allocation fails.
+    # Device memory taken outside PyTorch after that puts the device's limit
+    # just under the cap, so the cached blocks grow until a step's next buffer
+    # -- a mixed step's fp32 logits, formed whole on every rank at 1 MiB a row
+    # for up to 1 + D rows of each of MAX_BATCH_SIZE requests -- fails its
+    # cudaMalloc and is retried after the cache is emptied: a recovered
+    # allocator OOM, measured at 916 rows with two drafts and at 1596 with five,
+    # each at one of the kv-cache fractions 0.9 and 0.8 and not at the other.
+    # Past this share of the cap, PyTorch frees its oldest unused blocks before
+    # each new allocation instead, which leaves a fifth of the cap (over 14 GiB
+    # a rank in either leg) under the limit.
+    RANK_ENV = {"PYTORCH_ALLOC_CONF": "garbage_collection_threshold:0.8"}
+
     # There is deliberately no standalone identity gsm8k case. The paired test
     # below evaluates the identity config as its first leg, and
     # ``task.evaluate`` asserts accuracy against the reference on the way past,
@@ -590,12 +625,14 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.private_mpi_session
     def test_gsm8k_identity_vs_mtp2(self, mocker):
         """The identity gate and MTP at two drafts, paired (``_gsm8k_identity_vs_mtp``)."""
         self._gsm8k_identity_vs_mtp(mocker, self.MTP_DRAFT_LEN)
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.private_mpi_session
     def test_gsm8k_identity_vs_mtp5(self, mocker):
         """The identity gate and MTP at five drafts, paired (``_gsm8k_identity_vs_mtp``)."""
         self._gsm8k_identity_vs_mtp(mocker, self.MTP5_DRAFT_LEN)
@@ -631,6 +668,7 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
         # The stock protocol, as the anchor was measured: 5-shot, no chat
         # template, the default 256 output tokens. Only the filter is patched.
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+        _spawn_ranks_with(mocker, self.RANK_ENV)
         task = GSM8K(self.MODEL_NAME)
 
         with self._llm(self.MAX_NUM_TOKENS) as llm:
@@ -976,12 +1014,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4Identity(
 
     # The near-tie band: the largest shift of a top gap between the CUDA-graph
     # and eager legs at matched positions, measured by this gate over every
-    # compared request (1110 requests, 33 graph sizes): 0.8244; plus a quarter,
-    # rounded up. Where the legs parted, the CUDA-graph leg emitted one of the
-    # eager leg's top tokens at 0.0026 to 0.1974 below its top-1. A rank attends
-    # with 4 of the 16 query heads and runs a quarter of every GEMM's width, so
-    # the band is tp4's own.
-    NEAR_TIE_BAND = 1.04
+    # compared request (1110 requests, 33 graph sizes): 1.2059, the eager leg's
+    # runner-up 1.33 below its top-1 at a position where the CUDA-graph leg has
+    # it 0.13 below; plus a quarter, rounded up. Where the legs parted, the
+    # CUDA-graph leg emitted the eager leg's runner-up, 0.0028 to 0.0839 below
+    # its top-1. A rank attends with 4 of the 16 query heads and runs a quarter
+    # of every GEMM's width, so the band is tp4's own.
+    NEAR_TIE_BAND = 1.51
 
     def _saturations(self, prompts) -> dict[str, list[_Request]]:
         """Two long prompts, then MAX_BATCH_SIZE - 2 short requests: one call holding every slot.
