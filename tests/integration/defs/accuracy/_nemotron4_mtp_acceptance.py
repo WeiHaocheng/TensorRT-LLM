@@ -352,25 +352,27 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
         """The acceptance length the target measures matches the reference's.
 
         Leg 1 runs the fixed prompt set (6 short prompts x 256 tokens, 4 of ~8K
-        tokens x 1024) through the target in one batch with MTP-Eagle draft 2,
-        the overlap scheduler and CUDA graphs on: AL_trt, read as the target's
-        class reads it (``_engine_al``). Leg 2 runs the reference teacher-forced
-        over each prompt and the target's own output: AL_ref, its greedy walk
-        pooled with the same estimator.
+        tokens x 1024) through the target in one batch with MTP-Eagle at the
+        class's draft length D (``MTP_DRAFT_LEN``), the overlap scheduler and
+        CUDA graphs on: AL_trt, read as the target's class reads it
+        (``_engine_al``). Leg 2 runs the reference teacher-forced over each
+        prompt and the target's own output, D depths deep: AL_ref, its greedy
+        walk pooled with the same estimator.
 
         **Tolerance.** At a verify step the two sides' accepted counts differ
         only if the deciding draft's outcome flips, which needs some token to
         gain at least the reference's margin there (``draft_scores``) against
         the logit error ``epsilon`` between the implementations. A flip at depth
-        1 moves the step's count by at most 2, at depth 2 by at most 1. So over
-        the reference's n steps:
+        d of D moves the step's count by at most D - d + 1: at D = 2, by 2 at
+        depth 1 and 1 at depth 2. So over the reference's n steps:
 
-            tol = (2 * k1 + k2 + 2 * E) / n
+            tol = (sum over d of (D - d + 1) * k_d + D * E) / n
 
-        k1 counts the steps whose depth-1 margin is below epsilon, k2 the
-        remaining ones whose depth-1 draft matched and whose depth-2 margin is
-        below epsilon. E counts the steps AL_trt holds that the reference walk
-        cannot pair, each moving a mean of n steps by at most 2 / n:
+        which at D = 2 is (2 * k1 + k2 + 2 * E) / n. k_d counts the steps whose
+        first d - 1 drafts matched, whose depth-d margin is below epsilon and
+        whose earlier margins are not (k1: the depth-1 margin is below it). E
+        counts the steps AL_trt holds that the reference walk cannot pair, each
+        moving a mean of n steps by at most D / n:
 
         - the engine's last step of an output whose window passes the last
           token, which the reference cannot score (at most one per request);
@@ -386,7 +388,7 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
         AL_trt >= 2.0 is a tripwire for a collapsed draft path. The reference's
         AL with HF's per-depth MTP (``mode="hf"``) is reported beside it.
         """
-        assert self.MTP_DRAFT_LEN == 2, "the tolerance is derived for two draft depths"
+        draft_len = self.MTP_DRAFT_LEN
         monkeypatch.setenv("LLM_MODELS_ROOT", llm_models_root())
         prompts_module = _unittest_module("_nemotron4_prompts")
         reference = _unittest_module("_nemotron4_reference")
@@ -395,8 +397,7 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
 
         runs, stats = self._engine_leg(prompts, ranks)
         walks = {
-            p.name: _engine_walk(p.name, len(p.token_ids), runs[p.name], self.MTP_DRAFT_LEN)
-            for p in prompts
+            p.name: _engine_walk(p.name, len(p.token_ids), runs[p.name], draft_len) for p in prompts
         }
         al_trt, extra_steps, engine_report = self._engine_al(stats, walks, ranks)
         # Iterations of a rank that ran context rows beside generation rows.
@@ -414,8 +415,9 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
         refs = self._reference_leg(reference, prompts, runs)
 
         epsilon = self._epsilon()
+        assert len(epsilon) == draft_len, f"epsilon {epsilon} for {draft_len} draft depths"
         rows, flips_all, offenders = [], [], []
-        pooled = dict(ref_accepted=[], ref_hf_accepted=[], trt_accepted=[], k1=0, k2=0)
+        pooled = dict(ref_accepted=[], ref_hf_accepted=[], trt_accepted=[], k=[0] * draft_len)
         boundary_total = 0
         for p in prompts:
             run, ref = runs[p.name], refs[p.name]
@@ -423,13 +425,14 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
             seq = list(p.token_ids) + run.output
             walk = walks[p.name]
 
-            # The reference's own walk and its near-ties (the tolerance).
-            k1 = k2 = 0
+            # The reference's own walk and its near-ties (the tolerance): a step's count can
+            # flip at depth d + 1 only when its first d drafts matched (a >= d).
+            k = [0] * draft_len
             for q, a in zip(eagle["positions"], eagle["accepted"]):
-                if eagle["margins"][0][q] < epsilon[0]:
-                    k1 += 1
-                elif a >= 1 and eagle["margins"][1][q] < epsilon[1]:
-                    k2 += 1
+                for depth in range(min(a + 1, draft_len)):
+                    if eagle["margins"][depth][q] < epsilon[depth]:
+                        k[depth] += 1
+                        break
 
             # The engine's walk, each step scored by the reference where the engine took it.
             flips, boundary, matched_trt, matched_ref = [], 0, [], []
@@ -471,8 +474,7 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
                 ref_steps=eagle["verify_steps"],
                 al_ref=round(eagle["acceptance_length"], 4),
                 al_ref_hf=round(hf["acceptance_length"], 4),
-                k1=k1,
-                k2=k2,
+                **{f"k{depth + 1}": k[depth] for depth in range(draft_len)},
                 al_ref_at_trt_steps=round(_al(matched_ref), 4),
                 al_trt_at_trt_steps=round(_al(matched_trt), 4),
                 flips=len(flips),
@@ -487,8 +489,7 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
             pooled["ref_accepted"] += eagle["accepted"]
             pooled["ref_hf_accepted"] += hf["accepted"]
             pooled["trt_accepted"] += [a for _, a in walk]
-            pooled["k1"] += k1
-            pooled["k2"] += k2
+            pooled["k"] = [total + mine for total, mine in zip(pooled["k"], k)]
             flips_all += flips
             boundary_total += boundary
 
@@ -498,7 +499,13 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
         al_trt_requests = _al(pooled["trt_accepted"])
         request_steps = len(pooled["trt_accepted"])
         unpaired = boundary_total + extra_steps
-        tol = (2 * pooled["k1"] + pooled["k2"] + 2 * unpaired) / n
+        weighted = " + ".join(
+            f"{draft_len - depth} * {pooled['k'][depth]}" for depth in range(draft_len)
+        )
+        tol = (
+            sum((draft_len - depth) * pooled["k"][depth] for depth in range(draft_len))
+            + draft_len * unpaired
+        ) / n
         summary = dict(
             al_trt=round(al_trt, 4),
             al_trt_from_requests=round(al_trt_requests, 4),
@@ -508,8 +515,7 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
             al_ref=round(al_ref, 4),
             al_ref_hf=round(al_ref_hf, 4),
             ref_steps=n,
-            k1=pooled["k1"],
-            k2=pooled["k2"],
+            **{f"k{depth + 1}": pooled["k"][depth] for depth in range(draft_len)},
             requests=len(prompts),
             epsilon=[round(e, 4) for e in epsilon],
             tol=round(tol, 4),
@@ -517,7 +523,7 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
             flips=len(flips_all),
             max_flip_margin=[
                 max((f["margin"] for f in flips_all if f["depth"] == depth), default=None)
-                for depth in range(1, self.MTP_DRAFT_LEN + 1)
+                for depth in range(1, draft_len + 1)
             ],
             boundary_steps=boundary_total,
             unpaired_steps=unpaired,
@@ -543,5 +549,5 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
         )
         assert abs(al_trt - al_ref) <= tol, (
             f"AL_trt {al_trt:.4f} vs AL_ref {al_ref:.4f}: |delta| {abs(al_trt - al_ref):.4f} > "
-            f"tol {tol:.4f} = (2 * {pooled['k1']} + {pooled['k2']} + 2 * {unpaired}) / {n}"
+            f"tol {tol:.4f} = ({weighted} + {draft_len} * {unpaired}) / {n}"
         )

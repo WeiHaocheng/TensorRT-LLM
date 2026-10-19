@@ -12,7 +12,8 @@ state that MTP-off decode reaches over the accepted tokens alone.
 Checked here bit for bit, on layer 0's real weights, through the target's own mixer code
 (`DecodeTarget._gdp` for a decode step, `PrefillTarget._gdp` for a mixed one) and the engine's
 own hybrid managers built with an MTP-Eagle config (`MambaHybridCacheManagerV2`, the default,
-and `CppMambaHybridCacheManager`), committing with the manager's `update_mamba_states`:
+and `CppMambaHybridCacheManager`), committing with the manager's `update_mamba_states`, at
+both draft lengths tp1 runs (D = 2, the checkpoint's trained depth, and D = 3):
 
 - every real row's committed recurrent and conv state equals the slot after `accepted` decode
   steps (T = 1 calls of the same mixer) over the same tokens, for every accepted count;
@@ -45,8 +46,8 @@ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 assert torch.cuda.is_available(), "the GDP mixer and the hybrid cache managers run on a CUDA device"
 
 _LAYER = 0  # a `linear_attention` block; every GDP mixer of the model is the same mixer
-_DRAFT = 2  # the checkpoint's trained depth
-_TOKENS = 1 + _DRAFT
+#: The draft lengths tp1 runs: the checkpoint's trained depth, and the repeated layer's next one.
+_DRAFTS = (2, 3)
 _MAX_BATCH = 8
 _PREFIX = f"model.language_model.layers.{_LAYER}."
 
@@ -106,10 +107,15 @@ def _targets(text_config):
     return decode, prefill
 
 
-@pytest.fixture(scope="module", params=["v2", "v1"])
+@pytest.fixture(
+    scope="module",
+    params=[(pool, draft) for draft in _DRAFTS for pool in ("v2", "v1")],
+    ids=lambda p: f"{p[0]}-draft{p[1]}",
+)
 def manager(request, checkpoint):
     """The engine's hybrid cache manager for this checkpoint, built as the engine builds the
-    trunk's under one-model MTP-Eagle (draft 2): per-position buffers for 1 + 2 tokens."""
+    trunk's under one-model MTP-Eagle at draft length D: per-position buffers for 1 + D tokens."""
+    pool, draft = request.param
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.pyexecutor._util import (
         _create_kv_cache_manager,
@@ -126,7 +132,7 @@ def manager(request, checkpoint):
         max_tokens=64 * 1024,
         enable_block_reuse=False,
         free_gpu_memory_fraction=0.05,
-        use_kv_cache_manager_v2=request.param == "v2",
+        use_kv_cache_manager_v2=pool == "v2",
     )
     manager = _create_kv_cache_manager(
         None,
@@ -136,7 +142,7 @@ def manager(request, checkpoint):
         tokens_per_block=32,
         max_seq_len=9344,
         max_batch_size=_MAX_BATCH,
-        spec_config=MTPDecodingConfig(max_draft_len=_DRAFT),
+        spec_config=MTPDecodingConfig(max_draft_len=draft),
         sparse_attention_config=None,
         max_num_tokens=8192,
         max_beam_width=1,
@@ -146,13 +152,19 @@ def manager(request, checkpoint):
         layer_mask=[True] * config.num_hidden_layers,
         max_cuda_graph_batch_size=_MAX_BATCH,
     )
-    assert manager.get_intermediate_ssm_states(_LAYER).shape[:2] == (_MAX_BATCH, _TOKENS)
+    assert manager.get_intermediate_ssm_states(_LAYER).shape[:2] == (_MAX_BATCH, 1 + draft)
+    assert manager.get_intermediate_conv_states(_LAYER).shape[:2] == (_MAX_BATCH, 1 + draft)
     yield manager
     manager.shutdown()
 
 
 def _pools(manager):
     return manager.get_ssm_states(_LAYER), manager.get_conv_states(_LAYER)
+
+
+def _tokens(manager) -> int:
+    """1 + D: the tokens a verify row carries, the positions the manager keeps per row."""
+    return manager.get_intermediate_ssm_states(_LAYER).shape[1]
 
 
 def _snapshot(manager) -> tuple[torch.Tensor, torch.Tensor]:
@@ -217,17 +229,17 @@ def _decode_reference(manager, decode, layer, x, slots, padded_slots, accepted):
     """MTP-off decode over the verify's tokens, one step per position, from the slots as they
     are now: each real row's state after its accepted tokens, and every step's output rows.
 
-    The states after one, two and three tokens differ pairwise in every row, recurrent and conv
+    The states after each number of tokens differ pairwise in every row, recurrent and conv
     state alike, so a commit from any position but the accepted one fails the comparison."""
-    num_real = len(slots)
+    num_real, tokens = len(slots), x.shape[1]
     after = []
     outs = []
-    for j in range(_TOKENS):
+    for j in range(tokens):
         outs.append(decode._gdp(x[:, j].contiguous(), layer.mixer, _step(manager, padded_slots)))
         after.append(_states(manager, slots))
     for b in range(num_real):
-        for i in range(_TOKENS):
-            for j in range(i + 1, _TOKENS):
+        for i in range(tokens):
+            for j in range(i + 1, tokens):
                 assert not torch.equal(after[i][0][b], after[j][0][b]), (b, i, j)
                 assert not torch.equal(after[i][1][b], after[j][1][b]), (b, i, j)
     taken = [(after[accepted[b] - 1][0][b], after[accepted[b] - 1][1][b]) for b in range(num_real)]
@@ -251,11 +263,17 @@ def _assert_states_equal(manager, slots, expected, what: str) -> None:
         assert torch.equal(conv[b], want_conv), f"{what}: row {b} conv state differs"
 
 
+#: Per T = 1 + D, the accepted counts of the 5 real rows in each of the two verify rounds: every
+#: count 1..T in each round.
+_ROUNDS = {3: ([3, 1, 2, 3, 1], [1, 2, 3, 2, 3]), 4: ([4, 1, 2, 3, 4], [1, 4, 3, 2, 4])}
+
+
 @torch.inference_mode()
 def test_verify_then_commit_equals_decode_over_the_accepted_tokens(manager, layer, text_config):
     """A padded CUDA-graph-shaped decode step, two verify rounds: 5 requests and 3 padding rows
-    (graph batch 8), T = 3, every accepted count 1..3 among the rows."""
+    (graph batch 8), T = 1 + D, every accepted count 1..T among the rows."""
     decode, _ = _targets(text_config)
+    tokens = _tokens(manager)
     g = torch.Generator(device="cuda").manual_seed(4404)
     num_slots = manager.get_ssm_states(_LAYER).shape[0]
     order = torch.randperm(num_slots, generator=torch.Generator().manual_seed(7)).tolist()
@@ -264,9 +282,9 @@ def test_verify_then_commit_equals_decode_over_the_accepted_tokens(manager, laye
     engine_slots = slots + [dummy] * 3
     _prime(manager, decode, layer, text_config, g, slots, steps=6)
 
-    for accepted in ([3, 1, 2, 3, 1], [1, 2, 3, 2, 3]):
+    for accepted in _ROUNDS[tokens]:
         start = _snapshot(manager)
-        x = _rows(layer, text_config, g, len(padded) * _TOKENS).view(len(padded), _TOKENS, -1)
+        x = _rows(layer, text_config, g, len(padded) * tokens).view(len(padded), tokens, -1)
 
         out = decode._gdp(x.reshape(-1, x.shape[-1]), layer.mixer, _step(manager, padded))
         assert _changed_slots(manager, start) == set(), "the verify wrote a state slot"
@@ -280,7 +298,7 @@ def test_verify_then_commit_equals_decode_over_the_accepted_tokens(manager, laye
         expected, ref_out = _decode_reference(manager, decode, layer, x, slots, padded, accepted)
         _restore(manager, committed)
         _assert_states_equal(manager, slots, expected, f"accepted {accepted}")
-        assert torch.equal(out.view(len(padded), _TOKENS, -1)[:5], ref_out[:5]), (
+        assert torch.equal(out.view(len(padded), tokens, -1)[:5], ref_out[:5]), (
             "the verify's output rows differ from the decode steps' rows"
         )
 
@@ -291,16 +309,17 @@ def test_mixed_step_commits_only_its_generation_rows(manager, layer, text_config
     row's tokens go through the prefill entries into its own slot; the generation rows verify
     from theirs, and the commit, offset past the context row, rolls them back exactly."""
     decode, prefill = _targets(text_config)
+    tokens = _tokens(manager)
     g = torch.Generator(device="cuda").manual_seed(3707)
     num_slots = manager.get_ssm_states(_LAYER).shape[0]
     order = torch.randperm(num_slots, generator=torch.Generator().manual_seed(11)).tolist()
     context_slot, slots = order[0], order[1:4]
     _prime(manager, decode, layer, text_config, g, slots, steps=4)
-    accepted = [2, 3, 1]
+    accepted = {3: [2, 3, 1], 4: [4, 1, 3]}[tokens]
 
     start = _snapshot(manager)
     context = _rows(layer, text_config, g, 37)
-    x = _rows(layer, text_config, g, len(slots) * _TOKENS).view(len(slots), _TOKENS, -1)
+    x = _rows(layer, text_config, g, len(slots) * tokens).view(len(slots), tokens, -1)
     starts = torch.tensor([0, 37], dtype=torch.int32, device="cuda")
     step = _step(
         manager,
@@ -326,6 +345,6 @@ def test_mixed_step_commits_only_its_generation_rows(manager, layer, text_config
     expected, ref_out = _decode_reference(manager, decode, layer, x, slots, slots, accepted)
     _restore(manager, committed)
     _assert_states_equal(manager, slots, expected, f"accepted {accepted} beside a context row")
-    assert torch.equal(out[37:].view(len(slots), _TOKENS, -1), ref_out), (
+    assert torch.equal(out[37:].view(len(slots), tokens, -1), ref_out), (
         "the verify's output rows differ from the decode steps' rows"
     )
