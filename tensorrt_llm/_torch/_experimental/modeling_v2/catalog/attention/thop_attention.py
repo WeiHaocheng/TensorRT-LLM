@@ -87,11 +87,11 @@ class ThopAttention(OpWrapper):
     # around 32 to 72, one CTA per KV range from 80 to 128, and a persistent
     # kernel from 192. The verify cells sit in each: B = 1, 16, 64, 128 and 512.
     # Its decode steps (one query token a request, at the CUDA-graph batch sizes
-    # 1, 2, 4, 8 to 128 by 8, then 192 to 1024 by 64) reach four of those
-    # families, measured at both head counts: the multi-CTA KV split up to 48
-    # requests, the same with a CTA cluster around 32 to 72, one CTA per KV range
-    # from 80 to 128, and the persistent kernel from 192. The decode cells sit in
-    # each: B = 1, 64, 128 and 1024.
+    # 1, 2, 4, 8 to 128 by 8, then 192 to 1024 by 64) run dense-mask kernels of
+    # four kinds, measured at both head counts: a multi-CTA KV split up to 24
+    # requests (and at 48), the same with a CTA cluster at 32, 40 and 56 to 72,
+    # one CTA per KV range from 80 to 128, and a persistent kernel from 192. The
+    # decode cells sit in each: B = 1, 64, 128 and 1024.
     # Its steps reach 16384 tokens per rank: a fresh 8192-token prompt beside
     # the largest decode or verify batch, or two fresh prompts in one step.
     CELLS: tuple[Cell, ...] = (
