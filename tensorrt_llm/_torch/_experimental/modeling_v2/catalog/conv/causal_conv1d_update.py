@@ -127,17 +127,14 @@ class CausalConv1dUpdate(OpWrapper):
     conv columns, `[batch, 16896, 1]` with row stride 18528, or a tp4 rank's `[batch, 4224, 1]`
     with row stride 4632; no bias; `conv_state_indices` with
     the padding rows at the end; both pool forms; one call captured in a CUDA graph and replayed
-    on new inputs, slots and states. Not certified, because no target here reaches it yet: T > 1
-    (an MTP verify step) runs the general kernel, whose states match T one-token steps bit for
-    bit but about 6e-6 of whose outputs were measured one ulp away from theirs -- a verify step
-    through this op does not reproduce decode bitwise. Nor are `state_len > W - 1`, a bias, SiLU
-    off, widths 2 and 3, or fp16 and fp32.
+    on new inputs, slots and states. Not certified, because no target here reaches it: T > 1
+    (an MTP verify step, which `causal_conv1d_verify` covers) runs the op's general kernel. Nor
+    are `state_len > W - 1`, a bias, SiLU off, widths 2 and 3, or fp16 and fp32.
 
     Rounding: the decode kernel sums the four taps as an fma chain from the bias, applies SiLU as
     `v * __frcp_rn(1 + __expf(-v))` in fp32 and rounds once -- the arithmetic of
     `causal_conv1d_fwd`'s kernels at the default `TRTLLM_CAUSAL_CONV1D_SILU_MODE`, a variable
-    that reaches the prefill kernels only. A token's output and state therefore do not depend on
-    whether it ran as a one-token context or as a decode row; the test pins that bitwise.
+    that reaches the prefill kernels only.
 
     The checkpoint's `Nemotron4GDPMixer` rounds the conv output to bf16 before its SiLU; this op
     rounds once. Measured over a dense grid of pre-activations on [-16, 16], HF's extra rounding

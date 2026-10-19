@@ -9,7 +9,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import gdp_recurrent
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_verify import gdp_verify as op
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
@@ -21,8 +20,6 @@ assert torch.cuda.is_available(), "gdp_verify requires a CUDA device"
 #: A v2 (`MambaHybridCacheManagerV2`) slot holds the ssm states of all 32 GDP
 #: layers back to back; the view under test is this one's.
 _V2_LAYERS, _V2_LAYER = 32, 13
-#: The head counts the cells certify: tp1's 24 and a tp4 rank's 6.
-HEADS = sorted({c.spec["heads"] for c in op.CELLS}, reverse=True)
 
 
 def _conv_dim(spec) -> int:
@@ -36,15 +33,6 @@ def _conv_state_floats(spec) -> int:
     """What a v1 (`CppMambaHybridCacheManager`) slot carries after a GDP layer's
     ssm state: its conv state, conv_dim x (kernel 4 - 1) bf16 values, in floats."""
     return _conv_dim(spec) * 3 * 2 // 4
-
-
-def _cell_spec(heads: int, batch: int, tokens: int):
-    """The spec of the cell at this head count, batch and token count."""
-    return next(
-        c.spec
-        for c in op.CELLS
-        if c.spec["heads"] == heads and c.spec["batch"] == batch and c.spec["tokens"] == tokens
-    )
 
 
 def _rows_view(proj: torch.Tensor, start: int, inner: tuple, tokens: int | None) -> torch.Tensor:
@@ -241,38 +229,6 @@ def _check(out, ref_out, ref_inter, args, pool_raw, pool_before, inter_raw, inte
     )
 
 
-def _decode_rows(x: torch.Tensor, t: int, spec) -> torch.Tensor:
-    """Token t of every request, as a decode step's target holds it: one in_proj row per
-    request, its row stride the in_proj width."""
-    batch, tokens = x.shape[:2]
-    proj = torch.full((batch, spec["proj_width"]), float("nan"), dtype=x.dtype, device=x.device)
-    start = x.storage_offset() % spec["proj_width"]
-    inner = tuple(x.shape[2:])
-    view = _rows_view(proj, start, inner, None)
-    view.copy_(x[:, t])
-    return view
-
-
-def _decode(args, spec):
-    """What MTP-off decode computes for the same tokens: T consecutive
-    `gdp_recurrent` calls, each advancing the request's state in place -- on
-    a dense copy of the requests' slots, since the verify's pool must stay as it
-    is -- each on the views a decode step's target passes (`_decode_rows`).
-    Returns (out `[B, T, H, V]`, the state after each token `[B, T, H, V, K]`)."""
-    slots = args["slots"]
-    pad = slots < 0
-    pool = args["state_pool"][torch.where(pad, 0, slots).long()].clone()
-    rows = torch.arange(slots.numel(), dtype=torch.int32, device=slots.device)
-    rows = torch.where(pad, PAD_SLOT_ID, rows).to(torch.int32)
-    outs, states = [], []
-    for t in range(args["q"].shape[1]):
-        step = {name: _decode_rows(args[name], t, spec) for name in ("q", "k", "v")}
-        step.update({name: args[name][:, t] for name in ("g", "beta")})
-        outs.append(gdp_recurrent(**step, state_pool=pool, slots=rows, scale=args["scale"]))
-        states.append(pool.clone())
-    return torch.stack(outs, 1), torch.stack(states, 1)
-
-
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
@@ -284,23 +240,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     assert out.shape == (spec["batch"], spec["tokens"], spec["heads"], spec["value_dim"])
     assert out.dtype == args["q"].dtype
     _check(out, ref_out, ref_inter, args, pool_raw, pool_before, inter_raw, inter_before)
-
-    # Bit for bit what MTP-off decode of the same tokens gives every real
-    # request: the snapshot the commit promotes is the state decode would have
-    # left in the slot. Not the padding rows: a decode call starts a padding
-    # row from zero and keeps nothing, so from the second token on its outputs
-    # come from another state than the verify carries -- discarded either way.
-    # Not where the request stride's divisibility by 16 differs from decode's
-    # row stride (`decode_bits`; `test_an_even_draft_at_a_tp4_rank_rounds_otherwise`).
-    del pool_before, inter_before
-    if not spec["decode_bits"]:
-        return
-    dec_out, dec_states = _decode(args, spec)
-    real = _real_rows(args["slots"])
-    assert torch.equal(out[real], dec_out[real]), "out differs from T gdp_recurrent calls"
-    assert torch.equal(args["intermediate"][real, : spec["tokens"]], dec_states[real]), (
-        "a snapshot differs from the state T gdp_recurrent calls leave"
-    )
 
 
 def test_cuda_graph_replays_verify_commit_verify() -> None:
@@ -340,61 +279,6 @@ def test_cuda_graph_replays_verify_commit_verify() -> None:
         accepted = torch.randint(1, tokens + 1, (n_real,), generator=g, device="cuda")
         rows = torch.arange(n_real, device="cuda")
         args["state_pool"][order.long()] = args["intermediate"][rows, accepted - 1]
-
-
-@pytest.mark.parametrize("heads", HEADS)
-def test_a_row_does_not_depend_on_its_batch(heads: int) -> None:
-    """Bit-identical output and snapshots for a request whether it runs alone,
-    in a batch of three or in the padded graph batch of 1024: a row's
-    arithmetic is fixed by the kernel's tile, never by the batch around it."""
-    spec = _cell_spec(heads, 1024, 3)
-    args, _, _ = _build(spec, seed=1024)
-    full_out = op(**args)
-    full_inter = args["intermediate"][: spec["batch"]].clone()
-    for rows in (slice(0, 1), slice(1, 4)):
-        sub = {name: args[name][rows] for name in ("q", "k", "v", "g", "beta", "slots")}
-        inter = torch.zeros_like(full_inter[rows])
-        out = op(**sub, state_pool=args["state_pool"], intermediate=inter, scale=args["scale"])
-        assert torch.equal(out, full_out[rows]), f"rows {rows}: out depends on the batch"
-        assert torch.equal(inter, full_inter[rows]), f"rows {rows}: snapshots depend on the batch"
-
-
-def test_an_even_draft_at_a_tp4_rank_rounds_otherwise() -> None:
-    """The stride condition of the note, at a tp4 rank's 6 heads (in_proj width 4632). With one
-    draft token a request's two tokens sit 9264 apart, a multiple of 16 where decode's row
-    stride 4632 is not, and the verify of a 64-request batch moves some output or snapshot off
-    decode's bits. The same tokens laid out one in_proj row further apart per request -- 13896,
-    a draft-2 request's stride -- give decode's bits again. If the first assertion fails, Triton
-    compiles the two strides alike and the condition in the note can go."""
-    spec = _cell_spec(6, 64, 2)
-    assert not spec["decode_bits"]
-    args, _, _ = _build(spec, seed=264)
-    real = _real_rows(args["slots"])
-    dec_out, dec_states = _decode(args, spec)
-    out = op(**args)
-    moved = not torch.equal(out[real], dec_out[real]) or not torch.equal(
-        args["intermediate"][real, :2], dec_states[real]
-    )
-    assert moved, "the hazard the note describes is gone: a draft-1 verify rounds as decode does"
-
-    batch, tokens, width = spec["batch"], spec["tokens"], spec["proj_width"]
-    gapped = torch.full(
-        (batch * (tokens + 1), width), float("nan"), dtype=torch.bfloat16, device="cuda"
-    )
-    spaced = {}
-    for name in ("q", "k", "v"):
-        x = args[name]
-        inner = tuple(x.shape[2:])
-        strides = [math.prod(inner[i + 1 :]) for i in range(len(inner))]
-        start = x.storage_offset() % width
-        spaced[name] = gapped.as_strided(
-            x.shape, ((tokens + 1) * width, width, *strides), gapped.storage_offset() + start
-        )
-        spaced[name].copy_(x)
-    intermediate = torch.zeros_like(args["intermediate"])
-    out = op(**dict(args, **spaced, intermediate=intermediate))
-    assert torch.equal(out[real], dec_out[real]), "spaced out, the outputs still move"
-    assert torch.equal(intermediate[real, :2], dec_states[real]), "spaced out, a state moves"
 
 
 def test_rows_may_share_a_slot() -> None:

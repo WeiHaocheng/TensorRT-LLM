@@ -25,7 +25,8 @@ constants stated in it:
 * routing on the checkpoint's own config (``...Routing``);
 * GSM8K, the accuracy anchor, with MTP off and on (``...Tp1``, ``...Dep4``,
   ``...Tp4``);
-* token identity with CUDA graphs on and off (``...Identity``, criterion A);
+* token identity with CUDA graphs on and off, parting only at a near-tie
+  (``...Identity``, criterion A);
 * MTP on against MTP off, parting only at a near-tie (``...MtpIdentity``,
   criterion B(1));
 * the MTP acceptance length against the checkpoint's own MTP layer
@@ -34,9 +35,9 @@ constants stated in it:
 The legs and checks the identity and acceptance gates share are the harnesses
 beside this file: ``_nemotron4_cuda_graph_identity.py``,
 ``_nemotron4_mtp_identity.py`` and ``_nemotron4_mtp_acceptance.py``. The MTP
-layer's module accuracy (criterion B(3)), the decode invariance the CUDA-graph
-identity gates rest on, and the verify's measured deviation from decode, which
-the MTP gates' bands rest on, are unit tests, under
+layer's module accuracy (criterion B(3)), the decode step's measured drift
+across batches and the verify's measured drift from decode, which the MTP gates'
+bands rest on, are unit tests, under
 tests/unittest/_torch/modeling_v2/models/nemotron4/.
 
 Every test here passes ``modeling_v2="require"`` to ``LLM``. TensorRT-LLM has no
@@ -606,6 +607,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Identity(_CudaGraphIdentity):
     # through most padded graph sizes below it.
     NUM_FILLERS = 54
 
+    # The near-tie band: the largest shift of a top gap between the CUDA-graph
+    # and eager legs at matched positions, measured by this gate over every
+    # compared request (982 requests, 31 graph sizes): 1.2334; plus a quarter,
+    # rounded up. Where the legs parted, the CUDA-graph leg emitted the eager
+    # leg's runner-up at margins of 0.0006 to 0.4656.
+    NEAR_TIE_BAND = 1.55
+
     def _one_token(self, prompts) -> list[_Request]:
         return [_Request("one_token", prompts[0].token_ids[:1], self.MAX_TOKENS)]
 
@@ -674,16 +682,16 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Identity(_CudaGraphIdentity):
 
     @skip_not_sm103
     def test_cuda_graph_identity(self, monkeypatch):
-        """Greedy tokens with CUDA graphs on equal those with CUDA graphs off.
+        """CUDA graphs on against off: greedy tokens part only at near-ties (NEAR_TIE_BAND).
 
         On the fixed prompt set (6 short prompts and 4 of ~8K tokens, 256
         tokens each) as one batch, each alone, and beside 54 shorter requests;
         on MAX_BATCH_SIZE requests at once, whose decode batch passes through
         every padded graph size; and a fresh one-token prompt on a state slot a
-        finished request left equals the same prompt in the fresh engine.
+        finished request left against the same prompt in the fresh engine.
 
         Each prompt's output in the batch is also compared with its output alone
-        and reported, not gated: prefill and mixed steps are not batch-invariant.
+        and reported, not gated.
         """
         self._check_identity(monkeypatch)
 
@@ -721,6 +729,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4Identity(_CudaGraphIdentity):
     # Requests per rank when the fixed prompts run with the fillers: every rank's
     # decode batch then shrinks from 64 rows through the padded graph sizes below.
     BATCH_ROWS_PER_RANK = 64
+
+    # The near-tie band: the largest shift of a top gap between the CUDA-graph
+    # and eager legs at matched positions, measured by this gate over every
+    # compared request (4380 requests, 33 graph sizes): 1.2859; plus a quarter,
+    # rounded up. Where the legs parted, the CUDA-graph leg emitted the eager
+    # leg's runner-up at margins of 0.0025 to 0.4656.
+    NEAR_TIE_BAND = 1.61
 
     def _ranks(self, prompts) -> dict[str, int]:
         """Where each fixed prompt runs: one long prompt per rank, the short ones dealt round-robin."""
@@ -836,18 +851,18 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4Identity(_CudaGraphIdentity):
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_cuda_graph_identity(self, monkeypatch):
-        """Greedy tokens with CUDA graphs on equal those with CUDA graphs off, on 4 ranks.
+        """CUDA graphs on against off, 4 ranks: tokens part only at near-ties (NEAR_TIE_BAND).
 
         On the fixed prompt set (6 short prompts and 4 of ~8K tokens, 256
         tokens each) spread over the ranks as one batch, each alone on its rank
         while the others idle, and beside short requests up to 64 a rank; on
         MAX_BATCH_SIZE requests on one rank at a time, whose decode batch passes
         through every padded graph size; and a fresh one-token prompt on every
-        rank, on a state slot a finished request left, equals the same prompt in
-        the fresh engine.
+        rank, on a state slot a finished request left, against the same prompt
+        in the fresh engine.
 
         Each prompt's output in the batch is also compared with its output alone
-        and reported, not gated: prefill and mixed steps are not batch-invariant.
+        and reported, not gated.
         """
         self._check_identity(monkeypatch)
 
@@ -859,9 +874,9 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4Identity(
 
     Tensor parallel over the 4 GPUs of one node, without attention DP: every
     rank runs every request, in the batches rank 0's executor schedules, and
-    the ranks meet in every block's all-reduce. A rank's decode step computes
-    each row from that row alone, all-reduces included, so tp1's calls, batch
-    check and reports carry over; only the saturation call changes.
+    the ranks meet in every block's all-reduce, which leaves every rank the same
+    bits. So tp1's calls, batch check and reports carry over; only the
+    saturation call and the band change.
     """
 
     PARALLEL = dict(tensor_parallel_size=4, moe_tensor_parallel_size=4)
@@ -876,6 +891,15 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4Identity(
     MAX_NUM_TOKENS = 8192 + 1024
     KV_FRACTION = 0.9
     AVG_SEQ_LEN = 9216
+
+    # The near-tie band: the largest shift of a top gap between the CUDA-graph
+    # and eager legs at matched positions, measured by this gate over every
+    # compared request (1110 requests, 33 graph sizes): 0.8244; plus a quarter,
+    # rounded up. Where the legs parted, the CUDA-graph leg emitted one of the
+    # eager leg's top tokens at 0.0026 to 0.1974 below its top-1. A rank attends
+    # with 4 of the 16 query heads and runs a quarter of every GEMM's width, so
+    # the band is tp4's own.
+    NEAR_TIE_BAND = 1.04
 
     def _saturations(self, prompts) -> dict[str, list[_Request]]:
         """Two long prompts, then MAX_BATCH_SIZE - 2 short requests: one call holding every slot.
@@ -917,7 +941,7 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4Identity(
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_cuda_graph_identity(self, monkeypatch):
-        """Greedy tokens with CUDA graphs on equal those with CUDA graphs off, on 4 ranks.
+        """CUDA graphs on against off, 4 ranks: tokens part only at near-ties (NEAR_TIE_BAND).
 
         tp1's calls (see its test), with MAX_BATCH_SIZE requests at once
         passing through all 33 padded graph sizes up to 1024.
@@ -928,13 +952,15 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4Identity(
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpIdentity(_MtpIdentity):
     """nemotron4-nano-preview (text model) / sm_103 / tp1: MTP-Eagle on against off."""
 
-    # How far tp1's verify can move a gap between MTP off's top-1 and another of
-    # its top tokens: the drift band of tp1's verify test
-    # (test_modeling_v2_verify_invariance.py, DRIFT_GAP_BAND), which follows each
-    # fixed prompt alone for the tokens this gate generates, MTP on along MTP
-    # off's own tokens, and measured at most 0.7819 over 6132 positions; plus a
-    # quarter.
-    NEAR_TIE_BAND = 0.98
+    # How far MTP on can move a gap between MTP off's top-1 and another of its
+    # top tokens: the verify's drift from decode -- tp1's verify test
+    # (test_modeling_v2_verify_invariance.py, the drift) follows each fixed
+    # prompt alone for the tokens this gate generates, MTP on along MTP off's
+    # own tokens, and measured a top-gap shift of at most 0.9300 over 6132
+    # positions -- plus the decode step's drift across batches, since a decode
+    # row now moves with the batch it runs in (test_modeling_v2_decode_invariance.py:
+    # at most 0.4664); plus a quarter, rounded up.
+    NEAR_TIE_BAND = 1.75
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
@@ -948,11 +974,9 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
 
     Alone, the prompt's rank runs it and the other three run the attention-DP
     dummy, a generation row of 1 + D tokens with MTP on and of one token with
-    it off. That changes only how many rows every routed MoE block gathers
-    from the other ranks, and the target gives a token the same bits whatever
-    those rows are: the expert window computes each row by itself, and the
-    reduce-scatter's order does not depend on the ranks' counts. What parts
-    the legs is the verify's attention, as on tp1, by up to NEAR_TIE_BAND.
+    it off, which changes how many rows every routed MoE block gathers from the
+    other ranks. What parts the legs is the verify against the decode step, as
+    on tp1, by up to NEAR_TIE_BAND.
     """
 
     pytestmark = pytest.mark.skip_less_device(4)
@@ -970,13 +994,16 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
     CHUNKED_PREFILL = True
     BATCH_MAX_NUM_TOKENS = 2048
 
-    # How far dep4's verify can move a gap between MTP off's top-1 and another
-    # of its top tokens: the drift band of dep4's verify test
-    # (test_modeling_v2_dep4_verify_invariance.py, DRIFT_GAP_BAND in its job),
-    # which follows each fixed prompt alone on its rank for the tokens this gate
-    # generates, MTP on along MTP off's own tokens, and measured at most 0.7819
-    # over 6132 positions; plus a quarter.
-    NEAR_TIE_BAND = 0.98
+    # How far MTP on can move a gap between MTP off's top-1 and another of its
+    # top tokens: the verify's drift from decode -- dep4's verify test
+    # (test_modeling_v2_dep4_verify_invariance.py, the drift in its job) follows
+    # each fixed prompt alone on its rank for the tokens this gate generates, MTP
+    # on along MTP off's own tokens, and measured a top-gap shift of at most
+    # 0.9300 over 6132 positions -- plus the decode step's drift across batches,
+    # since a decode row moves with the batch it runs in and the load on the
+    # other ranks (test_modeling_v2_dep4_decode_invariance.py: at most 0.2512);
+    # plus a quarter, rounded up.
+    NEAR_TIE_BAND = 1.48
 
     def _ranks(self, prompts) -> dict[str, int]:
         """One long prompt per rank, the short ones dealt round-robin."""
@@ -1006,13 +1033,9 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpIdentity(_MtpIdentity):
     rank runs every request, in the steps rank 0's executor schedules, on its
     quarter of the mixers' heads and of every MLP's and routed expert's
     intermediate width, the MTP layer's included, and the ranks meet in every
-    block's all-reduce. Every rank forms the same logits: the all-reduce sums a
-    token's four partials by one formula whatever the step's row count, and the
-    GDP verify reads a request's tokens 3 x 4632 elements apart at the draft
-    length here, which like the decode step's 4632 is not a multiple of 16, so
-    its kernel rounds as the decode kernel does. What parts the legs is the
-    verify's attention, as on tp1, by up to NEAR_TIE_BAND. So tp1's legs, checks
-    and reports carry over unchanged.
+    block's all-reduce, so every rank forms the same logits. What parts the
+    legs is the verify against the decode step, as on tp1, by up to
+    NEAR_TIE_BAND. So tp1's legs, checks and reports carry over unchanged.
     """
 
     pytestmark = pytest.mark.skip_less_device(4)
@@ -1022,14 +1045,17 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpIdentity(_MtpIdentity):
     # intermediate width split four ways.
     PARALLEL = dict(tensor_parallel_size=4, moe_tensor_parallel_size=4)
 
-    # How far tp4's verify can move a gap between MTP off's top-1 and another of
-    # its top tokens: the drift band of tp4's verify test
-    # (test_modeling_v2_tp4_verify_invariance.py, DRIFT_GAP_BAND in its job),
-    # which follows each fixed prompt alone for the tokens this gate generates,
-    # MTP on along MTP off's own tokens, and measured at most 1.2381 over 6132
-    # positions; plus a quarter. A rank attends with 4 of the 16 query heads, so
+    # How far MTP on can move a gap between MTP off's top-1 and another of its
+    # top tokens: the verify's drift from decode -- tp4's verify test
+    # (test_modeling_v2_tp4_verify_invariance.py, the drift in its job) follows
+    # each fixed prompt alone for the tokens this gate generates, MTP on along
+    # MTP off's own tokens, and measured a top-gap shift of at most 1.6112 over
+    # 6132 positions -- plus the decode step's drift across batches, since a
+    # decode row moves with the batch it runs in
+    # (test_modeling_v2_tp4_decode_invariance.py: at most 0.3229); plus a
+    # quarter, rounded up. A rank attends with 4 of the 16 query heads, so
     # thop_attention runs other kernels than on tp1, and the band is tp4's own.
-    NEAR_TIE_BAND = 1.55
+    NEAR_TIE_BAND = 2.42
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
@@ -1048,12 +1074,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
     # larger of its two logit bands; the decode-step one is 1.25), because here
     # the target's MTP layer reads the target trunk's hidden states and the
     # reference's reads its own, at prefill rows and decode rows alike. The trunk
-    # band gains the verify's measured term, 5.0471: with MTP on the trunk
-    # verifies through thop_attention, whose logits drift from the decode steps'
-    # by up to that much along the same tokens (test_modeling_v2_verify_invariance.py,
-    # the drift over 6132 positions of the fixed prompts).
+    # band gains two measured terms: the verify's drift from decode along the
+    # same tokens, 4.3650 (test_modeling_v2_verify_invariance.py, the drift over
+    # 6132 positions of the fixed prompts), and the decode step's drift across
+    # batches, 1.1193 (test_modeling_v2_decode_invariance.py), since decode and
+    # verify rows move with the batch they run in.
     MTP_LOGIT_ERROR = (2.6806, 2.4847)
-    TRUNK_LOGIT_BAND = 2.0 + 5.0471
+    TRUNK_LOGIT_BAND = 2.0 + 4.3650 + 1.1193
 
     @skip_not_sm103
     def test_mtp2_acceptance_matches_reference(self, monkeypatch):
@@ -1097,12 +1124,14 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_MtpAcceptance):
     # 2.8998 and 4.5655, the gain rank 3's), plus the band on the target trunk's
     # logits against the reference's: dep4's trunk passes check_goldens_dep4.py
     # with tp1's bands, whose free-running logits band is 2.0. The trunk band
-    # gains the verify's measured term, 4.5999: with MTP on the trunk verifies
-    # through thop_attention, whose logits drift from the decode steps' by up to
-    # that much along the same tokens (test_modeling_v2_dep4_verify_invariance.py,
-    # the drift over 6132 positions of the fixed prompts).
+    # gains two measured terms: the verify's drift from decode along the same
+    # tokens, 4.0192 (test_modeling_v2_dep4_verify_invariance.py, the drift over
+    # 6132 positions of the fixed prompts), and the decode step's drift across
+    # batches and the other ranks' load, 0.8574
+    # (test_modeling_v2_dep4_decode_invariance.py), since decode and verify rows
+    # move with the batch they run in.
     MTP_LOGIT_ERROR = (2.6806, 4.5655)
-    TRUNK_LOGIT_BAND = 2.0 + 4.5999
+    TRUNK_LOGIT_BAND = 2.0 + 4.0192 + 0.8574
 
     def _ranks(self, prompts) -> dict[str, int]:
         """One long prompt per rank, the short ones dealt round-robin.
@@ -1196,13 +1225,14 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpAcceptance(_MtpAcceptance):
     # on the target trunk's logits against the reference's: tp4's trunk passes
     # check_goldens_tp4.py at tp1's free-running logits band, 2.0, plus its
     # measured tensor-parallel term, 1.1922 (tp4 against tp1 on the same
-    # prompts, largest on an ~8K prompt), plus the verify's measured term,
-    # 3.4226: with MTP on the trunk verifies through thop_attention, whose logits
-    # drift from the decode steps' by up to that much along the same tokens
+    # prompts, largest on an ~8K prompt). The trunk band gains two measured
+    # terms: the verify's drift from decode along the same tokens, 1.6811
     # (test_modeling_v2_tp4_verify_invariance.py, the drift over 6132 positions
-    # of the fixed prompts).
+    # of the fixed prompts), and the decode step's drift across batches, 0.6593
+    # (test_modeling_v2_tp4_decode_invariance.py), since decode and verify rows
+    # move with the batch they run in.
     MTP_LOGIT_ERROR = (2.7225, 2.4717)
-    TRUNK_LOGIT_BAND = 3.1922 + 3.4226
+    TRUNK_LOGIT_BAND = 3.1922 + 1.6811 + 0.6593
 
     def _engine_al(
         self, stats: list[dict], walks: dict[str, list[tuple[int, int]]], ranks: dict[str, int]

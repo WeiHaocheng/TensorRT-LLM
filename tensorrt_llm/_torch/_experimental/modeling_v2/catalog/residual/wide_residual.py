@@ -149,8 +149,7 @@ class WideResidual(OpWrapper):
 
     The streams come back bit-identical to the checkpoint's torch ops. The normed reads differ from
     them only where the fp32 variance, summed in another order, moves a value across a bf16
-    rounding boundary. A row's outputs do not depend on the rest of the call, bit for bit, and a
-    captured CUDA graph replays the eager call bit for bit.
+    rounding boundary. A captured CUDA graph replays the eager call bit for bit.
     """
 
     ARCHS = frozenset({Arch.SM_103})

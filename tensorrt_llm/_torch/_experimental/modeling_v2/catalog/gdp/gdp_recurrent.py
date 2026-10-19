@@ -310,16 +310,12 @@ class GdpRecurrent(OpWrapper):
     so a request that reaches a decode row without a prefill (a one-token
     prompt promoted into a graph batch) needs its slot zeroed first.
 
-    A row's result does not depend on the batch it runs in: one tile shape
-    and one reduction order for every batch size, so the same request gets the
-    same bits in a padded graph batch and in an eager one -- as long as the
-    batch's strides agree on being multiples of 16. Triton specializes the
-    kernel on that, and its variants round the reductions differently. A
-    one-row `x[:, cols].view(1, ...)` takes the inner block's size as its row
-    stride where a larger batch keeps the in_proj width: at tp1's 18528 both
-    are multiples of 16, but a tp4 rank's 4632 is not, and a request alone
-    then moves about a quarter of its state elements against the same request
-    in a batch. Pass views whose row stride is the in_proj width at every batch
+    Strides: Triton specializes the kernel on each stride's divisibility by
+    16, and the cells drive views whose row stride is the in_proj width at
+    every batch size. A one-row `x[:, cols].view(1, ...)` takes the inner
+    block's size as its row stride instead: at tp1's 18528 both are multiples
+    of 16, but at a tp4 rank's 4632 a request alone would run a variant no cell
+    drives. Pass views whose row stride is the in_proj width at every batch
     size (`as_strided`).
 
     Certified head counts: 24 (tp1) and 6 (a tp4 rank), each with its own

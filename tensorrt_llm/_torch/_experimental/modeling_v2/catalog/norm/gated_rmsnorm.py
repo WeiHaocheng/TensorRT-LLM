@@ -75,9 +75,8 @@ class GatedRmsnorm(OpWrapper):
     multi-row kernel), LayerNorm, the sigmoid gate, a bias, fp8 output, a delta-form weight, other
     group sizes, an explicit `out`.
 
-    A row is computed from its own inputs only, by one compiled kernel whatever the row count:
-    its result does not depend on the batch it runs in. A packed copy of the gate gives the same
-    bits as the in_proj slice. The test pins both bitwise.
+    A packed copy of the gate gives the same bits as the in_proj slice: the test pins it bitwise,
+    so the strided read of the gate is the dense one.
     """
 
     def __call__(

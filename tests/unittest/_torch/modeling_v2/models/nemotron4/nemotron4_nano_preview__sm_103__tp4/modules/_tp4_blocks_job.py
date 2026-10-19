@@ -580,13 +580,11 @@ class Observer:
     output).
 
     Attribution: a GEMM by the target parameter it multiplies (`cublas_mm`'s `mat_b`, a `.t()`
-    view of it; `invariant_mm`'s `weight`, the parameter as stored, which the decode target
-    passes for the GDP in_proj, the router and `fc1_latent_proj`); an all-reduce by the tagged
-    GEMM that produced its input -- the last GEMM call before it, so an untagged GEMM clears the
-    tag; `noaux_tc_op` and `latent_moe_experts` by the router and `fc1_latent_proj` GEMMs that
-    feed them; `flashinfer_rmsnorm` by its weight; a `wide_residual` call by the retention it
-    writes with and the read factors it reads with; an attention call (`thop_attention`, or
-    `invariant_gen_attention` in decode) by its KV layer.
+    view of it); an all-reduce by the tagged GEMM that produced its input -- the last GEMM call
+    before it, so an untagged GEMM clears the tag; `noaux_tc_op` and `latent_moe_experts` by the
+    router and `fc1_latent_proj` GEMMs that feed them; `flashinfer_rmsnorm` by its weight; a
+    `wide_residual` call by the retention it writes with and the read factors it reads with; an
+    attention call (`thop_attention`) by its KV layer.
     """
 
     def __init__(self, module, model, manager, layers: dict, config):
@@ -596,9 +594,7 @@ class Observer:
             for name in (
                 "wide_residual",
                 "cublas_mm",
-                "invariant_mm",
                 "thop_attention",
-                "invariant_gen_attention",
                 "allreduce",
                 "noaux_tc_op",
                 "latent_moe_experts",
@@ -683,11 +679,6 @@ class Observer:
         self._gemm(mat_a, mat_b, out)
         return out
 
-    def invariant_mm(self, x, weight, *args, **kwargs):
-        out = self.orig["invariant_mm"](x, weight, *args, **kwargs)
-        self._gemm(x, weight, out)
-        return out
-
     def allreduce(self, input, comm_buffer, buffer_flags):
         out = self.orig["allreduce"](input, comm_buffer, buffer_flags)
         if self.last is not None:
@@ -696,18 +687,12 @@ class Observer:
         self.last = None
         return out
 
-    def _attention(self, name, kwargs):
-        out = self.orig[name](**kwargs)
+    def thop_attention(self, **kwargs):
+        out = self.orig["thop_attention"](**kwargs)
         i = self.layer_of_kv.get(kwargs["local_layer_idx"])
         if i is not None:
             self.record[i]["attention"] = out.clone()
         return out
-
-    def thop_attention(self, **kwargs):
-        return self._attention("thop_attention", kwargs)
-
-    def invariant_gen_attention(self, **kwargs):
-        return self._attention("invariant_gen_attention", kwargs)
 
     def noaux_tc_op(self, router_logits, bias, *args):
         weights, ids = self.orig["noaux_tc_op"](router_logits, bias, *args)

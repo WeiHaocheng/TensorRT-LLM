@@ -169,7 +169,7 @@ exercised:
    32-token pages, histories up to 9344), as cells of stated batches on the
    paged-context path that an engine with chunked prefill takes for every
    step: an 8192-token prefill, a 2048-token chunk on 6144 cached tokens,
-   mixed steps, decode at B = 1, 64 and 1024, and MTP verify steps (3 query
+   mixed steps, decode at B = 1, 64, 128 and 1024, and MTP verify steps (3 query
    tokens per request, linear spec-dec off as sm_103 runs it) at B = 1, 16,
    64, 128 and 512, alone and beside contexts; and the same cells at a tp4
    rank's 4 query heads over the replicated KV head (4q/1kv d256). Histories are

@@ -184,17 +184,12 @@ def _speculation_declined(spec_config: Optional[Any], topology: Optional[str]) -
             )
         return f"{schedule} changes the draft length per step, and {why}"
     if spec_config.max_draft_len != _DRAFT_LEN:
-        why = (
-            f"the target runs {_DRAFT_LEN} drafts, the checkpoint's trained depth, which is the "
-            "length its gates certify"
+        return (
+            f"max_draft_len={spec_config.max_draft_len}: the target runs {_DRAFT_LEN} drafts, "
+            "the checkpoint's trained depth, which is the length its gates certify and the "
+            f"one verify length thop_attention's cells cover ({1 + _DRAFT_LEN} query tokens a "
+            "request)"
         )
-        if topology == "tp4":
-            why += (
-                "; on a tp4 rank it is also the one certified length whose GDP verify gives "
-                "decode's bits (gdp_verify: a request's stride, (1 + max_draft_len) x 4632, "
-                "must not be a multiple of 16, as decode's 4632 is not)"
-            )
-        return f"max_draft_len={spec_config.max_draft_len}: {why}"
     return None
 
 

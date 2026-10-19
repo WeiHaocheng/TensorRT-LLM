@@ -572,7 +572,7 @@ def _experts(
     tiles: tuple | None,
 ) -> torch.Tensor:
     """The routed experts by one path: the fused Triton GEMMs with `tiles` = (BLOCK_M, up tile,
-    down tile), or the grouped-GEMM path when `tiles` is None. Both give every row the same bits."""
+    down tile), or the grouped-GEMM path when `tiles` is None."""
     num_tokens, top_k = topk_ids.shape
     latent, intermediate = x.shape[1], up_proj.shape[1]
     w = topk_weights.reshape(-1)
@@ -697,8 +697,7 @@ class LatentMoeExperts(OpWrapper):
     `torch._grouped_mm` for up_proj, a Triton pass applying the activation and the routing
     weight in place, and `torch._grouped_mm` for down_proj. Either way a Triton pass then sums
     each token's rows in fp32. The paths round at the same points and accumulate every GEMM
-    output over K in fp32 in the same order, so a row has the same bits whichever path computed
-    it.
+    output over K in fp32.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -772,15 +771,9 @@ class LatentMoeExperts(OpWrapper):
     The grouped GEMMs accumulate in fp32 in another order than cuBLAS does for the checkpoint's
     `F.linear`, so neither this entry nor the checkpoint's loop is bitwise the fp32-GEMM
     reference; measured on every cell, both sit the same distance from it. The activation is
-    bit-exact against the checkpoint's torch ops on every finite bf16 input. A row's result does
-    not depend on the rest of the batch (bitwise), and a captured CUDA graph replays it bitwise.
-
-    The two paths' bit-identity rests on Triton's `tl.dot` and `torch._grouped_mm` accumulating
-    each output element over K in the same steps, in ascending order -- which neither promises.
-    It is measured on every cell the fused path takes and at every row of `_FUSED_TILES`, and a
-    row computed alone and inside a batch on the other path is compared bitwise; a change in
-    either kernel library shows up there, as a failing test, rather than as rows whose bits
-    depend on their batch.
+    bit-exact against the checkpoint's torch ops on every finite bf16 input, and a captured CUDA
+    graph replays the eager call bitwise. Every row of `_FUSED_TILES` is held to the band at
+    batch sizes the cells do not sample.
 
     Memory per call, at T tokens: the down-projection output [T*10, 768] bf16 and the
     intermediate [T*10, 4096] bf16, plus the gathered x [T*10, 768] on the grouped-GEMM path --

@@ -132,25 +132,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 
 @pytest.mark.parametrize("num_heads", HEADS)
-def test_rows_do_not_depend_on_the_batch(num_heads: int) -> None:
-    """A row comes out the same bits whatever batch it runs in.
-
-    CUDA-graph padding changes a decode step's row count, and an MTP verify step normalizes
-    three rows per request where a step without drafts normalizes one. The identity criteria
-    compare runs that differ in exactly that way, so this pins it bitwise on slices of each
-    width's largest cell.
-    """
-    _, kwargs = _build(_cell_spec(num_heads, 16384), seed=7)
-    full = op(**kwargs)
-    for begin, end in ((0, 1), (7, 10), (100, 1124), (5000, 13192), (16383, 16384)):
-        part = op(**dict(kwargs, x=kwargs["x"][begin:end], z=kwargs["z"][begin:end]))
-        assert torch.equal(part, full[begin:end]), (
-            f"rows [{begin}:{end}] alone differ from the same rows of a 16384-row call"
-        )
-    assert torch.equal(op(**kwargs), full), "two identical calls differ"
-
-
-@pytest.mark.parametrize("num_heads", HEADS)
 def test_a_packed_gate_gives_the_same_bits(num_heads: int) -> None:
     """The gate's row stride is only an address: a packed copy of the in_proj slice gives the
     same bits, so a target may pass either."""

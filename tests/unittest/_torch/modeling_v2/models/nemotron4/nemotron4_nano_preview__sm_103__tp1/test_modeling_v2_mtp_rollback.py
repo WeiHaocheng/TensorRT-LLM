@@ -9,19 +9,18 @@ engine's worker commits the last accepted token's state into the slot
 (`update_mamba_states`). A rejected draft must leave no trace: the committed slot has to be the
 state that MTP-off decode reaches over the accepted tokens alone.
 
-Checked here bit for bit, on layer 0's real weights, through the target's own mixer code
-(`DecodeTarget._gdp` for a decode step, `PrefillTarget._gdp` for a mixed one) and the engine's
-own hybrid managers built with an MTP-Eagle config (`MambaHybridCacheManagerV2`, the default,
-and `CppMambaHybridCacheManager`), committing with the manager's `update_mamba_states`:
+Checked here on layer 0's real weights, through the target's own mixer code (`DecodeTarget._gdp`
+for a decode step, `PrefillTarget._gdp` for a mixed one) and the engine's own hybrid managers
+built with an MTP-Eagle config (`MambaHybridCacheManagerV2`, the default, and
+`CppMambaHybridCacheManager`), committing with the manager's `update_mamba_states`:
 
-- every real row's committed recurrent and conv state equals the slot after `accepted` decode
-  steps (T = 1 calls of the same mixer) over the same tokens, for every accepted count;
+- every real row's committed recurrent and conv state is the slot after `accepted` decode steps
+  (T = 1 calls of the same mixer) over the same tokens, for every accepted count, within
+  `STATE_BAND` -- far below what one token moves the state, which the comparison checks;
 - the verify writes no slot; the commit writes the real rows' slots and the padding dummy's
   (whose stale snapshot it copies, harmlessly), and nothing else;
 - a second verify from the committed slots still matches decode continued from them;
-- the mixer's output rows of the verify equal the decode steps' rows: in_proj, out_proj and
-  the gates are row-invariant at these row counts, and the verify entries are bitwise with
-  the decode entries.
+- the mixer's output rows of the verify match the decode steps' rows within `OUT_ULP`.
 """
 
 import json
@@ -42,6 +41,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_na
 )
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
+__extra_import_path__ = ["../../.."]
+from _validating import ULP, assert_within_ulp  # noqa: E402 -- needs the path declared above
+
 assert torch.cuda.is_available(), "the GDP mixer and the hybrid cache managers run on a CUDA device"
 
 _LAYER = 0  # a `linear_attention` block; every GDP mixer of the model is the same mixer
@@ -49,6 +51,20 @@ _DRAFT = 2  # the checkpoint's trained depth
 _TOKENS = 1 + _DRAFT
 _MAX_BATCH = 8
 _PREFIX = f"model.language_model.layers.{_LAYER}."
+
+# The verify and the decode steps run the same tokens through other kernels: the in_proj and
+# out_proj GEMMs at 3 times the rows, the GDP and conv verify entries against the decode ones.
+# The GEMMs may round a row's inputs a bf16 step apart, and each recurrence entry keeps its fp32
+# state within a few fp32 ulps of the same reference (`gdp_verify` and `gdp_recurrent` tests).
+#: max |committed - decode| / max |decode| per row and state: two bf16 steps of the row scale.
+STATE_BAND = 2.0**-7
+#: The mixer's output rows, verify against decode, in bf16 ulp of the row scale (element, RMS):
+#: each GDP entry within 2 ulp of the reference and out_proj's cuBLAS cell band (4 / 2) on top,
+#: doubled for the two sides.
+OUT_ULP = (12.0, 6.0)
+#: A commit from another position moves every row's recurrent state by at least this share of
+#: its max |state|: the comparison has teeth at STATE_BAND.
+STATE_TEETH = 4 * STATE_BAND
 
 
 def _checkpoint_or_skip() -> str:
@@ -228,8 +244,8 @@ def _decode_reference(manager, decode, layer, x, slots, padded_slots, accepted):
     for b in range(num_real):
         for i in range(_TOKENS):
             for j in range(i + 1, _TOKENS):
-                assert not torch.equal(after[i][0][b], after[j][0][b]), (b, i, j)
-                assert not torch.equal(after[i][1][b], after[j][1][b]), (b, i, j)
+                assert _relative(after[i][0][b], after[j][0][b]) > STATE_TEETH, (b, i, j)
+                assert _relative(after[i][1][b], after[j][1][b]) > STATE_TEETH, (b, i, j)
     taken = [(after[accepted[b] - 1][0][b], after[accepted[b] - 1][1][b]) for b in range(num_real)]
     return taken, torch.stack(outs, dim=1)
 
@@ -244,11 +260,24 @@ def _commit(manager, num_contexts: int, accepted: list[int], engine_slots: list[
     )
 
 
-def _assert_states_equal(manager, slots, expected, what: str) -> None:
+def _relative(got: torch.Tensor, ref: torch.Tensor) -> float:
+    """max |got - ref| / max |ref|."""
+    ref = ref.float()
+    return float((got.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-30))
+
+
+def _assert_states_close(manager, slots, expected, what: str) -> None:
     ssm, conv = _states(manager, slots)
     for b, (want_ssm, want_conv) in enumerate(expected):
-        assert torch.equal(ssm[b], want_ssm), f"{what}: row {b} recurrent state differs"
-        assert torch.equal(conv[b], want_conv), f"{what}: row {b} conv state differs"
+        for name, got, want in (("recurrent", ssm[b], want_ssm), ("conv", conv[b], want_conv)):
+            deviation = _relative(got, want)
+            assert deviation <= STATE_BAND, (
+                f"{what}: row {b} {name} state {deviation:.3g} of max |decode| from decode's"
+            )
+
+
+def _assert_rows_close(out: torch.Tensor, ref: torch.Tensor, what: str) -> None:
+    assert_within_ulp(out, ref, element_ulp=OUT_ULP[0], rms_ulp=OUT_ULP[1], ulp=ULP[torch.bfloat16])
 
 
 @torch.inference_mode()
@@ -279,10 +308,8 @@ def test_verify_then_commit_equals_decode_over_the_accepted_tokens(manager, laye
         _restore(manager, start)
         expected, ref_out = _decode_reference(manager, decode, layer, x, slots, padded, accepted)
         _restore(manager, committed)
-        _assert_states_equal(manager, slots, expected, f"accepted {accepted}")
-        assert torch.equal(out.view(len(padded), _TOKENS, -1)[:5], ref_out[:5]), (
-            "the verify's output rows differ from the decode steps' rows"
-        )
+        _assert_states_close(manager, slots, expected, f"accepted {accepted}")
+        _assert_rows_close(out.view(len(padded), _TOKENS, -1)[:5], ref_out[:5], "verify rows")
 
 
 @torch.inference_mode()
@@ -325,7 +352,5 @@ def test_mixed_step_commits_only_its_generation_rows(manager, layer, text_config
     _restore(manager, start)
     expected, ref_out = _decode_reference(manager, decode, layer, x, slots, slots, accepted)
     _restore(manager, committed)
-    _assert_states_equal(manager, slots, expected, f"accepted {accepted} beside a context row")
-    assert torch.equal(out[37:].view(len(slots), _TOKENS, -1), ref_out), (
-        "the verify's output rows differ from the decode steps' rows"
-    )
+    _assert_states_close(manager, slots, expected, f"accepted {accepted} beside a context row")
+    _assert_rows_close(out[37:].view(len(slots), _TOKENS, -1), ref_out, "verify rows")

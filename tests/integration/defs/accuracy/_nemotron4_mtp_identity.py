@@ -23,19 +23,20 @@ token the verify step itself picks, so with MTP on the engine emits the greedy
 text of its verify steps, and the recurrent and conv state a verify leaves
 behind is the state after its last accepted token: the engine's commit promotes
 the per-position GDP and conv state of that token, which rolls back the
-rejected drafts. A verify runs the decode step's row-invariant GEMMs and GDP and
-conv entries over 1 + D tokens per request, but attends through
-``thop_attention``'s generation kernels where a decode step attends through
-``invariant_gen_attention``. The two sum the softmax in other orders, so a
-verify token's logits sit near the MTP-off decode step's rather than on them,
-and MTP on can part from MTP off where MTP off's choice is nearly tied.
+rejected drafts. A verify runs the decode step's kernels -- cuBLAS for every
+GEMM, ``thop_attention``'s generation kernels -- over 1 + D tokens per request,
+with the GDP and conv verify entries; at 1 + D times the rows and tokens a row,
+cuBLAS and thop pick other kernels, so a verify token's logits sit near the
+MTP-off decode step's rather than on them, and MTP on can part from MTP off
+where MTP off's choice is nearly tied.
 
 So the gate is the near-tie rule. Each prompt is compared up to its first
 parting. A parting passes when the token MTP on emitted there is within the
 target's band (``NEAR_TIE_BAND``) of MTP off's top-1 -- the runner-up at a
 top-1 / top-2 margin within the band, or a lower rank where several
-candidates are that close. The band is the verify's measured deviation from
-decode, stated in each target's class with its derivation. A parting farther
+candidates are that close. The band is derived from the verify's measured drift
+from decode and the decode step's drift across batches, stated in each target's
+class with its derivation. A parting farther
 off fails: a rollback that keeps a rejected draft's state, or a verify that
 reads the wrong keys, moves a token wherever it lands. Every parting is
 reported with its margin and the tokens on both sides.
@@ -52,7 +53,7 @@ A batched run of the same prompts is reported, not gated. In a batch, a
 prefill step carries the generation rows of the requests already running, and
 with MTP each of them is 1 + D tokens: the step's GEMMs run at another row
 count, and a verify row inside such a mixed step runs the prefill path's
-kernels. Prefill and mixed steps are not batch-invariant, and MTP can also
+kernels. Every step's rows move with their batch, and MTP can also
 change which requests share a step (a verify row takes 1 + D tokens of the
 step's budget), so the two legs can part where the MTP-off logits are nearly
 tied. Each parting is classified: it is a near-tie when the token MTP on

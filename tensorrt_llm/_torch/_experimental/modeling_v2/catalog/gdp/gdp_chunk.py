@@ -41,9 +41,7 @@ def _jit(kernel):
 _FWD_H = _jit(chunk_gated_delta_rule_fwd_kernel_h_blockdim64)
 
 #: Every stage's launch config, fixed: the fastest of each kernel's configs at the
-#: 8K prefill, timed again at 2K, 16K and multi-sequence batches. Each rounds
-#: exactly as the vendored wrapper's constants do -- `fwd_h`'s configs all round
-#: alike -- which the test pins by comparing the call with the wrappers bitwise.
+#: 8K prefill, timed again at 2K, 16K and multi-sequence batches.
 _CONFIG = dict(
     cumsum=dict(num_warps=1),
     kkt=dict(BK=64, num_warps=2, num_stages=3),
@@ -783,12 +781,9 @@ class GdpChunk(OpWrapper):
 
     One config per stage, no autotuning: every launch config is fixed, chosen by
     timing at this op's shapes, so two processes compute the same bits (the test
-    runs two). Each stage's config rounds exactly as its wrapper's constants do,
-    and the whole call is bit-identical to the vendored stages with the vendored
-    output kernel `chunk_fwd_kernel_o` at the config its autotuner picks for the
-    8K prefill (that kernel's configs round two ways). `_last_step_o_kernel`
-    computes only the rows the mixer keeps, a token's last sub-step, with that
-    kernel's arithmetic.
+    runs two). `_last_step_o_kernel` computes only the rows the mixer keeps, a
+    token's last sub-step, with the vendored output kernel `chunk_fwd_kernel_o`'s
+    arithmetic.
 
     Certified head counts: 24 (tp1) and 6 (a tp4 rank). Uncertified: any other
     head count, head dims or Householder count, a bf16 state pool, query/key

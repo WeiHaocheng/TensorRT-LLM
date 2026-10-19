@@ -1,21 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test: an MTP verify step of the nemotron4 dep4 target's GDP mixer rolls back exactly, on
-every rank of one node.
+"""GPU test: an MTP verify step of the nemotron4 dep4 target's GDP mixer rolls back to the accepted
+tokens, on every rank of one node.
 
 Under one-model MTP-Eagle a generation row carries its last token and D drafts. The target's GDP
 mixer runs the row's 1 + D tokens from its state slot without writing it, and stores the state
 after every token in the hybrid cache manager's per-position buffers; after acceptance the
 engine's worker commits the last accepted token's state into the slot (`update_mamba_states`). A
 rejected draft must leave no trace: the committed slot has to be the state MTP-off decode reaches
-over the accepted tokens alone. Under attention DP every rank has its own manager -- one holding
-the trunk's state and KV and the MTP layer's KV -- and an idle rank verifies the attention-DP dummy,
-whose drafts the commit promotes into the dummy's own slot.
+over the accepted tokens alone -- its conv state bit for bit, a window of inputs copied, and its
+recurrent state within the band the two GDP entries' own bands put between them (the job's
+`STATE_ULP`), which a state from the wrong position misses by orders. Under attention DP every rank
+has its own manager -- one holding the trunk's state and KV and the MTP layer's KV -- and an idle
+rank verifies the attention-DP dummy, whose drafts the commit promotes into the dummy's own slot.
 
 The measurement runs once, as a 4-rank MPI job (`_dep4_mtp_rollback_job.py`, which says what each
 rank builds and runs: layer 0's mixer on real weights through the targets' own `_gdp`, both
 engine managers built for the rank's dep4 mapping); this module starts it and gates every rank's
-records, bit for bit.
+records: where the commit writes, bit for bit; what the verify computes, within the job's bands.
 """
 
 from __future__ import annotations
@@ -81,16 +83,27 @@ def measured(tmp_path_factory) -> list:
 @pytest.mark.gpu4
 @pytest.mark.parametrize("kind", J.MANAGERS)
 @pytest.mark.parametrize("case", J.CASES)
-def test_verify_then_commit_equals_decode_over_the_accepted_tokens(measured, kind, case) -> None:
+def test_verify_then_commit_matches_decode_over_the_accepted_tokens(measured, kind, case) -> None:
     """On every rank, with the rank's own manager of `kind`: `case`'s verify writes no slot, the
-    commit writes only the step's rows' engine slots (never a context row's), each real row's
-    committed state equals its slot after the accepted decode steps -- the states after one, two
-    and three tokens differing pairwise -- and the verify's output rows equal the decode steps'."""
+    commit writes only the step's rows' engine slots (never a context row's), and each real row's
+    committed state is its slot after the accepted decode steps -- the conv state bit for bit, the
+    recurrent state within `J.STATE_ULP` -- with the states after one, two and three tokens
+    differing pairwise by more than that; the verify's GDP entry outputs are within `J.OUT_ULP` of
+    the decode steps'. Prints, per rank, the recurrent state's largest distance in units of its
+    band, the outputs' in bf16 ulps and the least distance between positions in bands (`-s`)."""
     records = [r for r in measured if r["kind"] == kind and r["case"] == case]
     assert sorted(r["rank"] for r in records) == list(range(J.WORLD_SIZE)), records
     for r in records:
-        print(f"rank {r['rank']} {r['manager']} {case}: {len(r['failures'])} failures")
+        measures = (
+            f"; recurrent state {r['state']:.3g} of its band, GDP outputs {r['out']:.3g} bf16 ulp "
+            f"(band {J.OUT_ULP}), positions {r['separation']:.3g} bands apart"
+            if "state" in r
+            else ""
+        )
+        print(f"rank {r['rank']} {r['manager']} {case}: {len(r['failures'])} failures{measures}")
         assert not r["failures"], "\n".join(r["failures"])
-        assert r["distinct"], f"rank {r['rank']}: the states after 1..3 tokens do not all differ"
+        assert r["distinct"], (
+            f"rank {r['rank']}: the states after 1..3 tokens do not all differ beyond the band"
+        )
     if case in ("padded", "mixed"):
         assert {n for r in records for n in r["accepted"]} == {1, 2, 3}

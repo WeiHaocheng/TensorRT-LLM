@@ -181,22 +181,6 @@ def test_every_bf16_input(geometry, certifying) -> None:  # noqa: F811 — pytes
 
 
 @pytest.mark.parametrize("geometry", GEOMETRIES, ids=lambda c: f"{c.spec['heads']} heads")
-def test_rows_do_not_depend_on_the_batch(geometry) -> None:
-    """A token's gates come back as the same bits whatever batch it rides in.
-
-    CUDA-graph padding and MTP verify change T for the same request, and the identity gates
-    compare such runs bitwise. One program per token, this holds by construction; it is pinned.
-    """
-    spec = dict(geometry.spec, tokens=1024)
-    b, a, neg_a, dt_bias = _build(spec, seed=5)
-    full_beta, full_g = op(b, a, neg_a, dt_bias)
-    for start, stop in ((0, 1), (37, 40), (1021, 1024)):
-        beta, g = op(b[start:stop], a[start:stop], neg_a, dt_bias)
-        assert torch.equal(beta, full_beta[start:stop]), (start, stop)
-        assert torch.equal(g, full_g[start:stop]), (start, stop)
-
-
-@pytest.mark.parametrize("geometry", GEOMETRIES, ids=lambda c: f"{c.spec['heads']} heads")
 def test_a_captured_graph_replays_bitwise(geometry) -> None:
     """Captured once, replayed on new inputs, the same bits as eager and as HF's ops."""
     spec = dict(geometry.spec, tokens=64)

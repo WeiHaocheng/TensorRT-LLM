@@ -252,47 +252,6 @@ def test_decode_steps_reproduce_the_hf_whole_sequence_conv(dim: int) -> None:
     )
 
 
-@pytest.mark.parametrize("dim", DIMS)
-def test_a_decode_step_rounds_as_the_prefill_kernels_do(dim: int) -> None:
-    """A decode row and a one-token context give the same bits, output and state.
-
-    The same token can reach the GDP conv either way: as a decode row here, or as a one-token
-    sequence of a context batch through `causal_conv1d_fwd`'s channel-last kernel, the path
-    `causal_conv1d_varlen` certifies. Greedy identity across batch compositions needs the two to
-    agree exactly; both are fma chains over the same four products with the same SiLU. Pinned on
-    each width's largest cell.
-    """
-    cell = max((c for c in op.CELLS if c.spec["dim"] == dim), key=lambda c: c.spec["batch"])
-    spec = cell.spec
-    proj, raw, kwargs = _build(spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
-    slots = kwargs["conv_state_indices"]
-    live = slots != PAD_SLOT_ID
-    rows = live.nonzero().squeeze(1)
-    owned = slots[live]
-    lo, hi = spec["proj_offset"], spec["proj_offset"] + spec["dim"]
-
-    tokens = proj[rows, lo:hi]  # a copy, [requests, dim]
-    states = kwargs["conv_state"].clone()
-    out = torch.empty_like(tokens)
-    torch.ops.trtllm.causal_conv1d_fwd(
-        tokens.t(),  # channel-last, as the in_proj output's transpose is
-        kwargs["weight"],
-        None,
-        states,
-        torch.arange(rows.numel() + 1, dtype=torch.int32, device="cuda"),
-        owned,
-        torch.ones(rows.numel(), dtype=torch.bool, device="cuda"),
-        True,
-        PAD_SLOT_ID,
-        out.t(),
-    )
-    op(**kwargs)
-    assert torch.equal(proj[rows, lo:hi], out), "the decode step rounds unlike the prefill kernel"
-    assert torch.equal(kwargs["conv_state"][owned.long()], states[owned.long()]), (
-        "the decode step leaves another state than the prefill kernel"
-    )
-
-
 def _small(**over):
     """A small valid call -- four rows, the last one padding -- with `over` applied to its spec."""
     spec = dict(

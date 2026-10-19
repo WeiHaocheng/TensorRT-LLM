@@ -117,8 +117,8 @@ class GdpGates(OpWrapper):
     where exp(A_log) > 1 a normal number below 2^-126 * exp(A_log) (2.2e-37 at the checkpoint's
     largest). The recurrences read g through exp(), which maps both to exactly 1.0.
 
-    A token's results depend on that token alone, so a row is batch-invariant and a CUDA-graph
-    padding row only computes something nobody reads. CUDA-graph capturable: one launch, no host
+    A token's results depend on that token alone, so a CUDA-graph padding row only computes
+    something nobody reads. CUDA-graph capturable: one launch, no host
     sync, nothing allocated besides the two outputs. `T = 0` launches nothing.
 
     Certified: 24 heads (tp1) and 6 (a tp4 rank), 3 Householder steps, each as its target's in_proj

@@ -113,18 +113,6 @@ def test_every_bf16_input(certifying) -> None:  # noqa: F811 — pytest resolves
     assert clamp_moves >= 10000, f"the clamp changed only {clamp_moves} outputs"
 
 
-def test_rows_do_not_depend_on_the_batch() -> None:
-    """A row comes back as the same bits whatever batch it rides in.
-
-    CUDA-graph padding and MTP verify change T for the same request, and the identity gates
-    compare such runs bitwise. Element-wise, this holds by construction; it is pinned anyway.
-    """
-    x, clamp = _build(dict(tokens=1024, width=12288, activation_clamp=CLAMP), seed=5)
-    full = op(x, clamp)
-    for start, stop in ((0, 1), (37, 40), (1021, 1024)):
-        assert torch.equal(op(x[start:stop], clamp), full[start:stop]), (start, stop)
-
-
 def test_a_captured_graph_replays_bitwise() -> None:
     """Captured once, replayed on new inputs, the same bits as eager and as HF's order."""
     spec = dict(tokens=64, width=4096, activation_clamp=CLAMP)

@@ -1389,14 +1389,13 @@ def _plant_hidden_not_normed(mp, model, M) -> None:
 def _plant_routed_after_attention(mp, model, M) -> None:
     """The MoE routed on the shared expert's input -- the block's input after attention, as a
     sequential `MoE(mixer(x))` block would route -- instead of the block's input. Planted in the
-    MoE each target's MTP layer calls: `_mtp_moe` where the target keeps one for it, else `_moe`;
-    any further arguments (the collectives' sizes under attention DP) pass through."""
+    MoE each target's MTP layer calls, `_moe`; any further arguments (the collectives' sizes under
+    attention DP) pass through."""
     for target in (model.model._prefill, model.model._decode):
-        name = "_mtp_moe" if hasattr(target, "_mtp_moe") else "_moe"
-        orig = getattr(target, name)
+        orig = target._moe
         mp.setattr(
             target,
-            name,
+            "_moe",
             lambda routed, shared, m, *rest, _orig=orig: _orig(shared, shared, m, *rest),
         )
 

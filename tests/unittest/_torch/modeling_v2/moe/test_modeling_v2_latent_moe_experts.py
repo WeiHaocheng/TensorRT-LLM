@@ -6,11 +6,10 @@ a dep4 rank's expert windows and a tp4 rank's intermediate slice.
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into what the target hands the entry -- a latent batch, top-10
 routing over 512 experts, the window's expert weights -- and holds what a cell cannot show:
-the activation on every bf16 input, the two paths giving the same bits, the counting sort and
-the grouped path's gather giving the stable sort's layout, rows that do not depend on their
-batch (across the switch between the paths), CUDA-graph replay, the band's distance from the
-plausible wrong orders, what the fp32 output is, the four expert-parallel windows adding up
-to the whole, and the input the guard refuses.
+the activation on every bf16 input, every tile of the fused path within the band, the counting
+sort and the grouped path's gather giving the stable sort's layout, CUDA-graph replay, the
+band's distance from the plausible wrong orders, what the fp32 output is, the four
+expert-parallel windows adding up to the whole, and the input the guard refuses.
 """
 
 import zlib
@@ -26,7 +25,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_expert
     _experts,
     _sort_and_gather,
     _sort_slots,
-    _tiles_for,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
     latent_moe_experts as op,
@@ -173,11 +171,16 @@ def test_the_bf16_output_is_the_fp32_sum_rounded_once(cell) -> None:
 #: The largest batch the fused path takes; past it, the grouped-GEMM path.
 _FUSED_MOST = _FUSED_TILES[-1][0]
 
-_FUSED_CELLS = [c for c in op.CELLS if c.spec["tokens"] <= _FUSED_MOST]
 
-
-def _takes_fused_path(args) -> bool:
-    return _tiles_for(args["x"], args["topk_ids"], args["up_proj"], args["down_proj"]) is not None
+@pytest.mark.parametrize("tokens", [1, 37, 1024])
+@pytest.mark.parametrize("row", _FUSED_TILES, ids=[f"tiles to {r[0]}" for r in _FUSED_TILES])
+def test_every_tile_is_within_the_band(row, tokens) -> None:
+    """A tile decides how the fused path splits the work. The dispatch reaches each row of
+    `_FUSED_TILES` only at its own batch sizes, which the cells do not all sample, so each row
+    is forced onto one token, an odd 37 and 1024 and held to the reference within `_compare`'s
+    band."""
+    args = _build(dict(op.CELLS[0].spec, tokens=tokens), seed=tokens)
+    _compare(_experts(**args, tiles=row[1:]), op.reference(**args))
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -209,28 +212,6 @@ def test_the_grouped_paths_gather_is_the_sorts_layout(cell) -> None:
     assert torch.equal(inv, want_inv)
     assert torch.equal(offs, want_offs)
     assert torch.equal(xg, x.index_select(0, want_order // spec["top_k"]))
-
-
-@pytest.mark.parametrize("cell", _FUSED_CELLS, ids=[c.why[:44] for c in _FUSED_CELLS])
-def test_the_fused_path_gives_the_grouped_paths_bits(cell) -> None:
-    """Every cell the fused path takes, through both paths: the same output, bit for bit.
-
-    So switching a batch size between the paths changes its speed and nothing else, and the
-    grouped path's certification -- this entry's before the fused path existed -- carries over.
-    """
-    args = _build(cell.spec, seed=_seed(cell))
-    tiles = _tiles_for(args["x"], args["topk_ids"], args["up_proj"], args["down_proj"])
-    assert tiles is not None, "the cell is expected on the fused path"
-    assert torch.equal(_experts(**args, tiles=tiles), _experts(**args, tiles=None))
-
-
-@pytest.mark.parametrize("tokens", [1, 37, 1024])
-@pytest.mark.parametrize("row", _FUSED_TILES, ids=[f"tiles to {r[0]}" for r in _FUSED_TILES])
-def test_every_tile_gives_the_grouped_paths_bits(row, tokens) -> None:
-    """A tile decides how the work is split and nothing else: each row of `_FUSED_TILES`,
-    forced onto one token, an odd 37 and 1024, gives the grouped path's bits."""
-    args = _build(dict(op.CELLS[0].spec, tokens=tokens), seed=tokens)
-    assert torch.equal(_experts(**args, tiles=row[1:]), _experts(**args, tiles=None))
 
 
 #: The four ranks' windows of a 4-rank expert-parallel target, (128 r, 128).
@@ -320,47 +301,6 @@ def test_the_activation_pass_is_the_checkpoints_on_every_bf16_value(clamp, weigh
     assert torch.equal(torch.isnan(got), nan)
     differ = got.view(torch.int16)[~nan] != want.view(torch.int16)[~nan]
     assert not differ.any(), f"{int(differ.sum())} of {int((~nan).sum())} bf16 inputs differ"
-
-
-@pytest.mark.parametrize(
-    "offset, count, out_dtype, intermediate",
-    [(0, 512, None, 4096), (384, 128, torch.float32, 4096), (0, 512, None, 1024)],
-    ids=["tp1 window, bf16", "dep4 rank 3 window, fp32", "tp4 rank's slice, bf16"],
-)
-def test_a_rows_result_does_not_depend_on_its_batch(offset, count, out_dtype, intermediate) -> None:
-    """The first n tokens computed alone and inside a larger batch: bit-identical.
-
-    Batch composition and CUDA-graph padding change what surrounds a request, and with it the
-    grouped GEMMs' group sizes -- and on an expert-parallel rank, every other rank's tokens
-    join the gathered batch too. A row whose bits moved with them would make greedy decoding
-    depend on its neighbours, so this is measured rather than assumed, at each intermediate
-    width a target runs: a tensor-parallel rank's quarter changes both grouped GEMMs' shapes.
-
-    The batch is twice the fused path's largest, so it takes the grouped-GEMM path, while every
-    part up to that largest takes the fused one: the comparison crosses the switch between the
-    paths, which is where a decode step's rows would part from a prefill's. One part past it
-    stays on the grouped path.
-    """
-    spec = dict(
-        op.CELLS[6].spec,
-        tokens=2 * _FUSED_MOST,
-        local_expert_offset=offset,
-        num_local_experts=count,
-        out_dtype=out_dtype,
-        intermediate=intermediate,
-    )
-    args = _build(spec, seed=123)
-    assert not _takes_fused_path(args)
-    full = op(**args)
-    for n in (1, 8, 37, 64, 256, _FUSED_MOST, _FUSED_MOST + 1):
-        part = dict(
-            args,
-            x=args["x"][:n],
-            topk_ids=args["topk_ids"][:n],
-            topk_weights=args["topk_weights"][:n],
-        )
-        assert _takes_fused_path(part) == (n <= _FUSED_MOST)
-        assert torch.equal(op(**part), full[:n]), f"the first {n} tokens change when computed alone"
 
 
 @pytest.mark.parametrize(

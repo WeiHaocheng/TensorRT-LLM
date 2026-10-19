@@ -508,9 +508,9 @@ _NEMOTRON4_TOPOLOGIES = {"tp1": {}, "dep4": _DEP4, "tp4": _TP4}
 @pytest.mark.parametrize("topology", list(_NEMOTRON4_TOPOLOGIES))
 def test_nemotron4_declines_another_draft_length(topology, max_draft_len):
     """Every target runs the checkpoint's trained depth, two drafts, the length its MTP
-    identity, acceptance and GSM8K gates run, and declines another one by name. On tp4 the
-    message also says why the length is structural there: a verify request's stride decides
-    whether its tokens round as decode's do."""
+    identity, acceptance and GSM8K gates run, and declines another one by name, with the
+    limit that remains: thop_attention's verify cells cover three query tokens a request.
+    No topology declines it for the sake of matching decode's bits."""
     pretrained_config = _nemotron4_config()
     spec_config = _as_loaded(pretrained_config, MTPDecodingConfig(max_draft_len=max_draft_len))
     assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
@@ -526,7 +526,8 @@ def test_nemotron4_declines_another_draft_length(topology, max_draft_len):
         "(MTP_EAGLE_ONE_MODEL), which the target does not run: "
         f"max_draft_len={max_draft_len}: the target runs 2 drafts" in message
     )
-    assert ("verify gives decode's bits" in message) == (topology == "tp4")
+    assert "thop_attention's cells cover (3 query tokens a request)" in message
+    assert "bits" not in message
     assert "is not implemented" not in message
 
 

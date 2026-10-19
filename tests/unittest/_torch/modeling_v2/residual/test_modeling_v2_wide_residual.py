@@ -147,29 +147,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         assert normed2 is None
 
 
-def test_rows_do_not_depend_on_the_batch() -> None:
-    """A token's outputs are the same bits whatever else is in the call.
-
-    CUDA-graph padding and chunking change T for the same tokens; greedy identity across them
-    needs every row computed alike. The launch never chooses the number of warps by T, which
-    would reorder each row's variance sum.
-    """
-    spec = dict(op.CELLS[0].spec, tokens=8192, write=True, reads=2)
-    full = _build(spec, seed=21)
-    parts = []
-    for start, stop in ((0, 1), (0, 3), (5, 1029), (100, 8192)):
-        part = dict(full, streams=full["streams"][start:stop].clone())
-        part["update"] = full["update"][start:stop]
-        parts.append((start, stop, part))
-    streams, normed, normed2 = op(**full)
-    for start, stop, kwargs in parts:
-        s, y, y2 = op(**kwargs)
-        rows = f"rows {start}:{stop}"
-        assert torch.equal(s, streams[start:stop]), f"the streams of {rows} depend on the batch"
-        assert torch.equal(y, normed[start:stop]), f"the first read of {rows} depends on the batch"
-        assert torch.equal(y2, normed2[start:stop]), f"the second read of {rows} depends on it"
-
-
 def test_a_captured_graph_replays_bitwise() -> None:
     """Decode runs the step inside a CUDA graph: the replay is the eager call, bit for bit."""
     spec = dict(op.CELLS[0].spec, tokens=64, write=True, reads=2)

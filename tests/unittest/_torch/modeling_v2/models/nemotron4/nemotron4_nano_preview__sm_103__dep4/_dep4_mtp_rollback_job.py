@@ -29,12 +29,15 @@ The cases, each on every rank with its own seed, on both managers (`CASES`):
 * ``dummy alone``: the attention-DP dummy alone, eagerly;
 * ``mixed``: a fresh 37-token prompt (a context row) beside 3 verify rows.
 
-Per case: every real row's committed recurrent and conv state equals its slot after `accepted`
-MTP-off decode steps (one token each) over the same tokens; the states after one, two and three
-tokens differ pairwise, so a commit from the wrong position cannot pass; the verify writes no slot;
-the commit writes only the step's rows' engine slots (the dummies' included, whose stale snapshot
-it copies) and never a context row's; and the verify's output rows equal the decode steps' rows.
-Rank 0 writes every rank's records to `--out` as JSON.
+Per case, every real row against its slot after `accepted` MTP-off decode steps (one token each)
+over the same tokens: its committed conv state bit for bit -- a window of the in_proj output's conv
+columns, which both conv entries copy rather than compute -- and its committed recurrent state
+within `STATE_ULP`; the verify's GDP entry outputs within `OUT_ULP` of the decode steps', observed
+where `_gdp_generation` calls `gdp_verify` and `gdp_recurrent`; and the states after one, two
+and three tokens differ pairwise -- the conv states in some bit, the recurrent ones by more than
+their band -- so a commit from the wrong position cannot pass. The verify writes no slot, and the
+commit writes only the step's rows' engine slots (the dummies' included, whose stale snapshot it
+copies) and never a context row's. Rank 0 writes every rank's records to `--out` as JSON.
 
 Not a pytest module: everything that imports `tensorrt_llm` is imported inside the rank body (an
 MPI-initialized process cannot start `mpirun`).
@@ -44,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import signal
@@ -65,6 +69,24 @@ LAYER = 0
 """A `linear_attention` block; every GDP mixer of the model is the same mixer."""
 MANAGERS = ("v2", "v1")
 CASES = ("padded", "idle", "dummy alone", "mixed")
+ULP_FP32, ULP_BF16 = 2.0**-23, 2.0**-8
+
+STATE_ULP = 16.0
+"""The committed recurrent state against the decode steps', element-wise in fp32 ulps of its row's
+scale (a row: the 128 key entries of one head and value channel, scaled by their max |decode|),
+times sqrt(t + 1) for the state after token t. gdp_verify's snapshot after token t is within
+8 sqrt(t + 1) of the fp32 reference (`_compare_states` in its test): gdp_recurrent's band for one
+token, 8, widened as the roundings of t + 1 tokens add. t + 1 gdp_recurrent calls carry the same
+t + 1 tokens of roundings, so they sit as far from the same reference, and the two within
+16 sqrt(t + 1) of each other. That holds where both are handed the same q, k, v, decay and beta:
+where the in_proj GEMM gives a token the same bits at the verify's 3B rows as at a decode step's
+B, as the bitwise conv state needs too, and the two conv entries round a token's output alike. A
+commit from the wrong position moves the state by O(1) of its scale, orders beyond."""
+OUT_ULP = 4.0
+"""The verify's GDP entry outputs against the decode steps', element-wise in bf16 ulps of their
+row's scale (a row: one head's 64 value channels for a token, scaled by their max |decode|): each
+entry is within 2 of the fp32 reference on the same inputs (`_compare_out` in both entries' tests),
+so 4 of each other."""
 
 
 def _standalone_env() -> dict[str, str]:
@@ -201,6 +223,29 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
     decode, prefill = object.__new__(M.DecodeTarget), object.__new__(M.PrefillTarget)
     decode._d = prefill._d = M._dims(text)
 
+    # The GDP entries' outputs, as `_gdp_generation` calls them: the last verify's
+    # `[rows, 1 + D, heads, value]`, the last decode step's `[rows, heads, value]`.
+    entries = dict(verify=M.gdp_verify, decode=M.gdp_recurrent)
+    seen = {}
+
+    def observed(name: str):
+        def call(*args, **kwargs):
+            out = entries[name](*args, **kwargs)
+            seen[name] = out.clone()
+            return out
+
+        return call
+
+    M.gdp_verify, M.gdp_recurrent = observed("verify"), observed("decode")
+
+    def ulps(got: torch.Tensor, want: torch.Tensor, ulp: float) -> float:
+        """max |got - want| over its row's max |want|, a row being the last dimension, in `ulp`s:
+        the element score of the entries' own tests (`assert_within_ulp`)."""
+        g = got.float().reshape(-1, got.shape[-1])
+        w = want.float().reshape(-1, want.shape[-1])
+        scale = w.abs().amax(-1, keepdim=True).clamp_min(1e-9)
+        return float(((g - w).abs() / scale).max()) / ulp
+
     def rows(generator, n: int) -> torch.Tensor:
         """Layer 0's input for random tokens: their embedding, RMS-normed with its input norm."""
         ids = torch.randint(0, embed.shape[0], (n,), generator=generator, device="cuda")
@@ -304,34 +349,49 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
 
         def decode_reference(x, real_slots: list, padded_slots: list, accepted: list):
             """MTP-off decode over the verify's tokens, one step per position, from the slots as
-            they are: each real row's state after its accepted tokens, every step's output rows,
-            and whether the states after 1, 2 and 3 tokens differ pairwise in every row."""
+            they are: each real row's state after its accepted tokens, every step's GDP entry
+            output `[rows, 1 + D, heads, value]`, and how far apart the states after 1, 2 and 3
+            tokens sit in every row: whether the conv states all differ, and the least distance
+            between two recurrent states in units of the band at the later position."""
             after, outs = [], []
             for j in range(TOKENS):
-                outs.append(decode._gdp(x[:, j].contiguous(), mixer, step(padded_slots)))
+                decode._gdp(x[:, j].contiguous(), mixer, step(padded_slots))
+                outs.append(seen["decode"])
                 after.append(states(real_slots))
-            distinct = all(
-                not torch.equal(after[i][k][b], after[j][k][b])
+            pairs = [(i, j) for i in range(TOKENS) for j in range(i + 1, TOKENS)]
+            conv_distinct = all(
+                not torch.equal(after[i][1][b], after[j][1][b])
                 for b in range(len(real_slots))
-                for i in range(TOKENS)
-                for j in range(i + 1, TOKENS)
-                for k in (0, 1)
+                for i, j in pairs
+            )
+            separation = min(
+                ulps(after[i][0][b], after[j][0][b], ULP_FP32) / (STATE_ULP * math.sqrt(j + 1))
+                for b in range(len(real_slots))
+                for i, j in pairs
             )
             taken = [
                 (after[accepted[b] - 1][0][b], after[accepted[b] - 1][1][b])
                 for b in range(len(real_slots))
             ]
-            return taken, torch.stack(outs, dim=1), distinct
+            return taken, torch.stack(outs, dim=1), conv_distinct, separation
 
-        def check_states(real_slots: list, expected, what: str) -> list:
+        def check_states(real_slots: list, expected, accepted: list, what: str) -> tuple:
+            """Each real row's slot against `expected`: the conv state bitwise, the recurrent
+            state within its band; the failures, and the recurrent state's largest distance in
+            units of its band."""
             got = states(real_slots)
-            failures = []
+            failures, worst = [], 0.0
             for b, (want_ssm, want_conv) in enumerate(expected):
-                if not torch.equal(got[0][b], want_ssm):
-                    failures.append(f"{what}: row {b} recurrent state differs")
+                band = STATE_ULP * math.sqrt(accepted[b])
+                found = ulps(got[0][b], want_ssm, ULP_FP32)
+                worst = max(worst, found / band)
+                if found > band:
+                    failures.append(
+                        f"{what}: row {b} recurrent state {found:.3g} fp32 ulp off, band {band:.3g}"
+                    )
                 if not torch.equal(got[1][b], want_conv):
                     failures.append(f"{what}: row {b} conv state differs")
-            return failures
+            return failures, worst
 
         g = torch.Generator(device="cuda").manual_seed(4404 + 97 * rank + (kind == "v1"))
 
@@ -342,10 +402,12 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             engine = real + [padding_slot] * 3
             prime(g, real, steps=6)
             failures, distinct_all = [], True
+            state, out_ulp, separation = 0.0, 0.0, float("inf")
             for accepted in ([3, 1, 2, 3, 1], [1, 2, 3, 2, 3]):
                 start = snapshot()
                 x = rows(g, len(padded) * TOKENS).view(len(padded), TOKENS, -1)
-                out = decode._gdp(x.reshape(-1, x.shape[-1]), mixer, step(padded))
+                decode._gdp(x.reshape(-1, x.shape[-1]), mixer, step(padded))
+                out = seen["verify"]
                 if changed(start):
                     failures.append(f"padded {accepted}: the verify wrote slots {changed(start)}")
                 commit(0, accepted + [1, 2, 3], engine)
@@ -354,12 +416,22 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                 if outside:
                     failures.append(f"padded {accepted}: the commit wrote slots {outside}")
                 restore(start)
-                expected, ref_out, distinct = decode_reference(x, real, padded, accepted)
-                distinct_all &= distinct
+                expected, ref_out, conv_distinct, apart = decode_reference(
+                    x, real, padded, accepted
+                )
+                distinct_all &= conv_distinct and apart > 1
+                separation = min(separation, apart)
                 restore(committed)
-                failures += check_states(real, expected, f"padded {accepted}")
-                if not torch.equal(out.view(len(padded), TOKENS, -1)[:5], ref_out[:5]):
-                    failures.append(f"padded {accepted}: verify output rows differ from decode's")
+                found, worst = check_states(real, expected, accepted, f"padded {accepted}")
+                failures += found
+                state = max(state, worst)
+                off = ulps(out[:5], ref_out[:5], ULP_BF16)
+                out_ulp = max(out_ulp, off)
+                if off > OUT_ULP:
+                    failures.append(
+                        f"padded {accepted}: the verify's GDP outputs {off:.3g} bf16 ulp off the "
+                        "decode steps'"
+                    )
             records.append(
                 dict(
                     rank=rank,
@@ -369,6 +441,9 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                     failures=failures,
                     distinct=distinct_all,
                     accepted=[1, 2, 3],
+                    state=state,
+                    out=out_ulp,
+                    separation=separation,
                 )
             )
 
@@ -409,7 +484,7 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             context = rows(g, 37)
             x = rows(g, len(real) * TOKENS).view(len(real), TOKENS, -1)
             starts = torch.tensor([0, 37], dtype=torch.int32, device="cuda")
-            out = prefill._gdp(
+            prefill._gdp(
                 torch.cat([context, x.reshape(-1, x.shape[-1])]),
                 mixer,
                 step(
@@ -422,6 +497,7 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                     has_initial_state=torch.zeros(1, dtype=torch.bool, device="cuda"),
                 ),
             )
+            out = seen["verify"]
             failures = []
             if changed(start) != {context_slot}:
                 failures.append(f"mixed: the verify wrote slots {changed(start) - {context_slot}}")
@@ -433,11 +509,15 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             if not all(torch.equal(a, b) for a, b in zip(states([context_slot]), prefilled)):
                 failures.append("mixed: the commit wrote the context row's slot")
             restore(start)
-            expected, ref_out, distinct = decode_reference(x, real, real, accepted)
+            expected, ref_out, conv_distinct, apart = decode_reference(x, real, real, accepted)
             restore(committed)
-            failures += check_states(real, expected, f"mixed {accepted}")
-            if not torch.equal(out[37:].view(len(real), TOKENS, -1), ref_out):
-                failures.append("mixed: verify output rows differ from the decode steps' rows")
+            found, state = check_states(real, expected, accepted, f"mixed {accepted}")
+            failures += found
+            out_ulp = ulps(out, ref_out, ULP_BF16)
+            if out_ulp > OUT_ULP:
+                failures.append(
+                    f"mixed: the verify's GDP outputs {out_ulp:.3g} bf16 ulp off the decode steps'"
+                )
             records.append(
                 dict(
                     rank=rank,
@@ -445,12 +525,16 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                     kind=kind,
                     case="mixed",
                     failures=failures,
-                    distinct=distinct,
+                    distinct=conv_distinct and apart > 1,
                     accepted=accepted,
+                    state=state,
+                    out=out_ulp,
+                    separation=apart,
                 )
             )
         manager.shutdown()
         comm.Barrier()
+    M.gdp_verify, M.gdp_recurrent = entries["verify"], entries["decode"]
 
     gathered = comm.gather(records, root=0)
     if rank == 0:

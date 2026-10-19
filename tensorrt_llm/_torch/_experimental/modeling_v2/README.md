@@ -192,10 +192,13 @@ checkpoints", which is the opposite of what this package is for.
    no built-in implementation has no `off` leg: its detector is a plain-torch
    transcription of the checkpoint's own draft module, run teacher-forced over
    the target's greedy output, and the acceptance it gives.
-4. **Identity** — for a target whose decode step is batch-invariant: greedy
-   tokens identical with CUDA graphs on and off, and with speculative decoding
-   on and off. Each holds only if every row of a step computes its bits from
-   that row alone, so a failure points at the step that is not.
+4. **Identity** — greedy tokens with CUDA graphs on and off, and with
+   speculative decoding on and off, compared prompt by prompt up to the first
+   parting. Kernels that pick their tiling by the batch move a row's logits in
+   the last bits, so two legs may part where the top two tokens are nearly
+   tied: a parting passes only within a near-tie band measured on the target
+   and stated in its test, and fails anywhere else. A miscomputed padding row,
+   recycled state slot or rolled-back draft moves tokens wherever it lands.
 
 Compare a variant against an identity run **in the same session**: one target
 measured 94.7688 and 95.0720 on a bit-identical forward a day apart, so a
@@ -207,7 +210,7 @@ Perf is measured, never gated.
 
 **Every entry is certified on sm_103, and all five targets are gated there.**
 
-The 33 entries -- 23 shared, 7 owned by deepseek, 3 by gpt-oss; the three
+The 31 entries -- 21 shared, 7 owned by deepseek, 3 by gpt-oss; the three
 nemotron4 targets own none, every entry they call being shared -- each drive
 their cells through `__call__` and `reference` in pre-merge CI, plus the three
 4-rank collective matrices (all-gather, reduce-scatter, all-reduce).
@@ -241,21 +244,19 @@ nemotron4-nano-preview's text model / sm_103 has three targets, tp1, dep4 and
 tp4, each gated in `tests/integration/defs/accuracy/test_modeling_v2_nemotron4.py`
 the same five ways: routing on the shipped config; gsm8k paired in one session
 with its MTP variant (one-model MTP-Eagle, draft length 2); token identity with
-CUDA graphs on and off; MTP on against MTP off, each prompt alone, where the two
-may part only at a near-tie; and the acceptance gate. A decode step attends
-through `invariant_gen_attention` and an MTP verify through `thop_attention`, so
-a verify token sits near its decode step's bits rather than on them, and the
-near-tie band is the verify's measured deviation from decode. TensorRT-LLM has
-no built-in implementation of this architecture, so there is no stock leg: the
-gsm8k anchor is the checkpoint's own HuggingFace code under the same protocol,
-and the acceptance anchor is a plain-torch transcription of its MTP layer. The
-MTP layer's module accuracy, the decode step's batch invariance the CUDA-graph
-identity gate rests on, and the verify's deviation from decode the MTP gates'
-bands rest on are unit tests in each target's test directory. The numbers live
-with those runs, not here: a number written into this file is one that drifts
-with nothing to notice. `invariant_gen_attention`'s verify path (two or three
-tokens a request) is on no target's path: the targets call it for decode only.
-Its cells stay certified, for a target that wants a verify with decode's bits.
+CUDA graphs on and off; MTP on against MTP off, each prompt alone; and the
+acceptance gate. Both identity gates follow the near-tie rule. Every step runs
+its GEMMs through `cublas_mm` and its attention through `thop_attention`, whose
+kernels change with the batch, so a decode row's bits move with the batch it
+runs in and a verify token's sit near its decode step's rather than on them.
+TensorRT-LLM has no built-in implementation of this architecture, so there is
+no stock leg: the gsm8k anchor is the checkpoint's own HuggingFace code under
+the same protocol, and the acceptance anchor is a plain-torch transcription of
+its MTP layer. The MTP layer's module accuracy, and the decode step's drift
+across batches and the verify's drift from decode that the near-tie bands rest
+on, are unit tests in each target's test directory. The numbers live with
+those runs, not here: a number written into this file is one that drifts with
+nothing to notice.
 
 The acceptance row is the one that matters for a speculative variant:
 rejection sampling makes a miscomputed draft layer *slower*, not wrong, so

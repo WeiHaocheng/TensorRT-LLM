@@ -12,9 +12,8 @@ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
 from .._op import Arch, Cell, OpWrapper
 
-# The decode entry's tile, warp count and grid cap. Each token's update has to
-# round exactly as one `gdp_recurrent` call does, and the order of its two
-# reductions over K follows from the tile and the warps.
+# The decode entry's tile, warp count and grid cap: each token's update is one
+# `gdp_recurrent` update, and runs on the same tile.
 from .gdp_recurrent import _BLOCK_V, _MAX_GRID_ROWS, _NUM_WARPS
 
 
@@ -180,10 +179,10 @@ class GdpVerify(OpWrapper):
             out[t] = S^T (l2n(q[t]) * scale)         # read after the token's last step
             intermediate[request, t] = S
 
-    A request's token t output and state are, bit for bit, what the t-th of
-    T consecutive `gdp_recurrent` calls returns and leaves in the slot -- the
-    MTP-off decode of the same tokens -- so promoting snapshot `t` commits
-    exactly the state that decode would have reached. Returns `out`
+    A request's token t output and state are what the t-th of T consecutive
+    `gdp_recurrent` calls returns and leaves in the slot -- the MTP-off decode
+    of the same tokens -- each within the reference's band, so promoting
+    snapshot `t` commits the state decode would have reached. Returns `out`
     `[B, T, H, V]` in `q`'s dtype.
     """
 
@@ -195,8 +194,7 @@ class GdpVerify(OpWrapper):
     # `scale` is what the target passes for HF's `query / sqrt(key_head_dim)`.
     # q, k and v are views of the in_proj output's conv columns, a token per row:
     # a token's row stride is that output's width, 18528, a request's T times it,
-    # and the conv columns start at 1536. `decode_bits`: a cell whose tokens must
-    # get the bits of T `gdp_recurrent` calls on decode's views of the same rows.
+    # and the conv columns start at 1536.
     _NEMOTRON4 = dict(
         heads=24,
         householder=3,
@@ -205,18 +203,13 @@ class GdpVerify(OpWrapper):
         scale=128**-0.5,
         proj_width=18528,
         conv_offset=1536,
-        decode_bits=True,
     )
     # A tp4 rank runs the same mixer on 6 of the 24 heads, its in_proj output
-    # [z 384 | conv 4224 | b 18 | a 6] = 4632 wide. Triton specializes both
-    # kernels on each stride's divisibility by 16. Decode's row stride 4632 is
-    # not divisible, and neither is a draft-2 request's 3 * 4632 = 13896, so a
-    # token there rounds as its decode step does. A draft-1 request's 9264 is
-    # divisible: that compiled variant rounds the reductions otherwise, within
-    # the band of the reference but not with decode's bits (measured: in every
-    # batch of two rows or more some output or state moved).
+    # [z 384 | conv 4224 | b 18 | a 6] = 4632 wide. Triton specializes the
+    # kernel on each stride's divisibility by 16, which a request's stride
+    # T * 4632 meets at an even T and misses at an odd one, so the tp4 cells run
+    # both draft lengths.
     _NEMOTRON4_TP4 = dict(_NEMOTRON4, heads=6, proj_width=4632, conv_offset=384)
-    _NEMOTRON4_TP4_DRAFT1 = dict(_NEMOTRON4_TP4, decode_bits=False)
 
     # tokens is 1 + max_draft_len: 3 for the checkpoint's trained depth (draft
     # length 2), 2 for draft length 1. The batch sizes are the decode CUDA graphs
@@ -376,27 +369,27 @@ class GdpVerify(OpWrapper):
         ),
         Cell(
             why="tp4 rank, draft 1, concurrency 1: one request, v1 pool",
-            spec=dict(tokens=2, batch=1, pad_rows=0, pool="v1", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=1, pad_rows=0, pool="v1", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, graph batch 2 with a padding row, v2 pool",
-            spec=dict(tokens=2, batch=2, pad_rows=1, pool="v2", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=2, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, eager batch 3, v2 pool",
-            spec=dict(tokens=2, batch=3, pad_rows=0, pool="v2", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=3, pad_rows=0, pool="v2", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, graph batch 64 with a padding row, v1 pool",
-            spec=dict(tokens=2, batch=64, pad_rows=1, pool="v1", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=64, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, graph batch 256 with a padding row, v2 pool",
-            spec=dict(tokens=2, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, graph batch 1024 with a padding row, v1 pool",
-            spec=dict(tokens=2, batch=1024, pad_rows=1, pool="v1", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=1024, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
         ),
     )
 
@@ -425,27 +418,12 @@ class GdpVerify(OpWrapper):
     that share a slot are harmless here, unlike in `gdp_recurrent`: the slot
     is only read.
 
-    Bit-identical to T `gdp_recurrent` calls on the same tokens, outputs and
-    states, for every real request: each token is that kernel's body with its
-    tile and warp count, and the state between tokens stays in fp32 registers,
-    the value the pool round trip would have stored and reloaded. A change to
-    either kernel's arithmetic or tiling breaks that, and so can a change in
-    how Triton compiles the same statements: the token loop rolled
-    (`tl.range`) instead of unrolled moved the snapshots' bits at a single
-    request. The entry's test compares the two bit for bit. A padding row
-    differs from its second token on, since a decode call restarts it from
-    zero and keeps nothing.
-
-    The bits hold only where both kernels compile alike: Triton specializes
-    them on each stride's divisibility by 16. Every stride a token's q, k and v
-    are read through -- the request's here, the row's in a decode call -- has
-    to agree in it with decode's row stride. tp1's in_proj width 18528 and every
-    multiple of it are divisible; a tp4 rank's 4632 is not, and neither is a
-    draft-2 request's 13896, but a draft-1 request's 9264 is (and a draft-3
-    request's 18528). There the verify stays within the reference's band but
-    is not bitwise decode's: measured, and pinned by the entry's test. A target
-    that needs those bits at an even T has to lay its requests out at a stride
-    that is not a multiple of 16.
+    Each token runs `gdp_recurrent`'s update with its tile and warp count, and
+    the state between tokens stays in fp32 registers, the value the pool round
+    trip would have stored and reloaded. The test holds the verify and its
+    snapshots to the reference, not to the decode entry's bits: the two kernels
+    may round apart, and Triton specializes each on its strides' divisibility
+    by 16, which a request's stride and a decode row's need not share.
 
     Uncertified: T other than 2 and 3, an intermediate whose token dim exceeds
     T, a pool other than the two managers' layouts, and the shapes

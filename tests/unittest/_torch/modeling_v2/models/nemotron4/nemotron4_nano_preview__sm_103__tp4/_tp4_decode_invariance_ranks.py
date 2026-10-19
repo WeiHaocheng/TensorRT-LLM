@@ -1,16 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""4-rank job: the nemotron4 tp4 decode step is batch-invariant on every rank, on real weights and
-real cache state.
+"""4-rank job: how far the nemotron4 tp4 decode step moves with its batch on every rank, on real
+weights and real cache state.
 
-A request's decode step must give the same bits whatever batch it runs in -- alone, inside a larger
-eager batch, or inside a padded CUDA-graph batch: its fp32 logits, the GDP recurrent and conv state
-it writes into its slot (32 layers, the rank's 6 of the 24 heads) and the K/V it appends (8
-attention layers, the one KV head every rank keeps whole). That is what CUDA graphs change between
-the two legs of a CUDA-graph on/off identity run: a decode step of B requests runs as B rows
-eagerly, and as the next captured batch size, padding rows included, under a graph. On tp4 each
-step's row-parallel partials meet in an all-reduce, so a row's bits also depend on the other
-ranks' partials of that row, which every rank computes from the same rows.
+A decode step runs its GEMMs through cuBLAS and its attention through ``thop_attention``'s
+generation kernels, and both pick their kernel by the batch: cuBLAS by the row count, thop by the
+batch size and history length. So a request's decode step gives slightly different bits alone,
+inside a larger eager batch and inside a padded CUDA-graph batch -- what CUDA graphs change between
+the two legs of a CUDA-graph on / off identity run, and what batching changes between a prompt
+alone and in a batch. This job measures how far, per request, on every rank: its fp32 logits (the
+largest |difference| and the largest shift of a gap between its top-1 and one of its top `TOP`
+tokens), and the GDP recurrent and conv state it writes into its slot (32 layers, the rank's 6 of
+the 24 heads) and the K/V it appends (8 attention layers, the one KV head every rank keeps whole),
+each as max |difference| / max |alone|. Every quantity is held to a band derived from that
+measurement (`LOGIT_BAND` and the rest); tp4's MTP identity gate's near-tie band and its MTP
+acceptance gate's batch term rest on it. Two things hold exactly: the padding rows of a graph
+batch write no slot, and every rank holds the same bits of a probe's logits and appended K/V in
+every run -- every rank runs the same rows, and each step's row-parallel partials meet in an
+all-reduce that gives every rank the same sums.
 
 This script is its own launcher, as the collective entries' matrices are: run it plainly and it
 starts one MPI rank per device named in CUDA_VISIBLE_DEVICES under ``mpirun``, with a deadline it
@@ -39,15 +46,19 @@ snapshot. A row's KV append lands at the one position its own attention reads on
 append, so an earlier run's append there is overwritten before it can be read.
 
 Each rank checks its own rows: its logits, its state, its appended K/V. Rank 0 gathers every rank's
-findings and its reference rows, checks that every rank formed the same logits and appended the
-same K/V, and writes the report the collected test reads
-(``test_modeling_v2_tp4_decode_invariance.py``). Not a pytest module: the checks are one fixed
-sequence inside a single 4-rank job, each reading rank state only ``_run_one_rank`` binds.
+findings and the bits of its probe rows, alone and in every batch, checks that every rank formed
+the same logits and appended the same K/V, and writes the report the collected test reads
+(``test_modeling_v2_tp4_decode_invariance.py``). The CUDA graphs are captured as the engine
+captures them: one eager forward at every size first, which grows the attention workspace all of
+them share to what the largest call needs, then the captures, which resize nothing. Not a pytest
+module: the checks are one fixed sequence inside a single 4-rank job, each reading rank state only
+``_run_one_rank`` binds.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib
 import json
 import os
@@ -89,9 +100,30 @@ BATCH_SIZES = (1, 2, 3, 4, 5, 7, 8, 16, 64, 100, 250, 256, 500, 512, 1000, 1024)
 #: The CUDA-graph batch sizes captured; a batch runs in the smallest one that holds it, as the
 #: runner pads.
 GRAPH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
-#: The eager batch sizes the rivals run at: cuBLAS changes kernels on the replaced shapes from 17
-#: and 72 rows up, thop_attention's KV split follows the batch, and NCCL's sum the message.
-RIVAL_BATCH_SIZES = (2, 3, 8, 64, 256, 1024)
+#: The alone step's top tokens whose gap to its top-1 a batched step must keep (`Drift.gap`).
+TOP = 8
+
+# The bands: how far a probe's decode step in a batch may sit from the same step alone. Measured on
+# this model's own state, on every rank, over every probe in the eager batches (2 to 1024 rows, 180
+# rows) and the padded graphs (1 to 1024, 192 rows) below; the kernels are deterministic, so the
+# worst cases repeat run to run. A tp4 rank attends with 4 of the 16 query heads and runs its GEMMs
+# at a quarter of their width, so the bands are tp4's own: the logits alike on every rank (each
+# forms them whole), the states over the rank's own heads. The worst cases over the four ranks,
+# eager and graph alike: |logit diff| 0.6593, top-gap shift 0.3229, recurrent state 0.0299, conv
+# state 0.0382 and K/V 0.0509 of max |alone|; no top-1 changed. A graph batch against the same rows
+# run eagerly, what the CUDA-graph identity gate's legs differ by in one step, measured 0.5672 /
+# 0.3229. Each band is its worst case plus a quarter, rounded up: room for a batch, history or graph
+# size the runs did not take, where cuBLAS or thop may pick yet another kernel.
+#: max |batched logit - alone logit| over the vocabulary, fp32.
+LOGIT_BAND = 0.83
+#: The largest change, batched against alone, of the gap between the alone step's top-1 and any of
+#: its top `TOP` tokens: how close to a tie the batch can tip the alone step's choice.
+GAP_BAND = 0.41
+#: max |batched - alone| / max |alone|, per tensor, over every GDP layer (the rank's heads of the
+#: recurrent state, fp32, and of the conv state, bf16) and every attention layer (the appended K/V).
+SSM_BAND = 0.038
+CONV_BAND = 0.048
+KV_BAND = 0.064
 
 # Bound inside the rank body, never in the launcher: tensorrt_llm calls MPI_Init at import.
 COMM = None
@@ -241,6 +273,12 @@ def _fill(md, manager, rows: list[Request], num_contexts: int, padding: int = 0)
     ``prepare()``. Context rows feed their whole prompt; generation rows feed one token over the
     prompt already cached; ``padding`` rows are the padding dummy's (prompt length 0, nothing
     cached, so one key: the dummy's own page)."""
+    # The cache manager stages a step's block-table gather index in one pinned host buffer
+    # that the device reads only when the step's copy runs (`IndexMapper::getCopyIndex`): a
+    # step filled while an earlier one is still queued would hand the earlier one its rows,
+    # and that step's K/V appends would land in another request's pages. So the device
+    # drains first.
+    torch.cuda.synchronize()
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 
@@ -280,31 +318,99 @@ def _bits(x: torch.Tensor) -> torch.Tensor:
     return x.view({4: torch.int32, 2: torch.int16}[x.element_size()])
 
 
-def _differences(got: Row, ref: Row, gdp_layers, attention_layers) -> list[str]:
-    """What differs, bitwise, between two of one request's decode steps."""
-    out = []
-    if not torch.equal(_bits(got.logits), _bits(ref.logits)):
-        diff = (got.logits - ref.logits).abs()
-        out.append(
-            f"logits: {int((diff > 0).sum())} of {diff.numel()} differ, max |diff| "
-            f"{float(diff.max()):.3e}, argmax {int(got.logits.argmax())} vs {int(ref.logits.argmax())}"
-        )
-    for name, got_states, ref_states in (("ssm", got.ssm, ref.ssm), ("conv", got.conv, ref.conv)):
-        bad = [
-            layer
-            for layer, a, b in zip(gdp_layers, got_states, ref_states)
-            if not torch.equal(_bits(a), _bits(b))
-        ]
-        if bad:
-            out.append(f"{name} state differs in GDP layers {bad}")
-    bad = [
-        layer
-        for layer, a, b in zip(attention_layers, got.kv, ref.kv)
-        if not torch.equal(_bits(a), _bits(b))
-    ]
-    if bad:
-        out.append(f"appended K/V differs in attention layers {bad}")
-    return out
+def _relative(got: torch.Tensor, ref: torch.Tensor) -> float:
+    """max |got - ref| / max |ref|."""
+    ref = ref.float()
+    return float((got.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-30))
+
+
+def _logit_drift(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
+    """``(max |got - ref|, the largest change of a gap between ref's top-1 and one of its top
+    TOP)``: the second bounds how far ``got`` can tip a choice ``ref`` made among its top tokens."""
+    diff = got - ref
+    top = ref.topk(TOP).indices
+    shift = diff[top] - diff[top[0]]
+    return float(diff.abs().max()), float(shift.abs().max())
+
+
+def _margin(logits: torch.Tensor) -> float:
+    """The top-1 minus top-2 logit: how close a greedy choice is to a tie."""
+    two = logits.topk(2).values
+    return float(two[0] - two[1])
+
+
+@dataclasses.dataclass
+class Drift:
+    """How a request's decode step in a batch compares with the same step alone on this rank."""
+
+    logit: float
+    gap: float
+    ssm: float
+    conv: float
+    kv: float
+    argmax: tuple[int, int]  # (batched, alone)
+    margin: float  # the alone step's top-1 / top-2 margin
+
+    def outside(self) -> list[str]:
+        """What lies outside the bands."""
+        out = []
+        for name, value, band in (
+            ("logits", self.logit, LOGIT_BAND),
+            ("top-gap shift", self.gap, GAP_BAND),
+            ("recurrent state", self.ssm, SSM_BAND),
+            ("conv state", self.conv, CONV_BAND),
+            ("K/V", self.kv, KV_BAND),
+        ):
+            if value > band:
+                out.append(f"{name} {value:.4g} outside its band {band:.4g}")
+        return out
+
+
+def _drift(got: Row, ref: Row) -> Drift:
+    """Compare a request's decode step with the same step alone."""
+    logit, gap = _logit_drift(got.logits, ref.logits)
+    return Drift(
+        logit=logit,
+        gap=gap,
+        ssm=max(_relative(a, b) for a, b in zip(got.ssm, ref.ssm)),
+        conv=max(_relative(a, b) for a, b in zip(got.conv, ref.conv)),
+        kv=max(_relative(a, b) for a, b in zip(got.kv, ref.kv)),
+        argmax=(int(got.logits.argmax()), int(ref.logits.argmax())),
+        margin=_margin(ref.logits),
+    )
+
+
+def _summary(drifts: list[Drift]) -> str:
+    flips = [d for d in drifts if d.argmax[0] != d.argmax[1]]
+    return (
+        f"{len(drifts)} rows: max |logit diff| {max(d.logit for d in drifts):.4f}, max top-gap "
+        f"shift {max(d.gap for d in drifts):.4f}, recurrent / conv state / K/V "
+        f"{max(d.ssm for d in drifts):.3g} / {max(d.conv for d in drifts):.3g} / "
+        f"{max(d.kv for d in drifts):.3g} of max |alone|; {len(flips)} top-1 changes"
+        + (f" at alone margins {[round(d.margin, 4) for d in flips]}" if flips else "")
+    )
+
+
+def _metrics(drifts: list[Drift]) -> dict:
+    """The worst case of each compared quantity, for the report."""
+    return {
+        "rows": len(drifts),
+        "logit": max(d.logit for d in drifts),
+        "gap": max(d.gap for d in drifts),
+        "ssm": max(d.ssm for d in drifts),
+        "conv": max(d.conv for d in drifts),
+        "kv": max(d.kv for d in drifts),
+        "flip_margins": [d.margin for d in drifts if d.argmax[0] != d.argmax[1]],
+    }
+
+
+def _digest(rows: list[Row]) -> str:
+    """The bits of the rows' logits and appended K/V, as a digest the ranks compare."""
+    sha = hashlib.sha256()
+    for row in rows:
+        sha.update(_bits(row.logits).cpu().numpy().tobytes())
+        sha.update(_bits(row.kv).cpu().numpy().tobytes())
+    return sha.hexdigest()
 
 
 class Harness:
@@ -350,6 +456,7 @@ class Harness:
         # The same seed on every rank: the ranks feed the padding rows the same tokens, as the
         # engine's ranks feed every row the same token.
         self.padding_tokens = torch.Generator(device="cuda").manual_seed(9)
+        self.workspace_address = None
 
     def _prefill(self, requests: list[Request]) -> None:
         """Every prompt through the target's prefill steps, whole prompts packed up to
@@ -419,32 +526,52 @@ class Harness:
         them, padded with the padding dummy's rows, from the snapshot; the real rows' logits."""
         size = self.graph_size(len(rows))
         padding = size - len(rows)
-        if size not in self.graphs:
-            self._capture(size, rows, padding)
         gmd, graph, out = self.graphs[size]
+        assert gmd.cuda_graph_workspace.data_ptr() == self.workspace_address, (
+            "the attention workspace moved under the captured graphs"
+        )
         self.restore()
         _fill(gmd, self.manager, rows, num_contexts=0, padding=padding)
         self.static_ids[:size].copy_(self._ids(rows, padding))
         graph.replay()
         return out[: len(rows)]
 
-    def _capture(self, size: int, rows: list[Request], padding: int) -> None:
-        """Capture the decode step at ``size`` rows, as the runner does: its own CUDA-graph
-        metadata, two eager warmup forwards, then the capture."""
+    def capture_graphs(self) -> None:
+        """Capture the decode step at every size of GRAPH_SIZES, as the runner does: first one
+        eager forward on every size's own CUDA-graph metadata, which grows the attention
+        workspace all of them share to what the largest call needs -- thop_attention resizes it
+        in place when a call needs more -- then at each size two warmup forwards and the
+        capture, which resize nothing. A resize after a capture would move the workspace under
+        the graph, which keeps its old address. Every rank runs the same steps."""
         from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
-        gmd = self.md.create_cuda_graph_metadata(size, False, 0, get_memory_buffers())
-        _fill(gmd, self.manager, rows, num_contexts=0, padding=padding)
-        self.static_ids[:size].copy_(self._ids(rows, padding))
-        ids = self.static_ids[:size]
-        for _ in range(2):
-            self.model.forward(attn_metadata=gmd, input_ids=ids)
+        rows = self.probes + self.fillers
+        metadata = {}
+        for size in sorted(GRAPH_SIZES, reverse=True):
+            gmd = self.md.create_cuda_graph_metadata(size, False, 0, get_memory_buffers())
+            _fill(gmd, self.manager, rows[:size], num_contexts=0)
+            self.static_ids[:size].copy_(self._ids(rows[:size], 0))
+            self.model.forward(attn_metadata=gmd, input_ids=self.static_ids[:size])
+            metadata[size] = gmd
         torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.graph_pool):
-            out = self.model.forward(attn_metadata=gmd, input_ids=ids)
-        torch.cuda.synchronize()
-        self.graphs[size] = (gmd, graph, out)
+        self.workspace_address = metadata[max(GRAPH_SIZES)].cuda_graph_workspace.data_ptr()
+        for size in GRAPH_SIZES:
+            gmd = metadata[size]
+            _fill(gmd, self.manager, rows[:size], num_contexts=0)
+            self.static_ids[:size].copy_(self._ids(rows[:size], 0))
+            ids = self.static_ids[:size]
+            for _ in range(2):
+                self.model.forward(attn_metadata=gmd, input_ids=ids)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self.graph_pool):
+                out = self.model.forward(attn_metadata=gmd, input_ids=ids)
+            torch.cuda.synchronize()
+            self.graphs[size] = (gmd, graph, out)
+        assert gmd.cuda_graph_workspace.data_ptr() == self.workspace_address, (
+            "a capture resized the attention workspace"
+        )
+        self.restore()
 
     def kv_at(self, r: Request, layer: int) -> torch.Tensor:
         """``[K/V, head_dim]``: what attention layer ``layer`` holds at ``r``'s decoded position,
@@ -493,15 +620,36 @@ def _batches(h: Harness, size: int) -> list[tuple[list[Request], list[int]]]:
     return out
 
 
-def _check_rows(h: Harness, rows, positions, logits, what: str, reference) -> list[str]:
-    failures = []
-    for pos in positions:
-        r = rows[pos]
-        for diff in _differences(
-            h.row(r, logits[pos]), reference[r.rid], h.gdp_layers, h.attention_layers
-        ):
-            failures.append(f"{what}, {r.name} at row {pos}: {diff}")
-    return failures
+def _compare(h: Harness, rows, positions, logits) -> tuple[list[Drift], str]:
+    """Every probe at ``positions`` against its step alone, and the digest of what the probes'
+    steps left."""
+    got = [h.row(rows[pos], logits[pos]) for pos in positions]
+    drifts = [_drift(row, h.reference[rows[pos].rid]) for row, pos in zip(got, positions)]
+    return drifts, _digest(got)
+
+
+def _failures(what: str, rows, positions, drifts: list[Drift]) -> list[str]:
+    return [
+        f"{what}, {rows[pos].name} at row {pos}: {f}"
+        for pos, d in zip(positions, drifts)
+        for f in d.outside()
+    ]
+
+
+def _ranks_disagree(runs: list[tuple[str, str]]) -> list[str]:
+    """Rank 0's findings where another rank's digest of a run is not its own: every rank runs the
+    same rows, and the all-reduces give every rank the same sums, so every rank holds the same
+    bits of a probe's logits and appended K/V in every run. Collective: every rank passes its
+    runs, ``(what, digest)``, in the same order."""
+    gathered = COMM.gather([digest for _, digest in runs], root=0)
+    if RANK != 0:
+        return []
+    return [
+        f"{what}: rank {other}'s logits or appended K/V differ from rank 0's"
+        for other, theirs in enumerate(gathered)
+        for (what, mine), digest in zip(runs, theirs)
+        if digest != mine
+    ]
 
 
 # --- The checks, in order. Each returns {"failures": [...], "log": [...], ...} for this rank. ----
@@ -525,7 +673,8 @@ def check_reference_rows_are_real(h: Harness) -> dict:
 
 def check_every_rank_forms_the_same_logits_and_kv(h: Harness) -> dict:
     """Every rank forms each probe's logits from the same hidden state with the whole lm_head, and
-    appends the K/V of the one KV head every rank keeps: the four ranks' bits must agree."""
+    appends the K/V of the one KV head every rank keeps: the four ranks' bits must agree, here
+    alone and in every batch of the eager and graph checks (`_ranks_disagree`)."""
     mine = {
         r.rid: (
             _bits(h.reference[r.rid].logits).cpu().numpy().tobytes(),
@@ -548,30 +697,82 @@ def check_every_rank_forms_the_same_logits_and_kv(h: Harness) -> dict:
     }
 
 
-def check_eager_rows_do_not_depend_on_the_batch(h: Harness) -> dict:
-    """Every probe inside eager decode batches of every size: the same bits as alone."""
-    failures, runs = [], 0
+def check_decode_attends_through_thop_and_appends_each_rows_kv(h: Harness) -> dict:
+    """A decode step's eight attention layers run ``thop_attention`` and nothing else, and on a
+    64-row eager step over the engine's own pool each row's K and V land where the manager's page
+    table puts its token: the K and V columns of its qkv row, bit for bit."""
+    M = _modeling()
+    d = h.model.model._decode._d
+    k_cols = slice(d.q_width, d.q_width + d.head_dim)
+    v_cols = slice(d.q_width + d.head_dim, d.q_width + 2 * d.head_dim)
+    rows = _batches(h, 64)[0][0]
+    calls = []
+    original = M.thop_attention
+
+    def recorded(**kwargs):
+        out = original(**kwargs)
+        layer = next(
+            i for i in h.attention_layers if h.manager.layer_offsets[i] == kwargs["local_layer_idx"]
+        )
+        q = kwargs["q"][: len(rows)]
+        expected = torch.stack([q[:, k_cols], q[:, v_cols]], dim=1)
+        appended = torch.stack([h.kv_at(r, layer) for r in rows])
+        calls.append((layer, expected.clone(), appended))
+        return out
+
+    M.thop_attention = recorded
+    try:
+        h.eager(rows)
+    finally:
+        M.thop_attention = original
+    failures = []
+    if len(calls) != len(h.attention_layers):
+        failures.append(
+            f"thop_attention ran {len(calls)} times, in layers {[c[0] for c in calls]}; expected "
+            f"once in each of {list(h.attention_layers)}"
+        )
+    for layer, expected, appended in calls:
+        if not torch.equal(_bits(appended), _bits(expected)):
+            failures.append(f"layer {layer}: the appended K/V are not the qkv GEMM's K/V columns")
+    return {"failures": failures, "log": [f"{len(calls)} thop_attention calls, {len(rows)} rows"]}
+
+
+def check_eager_rows_stay_within_the_band(h: Harness) -> dict:
+    """Every probe inside eager decode batches of every size, against its step alone: within the
+    bands, and every rank holding the same bits of the probes' rows. Reports the drift and every
+    top-1 change with the alone step's margin there."""
+    failures, drifts, runs = [], [], []
     for size in BATCH_SIZES:
         if size == 1:
             continue  # the reference itself
-        for rows, positions in _batches(h, size):
-            logits = h.eager(rows)
-            failures += _check_rows(h, rows, positions, logits, f"eager B={size}", h.reference)
-            runs += 1
-    return {"failures": failures, "log": [f"eager: {runs} batches, {len(failures)} differences"]}
+        for k, (rows, positions) in enumerate(_batches(h, size)):
+            found, digest = _compare(h, rows, positions, h.eager(rows))
+            drifts += found
+            failures += _failures(f"eager B={size}", rows, positions, found)
+            runs.append((f"eager B={size}, batch {k}", digest))
+    failures += _ranks_disagree(runs)
+    return {
+        "failures": failures,
+        "log": [f"eager: {_summary(drifts)}"],
+        "metrics": _metrics(drifts),
+    }
 
 
-def check_graph_rows_equal_the_eager_row(h: Harness) -> dict:
-    """Every probe inside padded CUDA-graph decode batches of every size: the same bits as alone
-    and eager. The padding rows write no slot: after every replay only the real rows' slots differ
-    from the snapshot."""
-    failures, runs = [], 0
+def check_graph_rows_stay_within_the_band(h: Harness) -> dict:
+    """Every probe inside padded CUDA-graph decode batches of every size, B = 1 included, against
+    its eager step alone: within the bands, and every rank holding the same bits of the probes'
+    rows. The padding rows write no slot: after every replay only the real rows' slots differ
+    from the snapshot. Reports, besides, each graph batch against the same rows run eagerly --
+    what the CUDA-graph identity gate's two legs differ by in one step."""
+    failures, drifts, runs, legs = [], [], [], []
     for size in BATCH_SIZES:
-        for rows, positions in _batches(h, size):
+        for k, (rows, positions) in enumerate(_batches(h, size)):
+            what = f"graph B={size} in {h.graph_size(size)}"
             logits = h.graph(rows)
-            failures += _check_rows(
-                h, rows, positions, logits, f"graph B={size} in {h.graph_size(size)}", h.reference
-            )
+            found, digest = _compare(h, rows, positions, logits)
+            drifts += found
+            failures += _failures(what, rows, positions, found)
+            runs.append((f"{what}, batch {k}", digest))
             written = h.changed_slots()
             real = {h.slot[r.rid] for r in rows}
             if not written <= real:
@@ -579,180 +780,66 @@ def check_graph_rows_equal_the_eager_row(h: Harness) -> dict:
                     f"graph B={size}: a padding row wrote slots {sorted(written - real)} "
                     f"(the padding dummy's slot is {h.dummy_slot})"
                 )
-            runs += 1
+            graph_logits = logits[: len(rows)].clone()
+            eager_logits = h.eager(rows)
+            legs += [_logit_drift(graph_logits[pos], eager_logits[pos]) for pos in positions]
+    failures += _ranks_disagree(runs)
+    leg_logit, leg_gap = max(x for x, _ in legs), max(y for _, y in legs)
     return {
         "failures": failures,
         "log": [
-            f"graph: {runs} batches over sizes {sorted(h.graphs)}, {len(failures)} differences"
+            f"graph: sizes {sorted(h.graphs)}, {_summary(drifts)}",
+            f"graph against eager, the same rows: max |logit diff| {leg_logit:.4f}, max top-gap "
+            f"shift {leg_gap:.4f} over {len(legs)} rows",
         ],
+        "metrics": dict(_metrics(drifts), against_eager_logit=leg_logit, against_eager_gap=leg_gap),
     }
 
 
-def check_attention_is_within_band_of_thop_attention(h: Harness) -> dict:
-    """On a 64-row eager decode step over the engine's own pool, in every attention layer:
-
-    - ``invariant_gen_attention`` appends each row's K and V -- the K and V columns of the qkv
-      GEMM's row, bit for bit -- where the manager's own page table puts the row's token;
-    - ``thop_attention``'s append of the same tokens leaves those bytes as they were;
-    - the two outputs, over the rank's 4 query heads, are within the band of each other.
-
-    Band: each kernel is within 2 element ulp of an fp32 reference (measured: 2.00 for this
-    entry, 1.98 for thop's decode kernels), so 4 element ulp between them; relative RMS 0.64 and
-    0.77 ulp, so at most 1.41 between them.
-    """
-    from _validating import ULP, assert_within_ulp
-
-    M = _modeling()
-    d = h.model.model._decode._d
-    k_cols = slice(d.q_width, d.q_width + d.head_dim)
-    v_cols = slice(d.q_width + d.head_dim, d.q_width + 2 * d.head_dim)
-    rows = _batches(h, 64)[0][0]
-    calls = []
-    original = M.invariant_gen_attention
-
-    def both(**kwargs):
-        out = original(**kwargs)
-        q, num_rows = kwargs["q"], kwargs["q"].shape[0]
-        layer = next(
-            i for i in h.attention_layers if h.manager.layer_offsets[i] == kwargs["local_layer_idx"]
-        )
-        ours = out[:num_rows].clone()
-        appended = torch.stack([h.kv_at(r, layer) for r in rows])
-        theirs = M.thop_attention(
-            q=q,
-            output=torch.empty_like(out),
-            local_layer_idx=kwargs["local_layer_idx"],
-            num_heads=kwargs["num_heads"],
-            num_kv_heads=kwargs["num_kv_heads"],
-            head_size=kwargs["head_size"],
-            **h.model.model._prefill.step_args(h.md)["attention"],
-            **M._CALL_CONSTANTS,
-        )
-        after_thop = torch.stack([h.kv_at(r, layer) for r in rows])
-        expected = torch.stack([q[:num_rows, k_cols], q[:num_rows, v_cols]], dim=1)
-        calls.append(
-            (layer, ours, theirs[:num_rows].clone(), expected.clone(), appended, after_thop)
-        )
-        return out
-
-    M.invariant_gen_attention = both
-    try:
-        h.eager(rows)
-    finally:
-        M.invariant_gen_attention = original
-    failures, log = [], []
-    if len(calls) != len(h.attention_layers):
-        failures.append(f"{len(calls)} attention calls, expected {len(h.attention_layers)}")
-    for layer, ours, theirs, expected, appended, after_thop in calls:
-        if not torch.equal(_bits(appended), _bits(expected)):
-            failures.append(f"layer {layer}: the appended K/V are not the qkv GEMM's K/V columns")
-        if not torch.equal(_bits(after_thop), _bits(appended)):
-            failures.append(f"layer {layer}: thop_attention appended other bytes")
-        diff = (ours.float() - theirs.float()).abs()
-        scale = theirs.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-9)
-        element = float((diff / scale).max()) / ULP[torch.bfloat16]
-        rms = float(diff.pow(2).mean().sqrt() / theirs.float().pow(2).mean().sqrt())
+def check_the_band_tells_a_state_one_token_off(h: Harness) -> dict:
+    """The bands have teeth: a decode step from the state one token too far -- every GDP slot
+    holding the state its own decode step left, as a rollback that kept a rejected draft would
+    leave it, each rank its own heads' -- moves every probe's logits by more than twice the logit
+    band. (Measured: at least 4.560, on the 4096-token prefix of `gsm8k_multiturn`, whose top gaps
+    it moves by only 0.322, inside the gap band: there the logit band is what tells the two states
+    apart.)"""
+    smallest, smallest_gap, log = float("inf"), float("inf"), []
+    for r in h.probes:
+        h.restore()
+        after = h.reference[r.rid]
+        slot = h.slot[r.rid]
+        for k, layer in enumerate(h.gdp_layers):
+            h.manager.get_ssm_states(layer)[slot] = after.ssm[k]
+            h.manager.get_conv_states(layer)[slot] = after.conv[k]
+        _fill(h.md, h.manager, [r], num_contexts=0)
+        logits = h.model.forward(attn_metadata=h.md, input_ids=h._ids([r], 0))
+        worst, worst_gap = _logit_drift(logits[0], after.logits)
+        smallest, smallest_gap = min(smallest, worst), min(smallest_gap, worst_gap)
         log.append(
-            f"attention layer {layer}: {element:.2f} element ulp, "
-            f"{rms / ULP[torch.bfloat16]:.3f} rms ulp from thop_attention"
+            f"{r.name}: one token off moves the logits by up to {worst:.3f}, a top gap by up to "
+            f"{worst_gap:.3f}"
         )
-        try:
-            assert_within_ulp(ours, theirs, element_ulp=4.0, rms_ulp=1.41, ulp=ULP[torch.bfloat16])
-        except AssertionError as exc:
-            failures.append(f"layer {layer}: outside the band: {str(exc).splitlines()[0]}")
-    return {"failures": failures, "log": log}
-
-
-def _rival(h: Harness, name: str):
-    """What the decode step ran before it was made invariant, at one of its paths: ``invariant_mm``
-    back on ``cublas_mm``, ``invariant_gen_attention`` back on ``thop_attention``, or -- the path
-    tp4 adds -- the all-reduce on NCCL, whose sum is formed by the message rather than the
-    element (op-allreduce). Returns ``(module attribute, replacement)``."""
-    M = _modeling()
-    if name == "cublas_mm":
-
-        def replaced(x, weight, out_dtype=None):
-            return M.cublas_mm(x, weight.t(), None, out_dtype)
-
-        return "invariant_mm", replaced
-    if name == "thop_attention":
-
-        def replaced(q, output, local_layer_idx, num_heads, num_kv_heads, head_size, **unused):
-            return M.thop_attention(
-                q=q,
-                output=output,
-                local_layer_idx=local_layer_idx,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_size=head_size,
-                **h.model.model._prefill.step_args(h.md)["attention"],
-                **M._CALL_CONSTANTS,
-            )
-
-        return "invariant_gen_attention", replaced
-    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
-
-    nccl = AllReduce(mapping=h.mapping, strategy=AllReduceStrategy.NCCL)
-
-    def replaced(input, comm_buffer, buffer_flags):
-        return nccl(input)
-
-    return "allreduce", replaced
-
-
-def check_the_replaced_paths_depend_on_the_batch(h: Harness, name: str) -> dict:
-    """The comparison has teeth on this model's own state: with one of the decode step's paths put
-    back on what it ran before it was made invariant, some probe's step differs between its batch
-    of one and the eager batches above. Each rival's reference is that rival's own batch of one."""
-    M = _modeling()
-    attribute, replaced = _rival(h, name)
-    original = getattr(M, attribute)
-    setattr(M, attribute, replaced)
-    try:
-        reference = {r.rid: h.row(r, h.eager([r])[0]) for r in h.probes}
-        differ, compared = [], 0
-        for size in RIVAL_BATCH_SIZES:
-            for rows, positions in _batches(h, size):
-                logits = h.eager(rows)
-                for pos in positions:
-                    r = rows[pos]
-                    compared += 1
-                    diffs = _differences(
-                        h.row(r, logits[pos]), reference[r.rid], h.gdp_layers, h.attention_layers
-                    )
-                    if diffs:
-                        differ.append(f"B={size} {r.name} at row {pos}: {'; '.join(diffs)}")
-    finally:
-        setattr(M, attribute, original)
-    return {
-        "failures": [],
-        "differ": len(differ),
-        "compared": compared,
-        "log": [
-            f"rival {name}: {len(differ)} of {compared} probe rows differ from their batch of one"
-        ]
-        + [f"  {line}" for line in differ],
-    }
+    h.restore()
+    log.append(
+        f"one token off: at least {smallest:.3f} / {smallest_gap:.3f} on every probe, against "
+        f"the bands {LOGIT_BAND} / {GAP_BAND}"
+    )
+    failures = []
+    if not smallest > 2 * LOGIT_BAND:
+        failures.append(f"a state one token off moves a probe only {smallest} / {smallest_gap}")
+    return {"failures": failures, "log": log, "metrics": {"logit": smallest, "gap": smallest_gap}}
 
 
 CHECKS = (
     ("reference_rows_are_real", check_reference_rows_are_real),
     ("every_rank_forms_the_same_logits_and_kv", check_every_rank_forms_the_same_logits_and_kv),
-    ("eager_rows_do_not_depend_on_the_batch", check_eager_rows_do_not_depend_on_the_batch),
-    ("graph_rows_equal_the_eager_row", check_graph_rows_equal_the_eager_row),
     (
-        "attention_is_within_band_of_thop_attention",
-        check_attention_is_within_band_of_thop_attention,
+        "decode_attends_through_thop_and_appends_each_rows_kv",
+        check_decode_attends_through_thop_and_appends_each_rows_kv,
     ),
-    ("rival_cublas_mm", lambda h: check_the_replaced_paths_depend_on_the_batch(h, "cublas_mm")),
-    (
-        "rival_thop_attention",
-        lambda h: check_the_replaced_paths_depend_on_the_batch(h, "thop_attention"),
-    ),
-    (
-        "rival_nccl_allreduce",
-        lambda h: check_the_replaced_paths_depend_on_the_batch(h, "nccl_allreduce"),
-    ),
+    ("eager_rows_stay_within_the_band", check_eager_rows_stay_within_the_band),
+    ("graph_rows_stay_within_the_band", check_graph_rows_stay_within_the_band),
+    ("the_band_tells_a_state_one_token_off", check_the_band_tells_a_state_one_token_off),
 )
 
 
@@ -792,6 +879,9 @@ def _run_one_rank() -> int:
             for r in h.probes:
                 logits = h.eager([r])
                 h.reference[r.rid] = h.row(r, logits[0])
+            start = time.time()
+            h.capture_graphs()
+            log(f"captured graphs {sorted(h.graphs)} in {time.time() - start:.0f}s")
             for name, check in CHECKS:
                 start = time.time()
                 result = check(h)

@@ -20,9 +20,9 @@ rows whose output it owns:
   on the target's own input -- with its bands unchanged, plus the expert-parallel path's own
   gates (`failures`): the dispatch moves bytes, the window is the entry's arithmetic, and the
   expert sums differ from the full window's by the EP term alone;
-* steps with an idle rank (`test_an_idle_ranks_dummy_leaves_the_real_rows_bits`): the real rows
-  are bitwise the same whatever the dummy and padding rows hold, and equal to the single-GPU
-  block's up to the EP term;
+* steps with an idle rank (`test_an_idle_ranks_dummy_keeps_the_real_rows_within_the_band`): the
+  real rows stay within `FILLER_BAND` whatever the dummy and padding rows hold, and equal the
+  single-GPU block's up to the EP term;
 * `test_the_decode_block_replays_in_a_cuda_graph`: captured at each decode height on all four
   ranks, a replay is bitwise the eager call;
 * `test_the_gates_refuse_plausible_wrong_blocks`: one planted mistake at a time breaks the gates
@@ -99,6 +99,17 @@ row scale apart. Measured: none of 87,465,984 elements differs over every step h
 9,666,048 in the idle-rank steps); on random inputs, one in ten million. So: one ulp element-wise,
 and at most one element in 10^5 (or one) differing, a hundred times the random-input rate.
 Rounding each window to bf16 first, the alternative, moves 36.2-37.5% of them (`RIVALS`)."""
+
+FILLER_BAND = (12.0, 0.8)
+"""A real row's block output with the non-real rows holding one of `J.FILLERS`, against the same
+row with them holding the first, in bf16 ulps of the row scale (element, relative RMS). Every rank
+keeps its row count between the runs, and the gathered batch its size, so each cuBLAS GEMM runs
+the same kernel, which computes a row from that row alone. What can move is the routed experts:
+the fillers route to other experts, which changes the group sizes of `latent_moe_experts`' grouped
+GEMMs, and the entry holds a row to its reference within its band (6 element / 0.4 RMS) rather
+than to the bits it gets beside other rows. Each run sits within that band of the same reference,
+so the two within twice it; the norm and the projection back up that follow carry a relative
+error through unchanged. Measured over every idle step, layer, rank and filler: no element moved."""
 
 
 def failures(metrics: dict) -> list[str]:
@@ -188,27 +199,38 @@ def test_moe_block(layer, step, measured) -> None:
 @pytest.mark.gpu4
 @pytest.mark.parametrize("case", J.IDLE_STEPS, ids=[c.name for c in J.IDLE_STEPS])
 @pytest.mark.parametrize("layer", J.LAYERS, ids=[f"layer{i}" for i in J.LAYERS])
-def test_an_idle_ranks_dummy_leaves_the_real_rows_bits(layer, case, measured) -> None:
+def test_an_idle_ranks_dummy_keeps_the_real_rows_within_the_band(layer, case, measured) -> None:
     """A step in which a rank has no request -- it runs the attention-DP dummy -- and graph-padded
-    ranks. Under each of `J.FILLERS` in every non-real row, the real rows' block outputs are
-    bitwise the same, on every rank that has any; and they equal the single-GPU block's on the
-    same rows, which never sees the dummy or another rank, wherever the expert sums agree with
-    the full window's (the EP term, gated as in `failures`).
+    ranks. Under each of `J.FILLERS` in every non-real row, the real rows' block outputs stay
+    within `FILLER_BAND` of their outputs under the first, on every rank that has any; and under
+    the first they equal the single-GPU block's on the same rows, which never sees the dummy or
+    another rank, wherever the expert sums agree with the full window's (the EP term, gated as in
+    `failures`). Prints the largest distance between fillers (`-s`).
 
     The fillers route to different experts, so the experts that real rows share with them change
-    group sizes between runs: the check reaches the grouped GEMMs' batch invariance, not only the
-    row independence of a GEMM at fixed M."""
+    group sizes between runs: the check reaches the grouped GEMMs, not only a GEMM at fixed M."""
     records = _per_rank(measured["idle"], layer=layer, step=case.name)
     for record in records:
         print(json.dumps(record))
     assert any(any(r["non_real_experts_differ"]) for r in records), (
         "the fillers routed alike: the check would not move the experts' group sizes"
     )
+    across = [d for r in records if r["real"] for d in r["real_rows_across_fillers"]]
+    print(
+        f"fillers, layer {layer}, {case.name}: real rows at most "
+        f"{max(d['element_ulp'] for d in across):.3g} element / "
+        f"{max(d['rms_ulp'] for d in across):.3g} RMS bf16 ulp from the first filler's, "
+        f"{sum(d['differing'] for d in across)} of {sum(d['numel'] for d in across)} elements "
+        "differing"
+    )
     for record in records:
         if not record["real"]:
             continue
         where = f"layer {layer}, {case.name}, rank {record['rank']}"
-        assert record["real_rows_bitwise_across_fillers"], f"{where}: a filler moved real rows"
+        for filler, d in zip(J.FILLERS[1:], record["real_rows_across_fillers"]):
+            assert d["element_ulp"] <= FILLER_BAND[0] and d["rms_ulp"] <= FILLER_BAND[1], (
+                f"{where}: {filler} moved the real rows beyond the band: {d}"
+            )
         ep = record["real_ep"]
         assert ep["element_ulp"] <= EP_ELEMENT_ULP and ep["differing"] <= max(
             1, int(ep["numel"] * EP_DIFFERING_FRACTION)

@@ -3,12 +3,13 @@
 """GPU test (one 4-GPU node): the nemotron4 tp4 MTP verify step against the decode steps of the
 same tokens, on every rank, on real weights and real cache state.
 
-A verify attends through ``thop_attention`` and a decode step through ``invariant_gen_attention``,
+A verify runs the decode step's entries at three tokens a row -- cuBLAS at three times the rows,
+``thop_attention``'s generation kernels at three tokens a row, the GDP and conv verify entries --
 so a verify token is held to its decode step as tp1's test holds it
-(``test_modeling_v2_verify_invariance.py``): bitwise, what it computes before attention's output
-first reaches it; within bands derived from measurement (the job's ``LOGIT_BAND`` and the rest,
-stated there), everything after; reported, whether its rows move with the batch. The drift check
-measures the deviation tp4's MTP identity and acceptance gates rest on.
+(``test_modeling_v2_verify_invariance.py``): within bands derived from measurement (the job's
+``LOGIT_BAND`` and the rest, stated there), everything it leaves; reported, whether its rows move
+with the batch. The drift check measures the deviation tp4's MTP identity and acceptance gates
+rest on.
 
 Collected entry point of ``_tp4_verify_invariance_ranks.py`` beside it, which says what runs and
 how. That job runs its four ranks as an MPI world under ``mpirun``, the way a tensor-parallel
@@ -125,21 +126,17 @@ def test_every_rank_forms_the_same_logits_and_kv(report):
 
 
 @pytest.mark.no_xdist
-def test_decode_attends_through_the_invariant_entry_and_a_verify_through_thop(report):
-    """The trunk's eight attention layers run ``invariant_gen_attention`` in a decode step and
-    ``thop_attention`` in a verify step, on every rank."""
-    failures = _failures(
-        report, "decode_attends_through_the_invariant_entry_and_a_verify_through_thop"
-    )
+def test_decode_and_verify_attend_through_thop(report):
+    """The trunk's eight attention layers run ``thop_attention`` in a decode step (one token a
+    row) and in a verify step (three), and nothing else, on every rank."""
+    failures = _failures(report, "decode_and_verify_attend_through_thop")
     assert not failures, "\n".join(failures)
 
 
 @pytest.mark.no_xdist
 def test_verify_alone_is_within_the_band_of_decode(report):
     """Every probe's verify step alone (B = 1), eagerly, with every entry's guard on, on every
-    rank: token j's state in the GDP layers before the first attention layer and its K/V in that
-    layer are the bits of its decode step, everything later is within the bands, and the verify
-    writes no slot."""
+    rank: each token within the bands of its decode step, and the verify writes no slot."""
     failures = _failures(report, "verify_alone_is_within_the_band_of_decode")
     assert not failures, "\n".join(failures[:40])
 
@@ -147,8 +144,8 @@ def test_verify_alone_is_within_the_band_of_decode(report):
 @pytest.mark.no_xdist
 def test_verify_rows_in_eager_batches(report):
     """Every probe inside eager verify batches of every size up to 1024 requests (3072 rows), on
-    every rank: within the bands of its decode steps, bitwise before attention; the job reports
-    how many rows move with the batch."""
+    every rank: within the bands of its decode steps; the job reports how many rows move with the
+    batch."""
     failures = _failures(report, "verify_rows_in_eager_batches")
     assert not failures, "\n".join(failures[:40])
 
@@ -156,8 +153,8 @@ def test_verify_rows_in_eager_batches(report):
 @pytest.mark.no_xdist
 def test_verify_rows_in_padded_graphs(report):
     """Every probe inside padded CUDA-graph verify batches of every size up to 1024, on every
-    rank: within the bands of its decode steps, bitwise before attention, and the verify writes
-    no slot, the padding rows' included."""
+    rank: within the bands of its decode steps, and the verify writes no slot, the padding rows'
+    included."""
     failures = _failures(report, "verify_rows_in_padded_graphs")
     assert not failures, "\n".join(failures[:40])
 
@@ -166,7 +163,7 @@ def test_verify_rows_in_padded_graphs(report):
 def test_commit_promotes_the_state_the_verify_stored(report):
     """After a padded graph verify, the worker's commit leaves in each probe's slot, on every
     rank, exactly the state the verify stored for its last accepted token (1, 2 and 3), in every
-    GDP layer, and writes no other request's slot."""
+    GDP layer, within the state bands of its decode step's, and writes no other request's slot."""
     failures = _failures(report, "commit_promotes_the_state_the_verify_stored")
     assert not failures, "\n".join(failures[:40])
 
@@ -181,21 +178,6 @@ def test_verify_at_the_length_limit(report):
 
 
 @pytest.mark.no_xdist
-def test_the_exact_comparison_moves_with_cublas(report):
-    """The bitwise half has teeth on this model's own state: with the GEMMs that run through
-    ``invariant_mm`` put back on ``cublas_mm``, an eager verify batch moves some probe's state
-    before the first attention layer, or its K/V in that layer, off that rival's own decode
-    steps alone, on every rank."""
-    ranks = report["checks"]["rival_cublas_mm"]["ranks"]
-    moved = [found["differ"] for found in ranks]
-    assert all(moved), (
-        f"with cublas_mm back in the verify nothing before attention moved on some rank ({moved} "
-        f"of {ranks[0]['compared']} tokens per rank), so the bitwise half cannot tell an invariant "
-        "verify from a variant one there"
-    )
-
-
-@pytest.mark.no_xdist
 def test_the_band_tells_a_state_one_token_off(report):
     """A verify from the state one token too far moves every probe's logits by more than twice the
     logit band, and one of its top gaps past the gap band, on every rank."""
@@ -206,17 +188,18 @@ def test_the_band_tells_a_state_one_token_off(report):
 @pytest.mark.no_xdist
 def test_the_drift_over_consecutive_verifies(report):
     """MTP on along MTP off's own greedy tokens for as many tokens as the MTP identity gate
-    generates, each verify alone in the graph of one with every draft accepted and committed: at
-    every matched position the logits stay within the drift bands of the decode step's, and every
-    top-1 change sits at a decode margin within the gap band, on every rank."""
+    generates, MTP off decoding each probe alone, each verify alone in the graph of one with every
+    draft accepted and committed: at every matched position the logits stay within the drift
+    bands of the decode step's, and every top-1 change sits at a decode margin within the gap
+    band, on every rank."""
     failures = _failures(report, "the_drift_over_consecutive_verifies")
     assert not failures, "\n".join(failures)
 
 
 @pytest.mark.no_xdist
 def test_the_mtp_layer_drafts_as_prefill_drafts(report):
-    """The MTP layer's draft step gives the same bits in the decode target as in the prefill
-    target, through ``MTPLayer``'s routing, on every rank and the same on all four; the decode
-    target's row-invariant MoE handed the MTP layer's views is refused by its guard."""
+    """The MTP layer's draft step through ``MTPLayer``'s routing reaches the decode target, whose
+    draft logits agree with the prefill target's within the logit band, on every rank; every
+    rank's outputs of both targets are rank 0's bits."""
     failures = _failures(report, "the_mtp_layer_drafts_as_prefill_drafts")
     assert not failures, "\n".join(failures)

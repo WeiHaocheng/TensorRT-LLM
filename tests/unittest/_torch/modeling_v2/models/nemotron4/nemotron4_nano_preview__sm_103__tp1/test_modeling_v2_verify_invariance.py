@@ -4,29 +4,25 @@
 
 Under one-model MTP-Eagle (``max_draft_len`` 2) a generation row carries its last accepted token
 and two drafts, and the trunk verifies the three in one step: 3B rows through every GEMM, three
-tokens per request through attention, the GDP mixers through the verify entries. Every entry of
-that step but one gives token j the bits it gets as an MTP-off decode step of its own: the GEMMs
-(``invariant_mm`` where cuBLAS is row-variant), the wide residual, the norms, the MoE and the GDP
-and conv verify entries. Attention is the exception. A decode step attends through
-``invariant_gen_attention``, a verify through ``thop_attention``'s generation kernels, which sum
-the softmax in another order and pick their kernel by batch size and history length. So a verify
-token is compared with its decode step three ways:
+tokens per request through attention, the GDP mixers through the verify entries. A decode step
+runs the same entries over one token a row -- cuBLAS for every GEMM, ``thop_attention``'s
+generation kernels -- and the GDP and conv decode entries. cuBLAS picks its kernel by the row
+count, thop by the batch size, history length and tokens per row, and the verify entries sum in
+their own order, so a verify token sits near its decode step's bits rather than on them. It is
+compared with its decode step two ways:
 
-* **bitwise**, what it computes before attention's output first reaches it: the recurrent and
-  conv state it leaves in the GDP layers before the first attention layer, and the K/V it appends
-  in that layer. The verify writes no state slot, and the worker's commit
-  (``update_mamba_states``) promotes exactly the state the verify stored for the last accepted
-  token;
-* **within a band**, everything downstream: its fp32 logits, and the state and K/V it leaves in
-  every later layer. The bands are derived from measurement below (`LOGIT_BAND` and the rest);
-* **reported**: whether a probe's verify rows move with the batch they run in -- thop's
-  generation kernel is not batch-invariant, which is why ``invariant_gen_attention`` was written.
+* **within a band**, everything it leaves: its fp32 logits, the recurrent and conv state it leaves
+  in every GDP layer and the K/V it appends in every attention layer. The bands are derived from
+  measurement below (`LOGIT_BAND` and the rest). The verify writes no state slot, and the worker's
+  commit (``update_mamba_states``) promotes exactly the state the verify stored for the last
+  accepted token;
+* **reported**: whether a probe's verify rows move with the batch they run in.
 
 A last test follows MTP on along MTP off's own greedy tokens for as many tokens as the MTP
-identity gate generates -- consecutive verifies that accept every draft, the state committed
-after each -- and measures the drift of the logits at matched positions. The MTP identity gate's
-near-tie band and the MTP acceptance gate's verify term rest on it (`DRIFT_GAP_BAND`,
-`DRIFT_LOGIT_BAND`).
+identity gate generates -- MTP off decoding each probe alone, MTP on in consecutive verifies that
+accept every draft, the state committed after each -- and measures the drift of the logits at
+matched positions. The MTP identity gate's near-tie band and the MTP acceptance gate's verify term
+rest on it (`DRIFT_GAP_BAND`, `DRIFT_LOGIT_BAND`).
 
 What runs is the target and the engine's own pieces around it, built as the engine builds them
 under ``MTPDecodingConfig(max_draft_len=2)``: the spec config resolved against the checkpoint
@@ -94,37 +90,37 @@ SHORT_TOKENS, LONG_TOKENS = 256, 1024
 #: The decode reference's top tokens whose gap to its top-1 a verify must keep (`Deviation.gap`).
 TOP = 8
 
-# The bands. A verify token differs from its decode step only through the attention kernel:
-# thop_attention's generation kernels against invariant_gen_attention, both an fp32 softmax over
-# the same bf16 K/V rounded once to bf16, summed in other orders. That leaves attention outputs a
-# bf16 rounding apart, which every later layer carries into the token's state, its K/V and its
-# logits; this model amplifies such differences (a decode step and a teacher-forced one, apart
-# only in GEMM row counts, differ by up to 1.15 in their logits). How far is measured here, on
-# this model's own state: every probe's three tokens alone (36), in eager batches of 2 to 256
-# (396) and in padded graphs of 1 to 256 (432). The worst cases, the same in every run (the
-# kernels are deterministic): |logit diff| 0.5371 alone and 1.1815 in batches and graphs, where
-# thop picks other kernel variants; top-gap shift 0.3120 alone, 0.3991 in batches; the later
-# layers' recurrent state, conv state and K/V 0.0462 / 0.087 / 0.0863 of max |decode|. Each band
-# is its worst case plus a quarter, rounded up: room for a batch, history or graph size the runs
-# did not take, where thop may pick yet another variant.
+# The bands. A verify token differs from its decode step through every kernel whose choice moves
+# with the step: cuBLAS at 3B rows against B, thop_attention's generation kernels at three tokens a
+# row against one, the GDP and conv verify entries against the decode ones. Each rounds within a
+# bf16 step of the other, and every later layer carries the difference into the token's state, its
+# K/V and its logits; this model amplifies such differences (a decode step and a teacher-forced one,
+# apart only in GEMM row counts, differ by up to 1.15 in their logits). How far is measured here, on
+# this model's own state: every probe's three tokens alone (36), in eager batches of 2 to 256 (396)
+# and in padded graphs of 1 to 256 (432). The kernels are deterministic, so the worst cases repeat
+# run to run: |logit diff| 0.8246 alone and 1.0445 in batches and graphs; top-gap shift 0.2685
+# alone, 0.4664 in batches; recurrent state, conv state and K/V 0.0535 / 0.069 / 0.0877 of max
+# |decode|; no top-1 changed. Each band is its worst case plus a quarter, rounded up: room for a
+# batch, history or graph size the runs did not take, where cuBLAS or thop may pick yet another
+# variant.
 #: max |verify logit - decode logit| over the vocabulary, fp32.
-LOGIT_BAND = 1.48
+LOGIT_BAND = 1.31
 #: The largest change, verify against decode, of the gap between the decode step's top-1 and any
 #: of its top `TOP` tokens: how close to a tie the verify can tip the decode step's choice.
-GAP_BAND = 0.50
-#: max |verify - decode| / max |decode|, per tensor, over the GDP layers after the first
-#: attention layer (recurrent state fp32, conv state bf16) and the attention layers after it (K/V).
-SSM_BAND = 0.058
-CONV_BAND = 0.11
+GAP_BAND = 0.59
+#: max |verify - decode| / max |decode|, per tensor, over every GDP layer (recurrent state fp32,
+#: conv state bf16) and every attention layer (K/V).
+SSM_BAND = 0.067
+CONV_BAND = 0.087
 KV_BAND = 0.11
 # The drift: the same two quantities over the 6132 matched positions of
 # `test_the_drift_over_consecutive_verifies`, where the verify's state and K/V carry each earlier
-# verify's deviation. Worst cases 5.0471 (|logit diff|, on the 2-shot chat `clips`; 0.68-1.5
-# on every other probe) and 0.7819 (top-gap shift), plus a quarter, rounded up. The MTP identity
-# gate's near-tie band is DRIFT_GAP_BAND; the MTP acceptance gate's verify term is the measured
-# |logit diff|.
-DRIFT_LOGIT_BAND = 6.31
-DRIFT_GAP_BAND = 0.98
+# verify's deviation. Worst cases 4.3650 (|logit diff|, on the 2-shot chat `clips`; 0.68-1.41 on
+# every other probe) and 0.9300 (top-gap shift, on `haiku`), plus a quarter, rounded up. The MTP
+# identity gate's near-tie band is built on the measured top-gap shift; the MTP acceptance gate's
+# verify term is the measured |logit diff|.
+DRIFT_LOGIT_BAND = 5.46
+DRIFT_GAP_BAND = 1.17
 
 
 def _modeling():
@@ -350,7 +346,6 @@ def _margin(logits: torch.Tensor) -> float:
 class Deviation:
     """How a verify token compares with its decode step."""
 
-    exact: list[str]  # bitwise quantities that differ: must be none
     logit: float
     gap: float
     ssm: float
@@ -361,7 +356,7 @@ class Deviation:
 
     def outside(self) -> list[str]:
         """What lies outside the bands."""
-        out = list(self.exact)
+        out = []
         for name, value, band in (
             ("logits", self.logit, LOGIT_BAND),
             ("top-gap shift", self.gap, GAP_BAND),
@@ -374,30 +369,15 @@ class Deviation:
         return out
 
 
-def _deviation(got: Token, ref: Token, upstream: int, gdp_layers) -> Deviation:
-    """Compare a verify token with its decode step: bitwise the GDP layers before the first
-    attention layer (global index below ``upstream``) and the first attention layer's K/V,
-    by deviation everything after."""
-    exact = []
-    for name, got_states, ref_states in (("ssm", got.ssm, ref.ssm), ("conv", got.conv, ref.conv)):
-        bad = [
-            layer
-            for layer, a, b in zip(gdp_layers, got_states, ref_states)
-            if layer < upstream and not _equal(a, b)
-        ]
-        if bad:
-            exact.append(f"{name} state differs bitwise in GDP layers {bad}, before attention")
-    if not _equal(got.kv[0], ref.kv[0]):
-        exact.append("the K/V appended in the first attention layer differs bitwise")
-    later = [k for k, layer in enumerate(gdp_layers) if layer > upstream]
+def _deviation(got: Token, ref: Token) -> Deviation:
+    """Compare a verify token with its decode step, in every layer."""
     logit, gap = _logit_deviation(got.logits, ref.logits)
     return Deviation(
-        exact=exact,
         logit=logit,
         gap=gap,
-        ssm=max(_relative(got.ssm[k], ref.ssm[k]) for k in later),
-        conv=max(_relative(got.conv[k], ref.conv[k]) for k in later),
-        kv=max(_relative(a, b) for a, b in zip(got.kv[1:], ref.kv[1:])),
+        ssm=max(_relative(a, b) for a, b in zip(got.ssm, ref.ssm)),
+        conv=max(_relative(a, b) for a, b in zip(got.conv, ref.conv)),
+        kv=max(_relative(a, b) for a, b in zip(got.kv, ref.kv)),
         argmax=(int(got.logits.argmax()), int(ref.logits.argmax())),
         margin=_margin(ref.logits),
     )
@@ -421,9 +401,6 @@ class Harness:
         self.lm_head = self.model.lm_head.weight
         self.gdp_layers = self.core.gdp_layers
         self.attention_layers = self.core.attention_layers
-        #: Everything a token computes in layers below the first attention layer is upstream of
-        #: attention's output.
-        self.upstream = min(self.attention_layers)
         self.vocab = self.config.pretrained_config.text_config.vocab_size
         self.probes, self.fillers = _requests(P.prompt_set(tokenizer))
         # The longest history a verify starts from: the request's last accepted token is its
@@ -501,6 +478,12 @@ class Harness:
         feed their whole prompt; generation rows feed ``tokens`` tokens over ``cached`` (default:
         the prompt); ``padding`` rows are the padding dummy's, a generation request of
         1 + D tokens of which D are history, as the runner fills it."""
+        # The cache manager stages a step's block-table gather index in one pinned host buffer
+        # that the device reads only when the step's copy runs (`IndexMapper::getCopyIndex`): a
+        # step filled while an earlier one is still queued would hand the earlier one its rows,
+        # and that step's K/V appends would land in another request's pages. So the device
+        # drains first.
+        torch.cuda.synchronize()
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         gen = rows[num_contexts:]
@@ -771,7 +754,7 @@ class Harness:
 
     def alone_logits(self, r: Request) -> torch.Tensor:
         """``r``'s verify logits alone, eagerly, from the snapshot: what its rows in a batch are
-        held against bitwise, to report whether they move with the batch."""
+        compared with, to report whether they move with the batch."""
         if r.rid not in self.alone:
             self.alone[r.rid] = self.eager([r])[:TOKENS].clone()
         return self.alone[r.rid]
@@ -780,10 +763,7 @@ class Harness:
         """Every token of the probes at ``positions`` against its decode step."""
         return [
             _deviation(
-                self.verify_token(rows[pos], pos, j, logits),
-                self.reference[rows[pos].rid][j],
-                self.upstream,
-                self.gdp_layers,
+                self.verify_token(rows[pos], pos, j, logits), self.reference[rows[pos].rid][j]
             )
             for pos in positions
             for j in range(TOKENS)
@@ -905,20 +885,19 @@ def test_reference_rows_are_real(harness):
 
 
 @torch.inference_mode()
-def test_decode_attends_through_the_invariant_entry_and_a_verify_through_thop(harness, monkeypatch):
-    """The trunk's eight attention layers run ``invariant_gen_attention`` in a decode step (one
-    token a row) and ``thop_attention`` in a verify step (three), and nothing else."""
+def test_decode_and_verify_attend_through_thop(harness, monkeypatch):
+    """The trunk's eight attention layers run ``thop_attention`` in a decode step (one token a
+    row) and in a verify step (three), and nothing else."""
     M = _modeling()
     h = harness
     calls = []
-    for name in ("invariant_gen_attention", "thop_attention"):
-        entry = getattr(M, name)
+    entry = M.thop_attention
 
-        def counted(*args, _entry=entry, _name=name, **kwargs):
-            calls.append(_name)
-            return _entry(*args, **kwargs)
+    def counted(*args, **kwargs):
+        calls.append(int(kwargs["q"].shape[0]))
+        return entry(*args, **kwargs)
 
-        monkeypatch.setattr(M, name, counted)
+    monkeypatch.setattr(M, "thop_attention", counted)
     r = h.probes[0]
     h.restore()
     h.decode(r, 0)
@@ -927,22 +906,19 @@ def test_decode_attends_through_the_invariant_entry_and_a_verify_through_thop(ha
     verify = list(calls)
     h.restore()
     layers = len(h.attention_layers)
-    assert decode == ["invariant_gen_attention"] * layers, decode
-    assert verify == ["thop_attention"] * layers, verify
+    assert decode == [1] * layers, decode
+    assert verify == [TOKENS] * layers, verify
 
 
 @torch.inference_mode()
 def test_verify_alone_is_within_the_band_of_decode(harness):
-    """Every probe's verify step alone (B = 1), eagerly, with every entry's guard on: token j's
-    state in the GDP layers before the first attention layer and its K/V in that layer are the
-    bits of its decode step, everything later is within the bands, and the verify writes no
-    slot."""
+    """Every probe's verify step alone (B = 1), eagerly, with every entry's guard on: each token
+    within the bands of its decode step, and the verify writes no slot."""
     M = _modeling()
     h = harness
     failures, deviations = [], []
     with validating(
         M.thop_attention,
-        M.invariant_mm,
         M.cublas_mm,
         M.gdp_verify,
         M.causal_conv1d_verify,
@@ -961,8 +937,8 @@ def test_verify_alone_is_within_the_band_of_decode(harness):
 @torch.inference_mode()
 def test_verify_rows_in_eager_batches(harness):
     """Every probe inside eager verify batches of every size: within the bands of its decode
-    steps, bitwise before attention. Reports how many of its rows move with the batch -- differ
-    from the same probe's verify alone -- and by how much."""
+    steps. Reports how many of its rows move with the batch -- differ from the same probe's
+    verify alone -- and by how much."""
     h = harness
     failures, deviations, moved, compared, largest = [], [], 0, 0, 0.0
     for size in BATCH_SIZES:
@@ -993,9 +969,8 @@ def test_verify_rows_in_eager_batches(harness):
 @torch.inference_mode()
 def test_verify_rows_in_padded_graphs(harness):
     """Every probe inside padded CUDA-graph verify batches of every size, B = 1 included: within
-    the bands of its decode steps, bitwise before attention, and the verify writes no slot, the
-    padding rows' included. Reports how many rows differ from the same probe's eager verify
-    alone."""
+    the bands of its decode steps, and the verify writes no slot, the padding rows' included.
+    Reports how many rows differ from the same probe's eager verify alone."""
     h = harness
     failures, deviations, moved, compared, largest = [], [], 0, 0, 0.0
     for size in BATCH_SIZES:
@@ -1024,8 +999,8 @@ def test_commit_promotes_the_state_the_verify_stored(harness):
     """After a padded graph verify of every probe (15 rows in the graph of 16), the worker's
     commit (``update_mamba_states`` with the engine's own slots, the padding dummy's included)
     leaves in each probe's slot, for one, two and three accepted, exactly the state the verify
-    stored for its last accepted token, in every GDP layer: bitwise its decode step's before the
-    first attention layer, within the state bands after it. It writes no other request's slot."""
+    stored for its last accepted token, in every GDP layer, within the state bands of its decode
+    step's. It writes no other request's slot."""
     h = harness
     rows = h.probes + h.fillers[:3]
     accepted = [1 + k % TOKENS for k in range(len(rows))]
@@ -1053,12 +1028,8 @@ def test_commit_promotes_the_state_the_verify_stored(harness):
                 failures.append(
                     f"{r.name}, {n} accepted: the slot is not the stored state, {layer}"
                 )
-            if layer < h.upstream:
-                if not (_equal(ssm, ref.ssm[k]) and _equal(conv, ref.conv[k])):
-                    failures.append(f"{r.name}, {n} accepted: differs from decode bitwise, {layer}")
-            else:
-                ssm_dev = max(ssm_dev, _relative(ssm, ref.ssm[k]))
-                conv_dev = max(conv_dev, _relative(conv, ref.conv[k]))
+            ssm_dev = max(ssm_dev, _relative(ssm, ref.ssm[k]))
+            conv_dev = max(conv_dev, _relative(conv, ref.conv[k]))
     h.restore()
     h.log(f"commit: recurrent / conv state {ssm_dev:.3g} / {conv_dev:.3g} of max |decode|")
     assert ssm_dev <= SSM_BAND and conv_dev <= CONV_BAND, (ssm_dev, conv_dev)
@@ -1104,45 +1075,6 @@ def test_verify_at_the_length_limit(harness, monkeypatch):
 
 
 @torch.inference_mode()
-def test_the_exact_comparison_moves_with_cublas(harness, monkeypatch):
-    """The bitwise half has teeth on this model's own state: with the GEMMs that run through
-    ``invariant_mm`` put back on ``cublas_mm`` -- what the verify ran before it was made
-    invariant -- an eager verify batch of 64 rows (192 GEMM rows, where cuBLAS splits the dense
-    MLPs of layers 1 and 3 otherwise than at one row) moves some probe's state before the first
-    attention layer, or its K/V in that layer, off that rival's own decode steps alone."""
-    M = _modeling()
-    h = harness
-
-    def replaced(x, weight, out_dtype=None):
-        return M.cublas_mm(x, weight.t(), None, out_dtype)
-
-    monkeypatch.setattr(M, "invariant_mm", replaced)
-    ((rows, positions),) = _batches(h, 64)
-    reference = {}
-    for pos in positions:
-        r = rows[pos]
-        h.restore()
-        reference[r.rid] = [h.slot_token(r, j, h.decode(r, j)) for j in range(TOKENS)]
-    h.restore()
-    logits = h.eager(rows)
-    differ = []
-    for pos in positions:
-        r = rows[pos]
-        for j in range(TOKENS):
-            got = h.verify_token(r, pos, j, logits)
-            exact = _deviation(got, reference[r.rid][j], h.upstream, h.gdp_layers).exact
-            differ += [f"{r.name} token {j}: {e}" for e in exact]
-    h.restore()
-    h.log(f"rival cublas_mm: {len(differ)} bitwise differences before attention")
-    for line in differ[:24]:
-        h.log(f"  {line}")
-    assert differ, (
-        "with cublas_mm back in the verify nothing before attention moved, so the bitwise half "
-        "cannot tell an invariant verify from a variant one here"
-    )
-
-
-@torch.inference_mode()
 def test_the_band_tells_a_state_one_token_off(harness):
     """The bands have teeth: a verify that starts from the state one token too far -- every GDP
     slot holding the state after t0 already, as a rollback that kept a rejected draft would
@@ -1178,32 +1110,27 @@ def test_the_band_tells_a_state_one_token_off(harness):
 @torch.inference_mode()
 def test_the_drift_over_consecutive_verifies(harness):
     """MTP on along MTP off's own greedy tokens, as far as the MTP identity gate generates: each
-    probe's 255 or 1023 tokens after t0 decoded one a step (MTP off), then verified three a step
-    from the same state, each verify alone in the padded graph of one (as the identity gate runs a
-    prompt) with every draft accepted and its state committed (MTP on). At every matched
-    position -- the same tokens before it -- the verify's logits stay within the drift bands of
-    the decode step's, and every top-1 change sits at a decode margin within the gap band: a
-    parting the identity gate would see there is a near-tie by its rule."""
+    probe's 255 or 1023 tokens after t0 decoded one a step, alone (MTP off, as the identity gate
+    runs a prompt), then verified three a step from the same state, each verify alone in the
+    padded graph of one with every draft accepted and its state committed (MTP on). At every
+    matched position -- the same tokens before it -- the verify's logits stay within the drift
+    bands of the decode step's, and every top-1 change sits at a decode margin within the gap
+    band: a parting the identity gate would see there is a near-tie by its rule."""
     h = harness
     probes = h.probes
-    longest = max(r.drift_steps for r in probes) * TOKENS
-    # MTP off: every probe decoded together, one token a step (decode rows do not depend on the
-    # batch), each until its own horizon. Position n feeds token n; its logits pick token n + 1.
-    h.restore()
+    # MTP off: each probe decoded alone, one token a step, until its own horizon. Position n
+    # feeds token n; its logits pick token n + 1.
     tokens = {r.rid: [r.tokens[0]] for r in probes}
     decode = {r.rid: [] for r in probes}
-    for n in range(longest):
-        rows = [r for r in probes if n < r.drift_steps * TOKENS]
-        h.fill(h.md, rows, 0, tokens=1, cached=[len(r.prompt) + n for r in rows])
-        ids = torch.tensor([tokens[r.rid][n] for r in rows], dtype=torch.int, device="cuda")
-        logits = h.trunk(h.md, ids)
-        for r, row in zip(rows, logits):
+    for r in probes:
+        h.restore()
+        for n in range(r.drift_steps * TOKENS):
+            h.fill(h.md, [r], 0, tokens=1, cached=[len(r.prompt) + n])
+            ids = torch.tensor([tokens[r.rid][n]], dtype=torch.int, device="cuda")
+            row = h.trunk(h.md, ids)[0]
             decode[r.rid].append(row.clone())
             tokens[r.rid].append(int(row.argmax()))
-    for r in probes:
         assert tuple(tokens[r.rid][:TOKENS]) == r.tokens, r.name
-        for j in range(TOKENS):
-            assert _equal(decode[r.rid][j], h.reference[r.rid][j].logits), (r.name, j)
     # MTP on: each probe alone, from the same state; position 3s + j is row j of verify s.
     h.restore()
     worst_logit, worst_gap, flips, lines = 0.0, 0.0, [], []
@@ -1236,14 +1163,11 @@ def test_the_drift_over_consecutive_verifies(harness):
 
 
 @torch.inference_mode()
-def test_the_mtp_layer_drafts_as_prefill_drafts(harness, monkeypatch):
+def test_the_mtp_layer_drafts_as_prefill_drafts(harness):
     """The MTP layer's draft step runs the same kernels in the decode target as in the prefill
-    target -- cuBLAS on `_mtp_view`'s `.t()` views, thop_attention -- so its drafts are the ones
-    the target drafted before decode was made batch-invariant: on a draft step of every probe
-    (t1 after the trunk's hidden state of t0, over the MTP layer's KV of the prompt), the decode
-    target's output, through ``MTPLayer``'s routing, equals the prefill target's bit for bit.
-    The decode target's row-invariant ``_moe`` reads the stored [out, in] weights, so handing it
-    the MTP layer's views misreads them; its guard says so."""
+    target: on a draft step of every probe (t1 after the trunk's hidden state of t0, over the MTP
+    layer's KV of the prompt), ``MTPLayer`` routes a decode-only step to the decode target, and
+    the draft logits of the two targets agree within the logit band."""
     M = _modeling()
     h = harness
     rows = list(h.probes)
@@ -1260,17 +1184,11 @@ def test_the_mtp_layer_drafts_as_prefill_drafts(harness, monkeypatch):
         decode = step(h.core._decode.mtp_forward)
         prefill = step(h.core._prefill.mtp_forward)
     assert bool(torch.isfinite(prefill).all())
-    assert _equal(decode, prefill), (
-        "the decode target's MTP layer differs from the prefill target's"
-    )
     assert _equal(routed, decode), "MTPLayer did not route a decode-only draft step to DecodeTarget"
-    drafts = mtp_layer.shared_head(prefill, h.model.lm_head, h.md, False).argmax(-1).tolist()
+    heads = [mtp_layer.shared_head(x, h.model.lm_head, h.md, False) for x in (decode, prefill)]
+    worst = max(_logit_deviation(a, b)[0] for a, b in zip(*heads))
+    h.log(f"draft step: decode against prefill target, max |logit diff| {worst:.4f}")
+    assert worst <= LOGIT_BAND, worst
+    drafts = heads[1].argmax(-1).tolist()
     agree = sum(d == r.tokens[2] for d, r in zip(drafts, rows))
     h.log(f"draft step: {agree} of {len(rows)} drafts equal the trunk's greedy t2")
-
-    monkeypatch.setattr(M.DecodeTarget, "_mtp_moe", M.DecodeTarget._moe)
-    with (
-        pytest.raises(AssertionError, match="x and weight must share K"),
-        validating(M.invariant_mm),
-    ):
-        step(h.core._decode.mtp_forward)

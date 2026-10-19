@@ -27,7 +27,8 @@ What each rank records, for the rows whose output it owns (gated by the test):
   against its single-GPU twin -- the same `_moe` with the collectives taken out and the window
   widened to every expert, which is the order HF sums a token's ten experts in;
 * `idle`: steps where a rank has no request and runs the attention-DP dummy, and graph-padded
-  ranks: the real rows' outputs under three contents of every non-real row;
+  ranks: the real rows' outputs under three contents of every non-real row, each against the
+  first's;
 * `graph`: `DecodeTarget._moe` captured in a CUDA graph at each decode height on all four ranks
   and replayed on other rows, against the eager call;
 * `rivals`: one planted mistake at a time, measured as a cell.
@@ -658,8 +659,9 @@ def _rank_body(out_path: str, checkpoint_path: str, layers) -> None:
                         rows=case.counts[rank],
                         real=real,
                         fillers=list(FILLERS),
-                        real_rows_bitwise_across_fillers=all(
-                            torch.equal(outs[0], o) for o in outs[1:]
+                        # Each later filler's real rows against the first's.
+                        real_rows_across_fillers=(
+                            [K.distance(o, outs[0]) for o in outs[1:]] if real else None
                         ),
                         own_filler_experts=[len(e) for e in filler_experts],
                         non_real_experts=[len(e) for e in non_real],

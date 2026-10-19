@@ -18,20 +18,31 @@ Each target's gate is a subclass of ``_CudaGraphIdentity`` in
 test_modeling_v2_nemotron4.py, beside the target's other gates; this module
 holds the legs, calls and checks they share.
 
-Greedy generation must not depend on how the engine runs a step: with CUDA
-graphs on, a decode step replays a graph captured for a padded batch size;
-with them off, the same step runs eagerly at its own size. Each target computes
-a decode row from that row alone -- its decode GEMMs and generation attention
-are batch-invariant, under tensor parallelism so are its all-reduces, and under
-attention DP its routed experts give a token the same bits whatever the other
-ranks hold -- so the two legs must emit the same tokens.
+Greedy generation must not depend on how the engine runs a step beyond the
+last bits: with CUDA graphs on, a decode step replays a graph captured for a
+padded batch size; with them off, the same step runs eagerly at its own size.
+A target's decode step runs cuBLAS and ``thop_attention``, whose kernels change
+with the row count and the batch, so the two legs compute a row's logits
+slightly apart and can part where the top two tokens are nearly tied.
 
-Prefill and mixed steps are not batch-invariant, and CUDA graphs never run
-them, so they are identical in both legs only while both legs schedule the
-same batches. This file therefore controls what reaches the scheduler: each
-leg runs the same sequence of ``generate`` calls, and the batches every rank
-ran -- how many context and generation requests each iteration ran there, and
-their context tokens -- are compared between the legs before any token is.
+So the gate is the near-tie rule. Each request is compared up to its first
+parting. A parting passes when the token the CUDA-graph leg emitted there is
+within the target's band (``NEAR_TIE_BAND``) of the eager leg's top-1 -- the
+runner-up at a top-1 / top-2 margin within the band, or a lower rank where
+several candidates are that close. The band is derived from measurement: the
+largest shift, between the legs, of a gap between the top-1 and another of the
+top tokens at matched positions (the same tokens before them), stated in each
+target's class with its derivation; the gate measures that shift again and
+holds it to the band. A parting farther off fails: a padding row that writes a
+real slot, or a recycled slot read before it is zeroed, moves tokens wherever
+it lands. Every parting is reported with its margin.
+
+Prefill and mixed steps run eagerly in both legs, so they compute alike only
+while both legs schedule the same batches. This file therefore controls what
+reaches the scheduler: each leg runs the same sequence of ``generate`` calls,
+and the batches every rank ran -- how many context and generation requests
+each iteration ran there, and their context tokens -- are compared between the
+legs before any token is.
 
 Every test here passes ``modeling_v2="require"`` to ``LLM``: TensorRT-LLM has
 no built-in implementation of this architecture, and ``"require"`` makes a
@@ -95,10 +106,10 @@ class _Request:
 
 @dataclass
 class _Output:
-    """What a request emitted: its tokens, and per token the top-2 raw logprobs."""
+    """What a request emitted: its tokens, and per token the top raw logprobs, best first."""
 
     token_ids: list[int]
-    top2: list[list[tuple[int, float]]]
+    top: list[list[tuple[int, float]]]
 
 
 # One iteration as every rank ran it, in rank order: per rank (context requests,
@@ -129,9 +140,48 @@ def _first_divergence(a: list[int], b: list[int]) -> int | None:
     return None if len(a) == len(b) else min(len(a), len(b))
 
 
-def _margin(top2: list[tuple[int, float]]) -> float:
-    """The top-1 minus top-2 raw logprob: how close a greedy step was to a tie."""
-    return top2[0][1] - top2[1][1] if len(top2) > 1 else float("inf")
+def _margin(top: list[tuple[int, float]]) -> float:
+    """The top-1 minus top-2 raw logprob (a raw logprob gap is the logit gap): how close a
+    greedy step was to a tie."""
+    return top[0][1] - top[1][1] if len(top) > 1 else float("inf")
+
+
+@dataclass
+class _Comparison:
+    """One request's output in one leg against another leg's (``base``).
+
+    ``parting`` is the first position where the tokens differ (None: identical); there, ``gap``
+    is how far below ``base``'s top-1 the other leg's token sits among ``base``'s top
+    logprobs (None: not among them). ``shift`` is the largest change, between the legs, of a
+    gap between the top-1 and another token both legs list, at the positions before the
+    parting; ``top1`` the largest change of the emitted token's own logprob there.
+    """
+
+    parting: int | None
+    gap: float | None
+    shift: float
+    top1: float
+
+
+def _compare(out: _Output, base: _Output) -> _Comparison:
+    """``out`` against ``base`` up to their first parting."""
+    pos = _first_divergence(base.token_ids, out.token_ids)
+    common = len(base.token_ids) if pos is None else pos
+    shift = top1 = 0.0
+    for i in range(min(common, len(out.top), len(base.top))):
+        mine, theirs = dict(out.top[i]), dict(base.top[i])
+        first = base.token_ids[i]  # greedy: both legs' top-1
+        if first not in mine or first not in theirs:
+            continue
+        top1 = max(top1, abs(mine[first] - theirs[first]))
+        for token in theirs.keys() & mine.keys():
+            shift = max(shift, abs((mine[token] - mine[first]) - (theirs[token] - theirs[first])))
+    gap = None
+    if pos is not None and pos < min(len(out.token_ids), len(base.top)):
+        top = dict(base.top[pos])
+        token = out.token_ids[pos]
+        gap = None if token not in top else base.top[pos][0][1] - top[token]
+    return _Comparison(parting=pos, gap=gap, shift=shift, top1=top1)
 
 
 def _promotable(step: _Step) -> bool:
@@ -256,6 +306,17 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
     # Output tokens per fixed prompt (criterion A), past any end id.
     MAX_TOKENS = 256
 
+    # The near-tie band, in logits: how far the CUDA-graph leg's token may sit
+    # below the eager leg's top-1 at a parting, and how far a gap between the
+    # top-1 and another top token may shift between the legs at matched
+    # positions. Each target's class states its own, derived from measurement.
+    NEAR_TIE_BAND: float
+
+    # Raw logprobs returned per emitted token, best first: enough to find the
+    # token the other leg emitted where three or more candidates are nearly
+    # tied, and to measure the gap shifts between the legs.
+    TOP_LOGPROBS = 8
+
     # Calls whose outputs and batches are not compared between the legs: the
     # one-token prompt, which the two legs run through different kernels (a
     # promoted decode row against a context row), and the last call, which only
@@ -314,7 +375,7 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
     def _generate(self, llm: LLM, requests: list[_Request]) -> _Call:
         """Submit the requests in order, as one call, and collect what each emitted.
 
-        Greedy, past any end id, with the top-2 raw logprobs of every emitted
+        Greedy, past any end id, with the top raw logprobs of every emitted
         token; a request with a rank is pinned there. The statistics available
         once the call has ended are read with it; `_attribute_steps` sorts them
         into calls after the leg.
@@ -326,7 +387,10 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
             llm.generate_async(
                 {"prompt_token_ids": list(r.token_ids)},
                 SamplingParams(
-                    max_tokens=r.max_tokens, temperature=0.0, ignore_eos=True, logprobs=2
+                    max_tokens=r.max_tokens,
+                    temperature=0.0,
+                    ignore_eos=True,
+                    logprobs=self.TOP_LOGPROBS,
                 ),
                 scheduling_params=None
                 if r.rank is None
@@ -338,11 +402,11 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
         outputs = {}
         for r, future in zip(requests, futures):
             out = future.result().outputs[0]
-            top2 = [
+            top = [
                 sorted(((t, lp.logprob) for t, lp in pos.items()), key=lambda x: -x[1])
                 for pos in out.logprobs
             ]
-            outputs[r.name] = _Output(list(out.token_ids), top2)
+            outputs[r.name] = _Output(list(out.token_ids), top)
         time.sleep(self.SETTLE_SECONDS)
         return _Call(requests, outputs, start, submit_seconds, llm.get_stats(timeout=2))
 
@@ -357,7 +421,8 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
         6. The one-token prompt again, on a slot a finished request left. With
            CUDA graphs on, the runner promotes a final one-token context into a
            graph decode row, whose recurrent and conv state the decode entries
-           read, so the target must zero that slot first.
+           read, so the target must zero that slot first: the same prompt then
+           runs the same steps as in the fresh engine.
         7. A short call that makes the executor publish the last statistics.
         """
         batch = self._batch_order(prompts)
@@ -398,7 +463,7 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
         raise NotImplementedError
 
     def _check_identity(self, monkeypatch) -> None:
-        """Run both legs and gate: G7, equal batches, then equal tokens."""
+        """Run both legs and gate: G7, equal batches, then the tokens by the near-tie rule."""
         monkeypatch.setenv("LLM_MODELS_ROOT", llm_models_root())
         module = _prompt_module()
         prompts = module.prompt_set(module.load_tokenizer(self.MODEL_PATH))
@@ -423,17 +488,6 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
                     f"call's work: {gaps}"
                 )
 
-        # G7: the recycled slot must hold nothing of its previous owner.
-        for leg_name, leg in legs.items():
-            for req, fresh in leg["one_token_fresh"].outputs.items():
-                recycled = leg["one_token_recycled"].outputs[req]
-                assert recycled.token_ids == fresh.token_ids and recycled.top2 == fresh.top2, (
-                    f"{leg_name} {req}: the one-token prompt on a recycled slot emitted "
-                    f"{recycled.token_ids[:16]}..., in the fresh engine "
-                    f"{fresh.token_ids[:16]}...; first difference at "
-                    f"{_first_divergence(fresh.token_ids, recycled.token_ids)}"
-                )
-
         # The legs are comparable only where they scheduled the same batches,
         # and where no context ran through other kernels in the two legs.
         for name, call in on.items():
@@ -453,31 +507,60 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
                 f"{[call.steps[i] for i in promoted]}"
             )
 
-        partings = []
-        for name, call in on.items():
-            if name in self.UNCOMPARED:
+        # Every compared request, and G7 in each leg -- the one-token prompt on a
+        # recycled slot against the same prompt in the fresh engine, the same
+        # steps on a slot the target must have zeroed -- by the near-tie rule.
+        pairs = [
+            (f"{name}/{req}", out, off[name].outputs[req])
+            for name, call in on.items()
+            if name not in self.UNCOMPARED
+            for req, out in call.outputs.items()
+        ]
+        pairs += [
+            (f"G7 {leg_name} {req}", leg["one_token_recycled"].outputs[req], fresh)
+            for leg_name, leg in legs.items()
+            for req, fresh in leg["one_token_fresh"].outputs.items()
+        ]
+        partings, off_tie, shift, top1 = [], [], 0.0, 0.0
+        for what, out, base in pairs:
+            c = _compare(out, base)
+            shift, top1 = max(shift, c.shift), max(top1, c.top1)
+            if c.parting is None:
                 continue
-            for req, out in call.outputs.items():
-                other = off[name].outputs[req]
-                pos = _first_divergence(out.token_ids, other.token_ids)
-                if pos is None:
-                    continue
-                at = min(pos, len(out.top2) - 1, len(other.top2) - 1)
-                partings.append(
-                    f"{name}/{req} at token {pos}: CUDA graphs {out.top2[at]}, eager "
-                    f"{other.top2[at]} (eager top-1 margin {_margin(other.top2[at]):.4f})"
-                )
-        assert not partings, "greedy tokens differ with CUDA graphs on and off:\n" + "\n".join(
-            partings
+            at = min(c.parting, len(base.top) - 1)
+            line = (
+                f"{what} at token {c.parting}: emitted {out.token_ids[c.parting]} where the "
+                f"base leg's top is {base.top[at][:4]} (top-1 / top-2 margin "
+                f"{_margin(base.top[at]):.4f}; "
+                + ("not among its top" if c.gap is None else f"{c.gap:.4f} below its top-1")
+                + ")"
+            )
+            partings.append(line)
+            if c.gap is None or c.gap > self.NEAR_TIE_BAND:
+                off_tie.append(line)
+        print(
+            f"[modeling_v2] identity: {len(pairs)} requests compared, {len(partings)} part; at "
+            f"matched positions the largest top-gap shift between the legs is {shift:.4f} and "
+            f"the largest change of the emitted token's logprob {top1:.4f} (band "
+            f"{self.NEAR_TIE_BAND})"
+        )
+        for line in partings:
+            print(f"[modeling_v2] identity parting {line}")
+        assert not off_tie, (
+            f"greedy tokens part off a near-tie (band {self.NEAR_TIE_BAND}):\n" + "\n".join(off_tie)
+        )
+        assert shift <= self.NEAR_TIE_BAND, (
+            f"at matched positions a top gap shifts by {shift:.4f} between the legs, past the "
+            f"near-tie band {self.NEAR_TIE_BAND} the gate was derived with"
         )
 
     def _report(self, legs: dict[str, dict[str, _Call]]) -> None:
         """Print what the gate does not assert, and dump the legs when asked.
 
         - Each fixed prompt in the batch against alone, in each leg: identical,
-          or the first parting with the alone run's top-2 there. A parting where
-          the batch's token is the alone run's runner-up, at a small margin, is
-          a near-tie that the batch's prefill / mixed-step numerics tipped.
+          or the first parting with the alone run's top tokens there. A parting
+          where the batch's token is the alone run's runner-up, at a small margin,
+          is a near-tie that the batch's numerics tipped.
         - The batch-shape noise: the largest change of the emitted token's
           logprob, batch against alone, over the positions before any parting.
         - The one-token prompt, CUDA graphs against eager: a promoted decode
@@ -496,18 +579,18 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
                 pos = _first_divergence(alone.token_ids, out.token_ids)
                 common = len(alone.token_ids) if pos is None else pos
                 for i in range(common):
-                    noise = max(noise, abs(out.top2[i][0][1] - alone.top2[i][0][1]))
+                    noise = max(noise, abs(out.top[i][0][1] - alone.top[i][0][1]))
                 if pos is None:
-                    same_lp = all(out.top2[i] == alone.top2[i] for i in range(common))
+                    same_lp = all(out.top[i] == alone.top[i] for i in range(common))
                     print(
                         f"[modeling_v2] identity {leg_name} batch vs alone {req}: identical "
                         f"tokens, logprobs {'bitwise equal' if same_lp else 'differ'}"
                     )
                     continue
-                runner_up = len(alone.top2[pos]) > 1 and out.token_ids[pos] == alone.top2[pos][1][0]
+                runner_up = len(alone.top[pos]) > 1 and out.token_ids[pos] == alone.top[pos][1][0]
                 print(
                     f"[modeling_v2] identity {leg_name} batch vs alone {req}: parts at token "
-                    f"{pos}; alone top-2 {alone.top2[pos]} (margin {_margin(alone.top2[pos]):.4f}), "
+                    f"{pos}; alone top-2 {alone.top[pos][:2]} (margin {_margin(alone.top[pos]):.4f}), "
                     f"batch emitted {out.token_ids[pos]} "
                     f"({'the alone runner-up' if runner_up else 'NOT the alone runner-up'})"
                 )
@@ -524,13 +607,13 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
                 + (
                     "identical tokens"
                     if pos is None
-                    else f"parts at token {pos} (eager top-2 {one_off.top2[pos]}, CUDA graphs "
-                    f"{one_on.top2[pos]})"
+                    else f"parts at token {pos} (eager top-2 {one_off.top[pos][:2]}, CUDA graphs "
+                    f"{one_on.top[pos][:2]})"
                 )
-                + f"; first-token top-2 {one_on.top2[0]} vs {one_off.top2[0]}"
+                + f"; first-token top-2 {one_on.top[0][:2]} vs {one_off.top[0][:2]}"
             )
         for name, call in on.items():
-            same = sum(out.top2 == off[name].outputs[req].top2 for req, out in call.outputs.items())
+            same = sum(out.top == off[name].outputs[req].top for req, out in call.outputs.items())
             decode_rows = [
                 max((row[2] for row in rows if row), default=0)
                 for rows in zip(
@@ -566,7 +649,7 @@ class _CudaGraphIdentity(LlmapiAccuracyTestHarness):
                                 submit_seconds=call.submit_seconds,
                                 ranks={r.name: r.rank for r in call.requests},
                                 outputs={
-                                    req: dict(token_ids=out.token_ids, top2=out.top2)
+                                    req: dict(token_ids=out.token_ids, top=out.top)
                                     for req, out in call.outputs.items()
                                 },
                             )

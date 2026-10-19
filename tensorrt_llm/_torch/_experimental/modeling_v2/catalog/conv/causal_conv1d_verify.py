@@ -150,9 +150,6 @@ class CausalConv1dVerify(OpWrapper):
     the accepted position's window into the slot. A row whose slot is `pad_slot_id` is skipped --
     its x keeps its values and its window row is not written.
 
-    Each token gets the bits `causal_conv1d_update` gives it as a one-token decode step: output
-    and window are the decode op's, bit for bit, as if the T tokens had run as T decode steps.
-
     `x` is `[batch, dim, T]` and is overwritten with the output; `conv_state` is the pool
     `[slots, dim, 3]` and `intermediate_conv_window` the buffer `[rows >= batch, positions >= T,
     dim, 3]`, all addressed through their strides. Every launch shape is fixed by the tensors'
@@ -252,13 +249,10 @@ class CausalConv1dVerify(OpWrapper):
     Rounding: every token takes the arithmetic of `causal_conv1d_update`'s decode kernel
     (`causal_conv1d_update_kernel_sl1`): the four taps as an fma chain from +0 -- which keeps a
     zero output +0 where products of zeros and negative taps are -0 -- SiLU as
-    `v * (1 / (1 + exp(-v)))` with a correctly rounded reciprocal, one rounding. Output and
-    window of every token are therefore the decode op's bit for bit, which the test pins on every
-    cell against T calls of that entry. Neither alternative does that: the op's general kernel,
-    which `causal_conv1d_update` takes for T > 1, was measured one ulp off on about 6e-6 of its
-    outputs, and the vendored Triton `causal_conv1d_update` forms its products in bf16 and was
-    measured off on 37% of them. Like the decode entry, this rounds the conv output once; the
-    checkpoint's `Nemotron4GDPMixer` rounds it to bf16 before SiLU too (see that entry's note).
+    `v * (1 / (1 + exp(-v)))` with a correctly rounded reciprocal, one rounding. The test holds
+    output and windows to the reference within the decode entry's band. Like the decode entry,
+    this rounds the conv output once; the checkpoint's `Nemotron4GDPMixer` rounds it to bf16
+    before SiLU too (see that entry's note).
 
     Certified: T = 2 and 3; x as the in_proj output's conv columns, `[batch, 16896, T]` with
     channel stride 1 and token stride 18528 (tp1), or `[batch, 4224, T]` with token stride 4632

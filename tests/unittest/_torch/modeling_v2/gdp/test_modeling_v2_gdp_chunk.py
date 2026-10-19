@@ -12,28 +12,18 @@ import zlib
 import pytest
 import torch
 import torch.nn.functional as F
-import triton
 from triton.runtime.autotuner import Autotuner
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp import gdp_chunk as gdp_chunk_module
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import (
-    _chunk_list,
-    _decay_cumsum_kernel,
-    _expand_kernel,
-    _jit,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import _chunk_list
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk as op
 from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
 )
-from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_kernel_o
-from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from tensorrt_llm._torch.modules.fla.cumsum import chunk_local_cumsum
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices, prepare_chunk_offsets
-from tensorrt_llm._torch.modules.fla.solve_tril import solve_tril
-from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd
 
 __extra_import_path__ = [".."]
 from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: E402,F401
@@ -268,136 +258,6 @@ def test_guard_refuses_offsets_that_miss_the_tokens() -> None:
     with pytest.raises(AssertionError, match="run from 0 to the token count"):
         with validating(op):
             op(**args)
-
-
-#: `chunk_fwd_kernel_o` at the config its autotuner picks for the 8K prefill. The
-#: kernel's configs fall into two groups that round differently (BK 64 / BV 64 on
-#: two warps against the rest), so the comparison pins one, of the larger group.
-_VENDORED_O = dict(BK=64, BV=64, num_warps=4, num_stages=2)
-
-
-def _through_the_wrappers(
-    q, k, v, g, beta, state_pool, slots, cu_seqlens, has_initial_state, scale
-):
-    """The entry's stages run the way the vendored wrappers run them: each wrapper
-    builds its chunk list on the host with `prepare_chunk_indices`, sizes its grid
-    from the list's length and launches with its own constants (`fwd_h` autotuned).
-    The output stage is the vendored `chunk_fwd_kernel_o` over every sub-step, at
-    `_VENDORED_O`, of which the mixer keeps each token's last. The expansion and the
-    decay cumsum are the entry's. Writes the final states into `state_pool[slots]`
-    and returns the kept output."""
-    num_tokens, nh, h, dv = v.shape
-    dk = k.shape[-1]
-    steps = num_tokens * nh
-    cu_steps = cu_seqlens.long() * nh
-    q_norm = q.new_empty(num_tokens, h, dk)
-    k_steps = k.new_empty(1, steps, h, dk)
-    v_steps = v.new_empty(1, steps, h, dv)
-    beta_steps = beta.new_empty(1, steps, h)
-    _expand_kernel[(num_tokens,)](
-        q,
-        k,
-        v,
-        beta,
-        q_norm,
-        k_steps,
-        v_steps,
-        beta_steps,
-        *q.stride(),
-        *k.stride(),
-        *v.stride(),
-        *beta.stride(),
-        H=h,
-        NH=nh,
-        K=dk,
-        V=dv,
-        BH=triton.next_power_of_2(h),
-        BK=triton.next_power_of_2(dk),
-        BV=triton.next_power_of_2(dv),
-        num_warps=4,
-    )
-    # The vendored output stage takes a query per sub-step: zero but on the last.
-    q_steps = q.new_zeros(num_tokens, nh, h, dk)
-    q_steps[:, -1] = q_norm
-    q_steps = q_steps.view(1, steps, h, dk)
-    chunk_indices = prepare_chunk_indices(cu_steps, 64)
-    g_cumsum = torch.empty(1, steps, h, dtype=torch.float32, device="cuda")
-    _decay_cumsum_kernel[(chunk_indices.shape[0],)](
-        g,
-        g_cumsum,
-        cu_steps,
-        chunk_indices,
-        *g.stride(),
-        H=h,
-        NH=nh,
-        BT=64,
-        BH=triton.next_power_of_2(h),
-        num_warps=4,
-    )
-    a = chunk_scaled_dot_kkt_fwd(
-        k=k_steps,
-        beta=beta_steps,
-        g_cumsum=g_cumsum,
-        cu_seqlens=cu_steps,
-        chunk_size=64,
-        output_dtype=torch.float32,
-    )
-    a = solve_tril(A=a, cu_seqlens=cu_steps, output_dtype=k_steps.dtype)
-    w, u = recompute_w_u_fwd(
-        k=k_steps, v=v_steps, beta=beta_steps, g_cumsum=g_cumsum, A=a, cu_seqlens=cu_steps
-    )
-    rows = slots.long()
-    initial = torch.where(has_initial_state[:, None, None, None], state_pool[rows], 0.0)
-    states, v_new, final = chunk_gated_delta_rule_fwd_h(
-        k=k_steps,
-        w=w,
-        u=u,
-        g=g_cumsum,
-        initial_state=initial,
-        output_final_state=True,
-        chunk_size=64,
-        cu_seqlens=cu_steps,
-    )
-    o = torch.empty_like(v_new)
-    _jit(chunk_fwd_kernel_o)[(triton.cdiv(dv, _VENDORED_O["BV"]), chunk_indices.shape[0], h)](
-        q_steps,
-        k_steps,
-        v_new,
-        states,
-        g_cumsum,
-        o,
-        cu_steps,
-        chunk_indices,
-        scale,
-        T=steps,
-        H=h,
-        Hg=h,
-        K=dk,
-        V=dv,
-        BT=64,
-        USE_G=True,
-        IS_VARLEN=True,
-        **_VENDORED_O,
-    )
-    state_pool[rows] = final.to(state_pool.dtype)
-    return o.view(num_tokens, nh, h, dv)[:, -1].clone()
-
-
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_the_stages_are_the_vendored_ones_bitwise(cell) -> None:
-    """The entry against `_through_the_wrappers`: the output and the whole pool
-    memory agree bit for bit. So the entry's own launch configs change no bit --
-    `fwd_h`'s configs all round alike, which is what lets the entry pin one -- and
-    `_last_step_o_kernel` computes exactly what the vendored output stage computes
-    for the rows the mixer keeps, while computing no other row."""
-    args, raw = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
-    raw_before = raw.clone()
-    want = _through_the_wrappers(**args)
-    want_raw = raw.clone()
-    raw.copy_(raw_before)
-    got = op(**args)
-    assert torch.equal(got, want), "the entry's output differs from the vendored stages'"
-    assert torch.equal(raw, want_raw), "the entry's pool differs from the vendored stages'"
 
 
 def _host_chunk_list(cu_steps, steps, chunk_size):
