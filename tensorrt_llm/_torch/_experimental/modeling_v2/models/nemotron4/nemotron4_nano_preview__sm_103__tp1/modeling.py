@@ -43,8 +43,8 @@ tokens a row, and its token j gets the bits that token gets as a decode step's
 one token. cuBLAS picks its kernel by the row count, and on six of the GEMM
 shapes the kernels it picks split K differently: decode and verify run those
 through `invariant_mm`, and generation attention through
-`invariant_gen_attention`, whose KV split is fixed and whose program for a
-verify token is the one that decodes it. Prefill and mixed steps keep cuBLAS
+`invariant_gen_attention`, whose KV split is fixed and whose kernels compute a
+verify token with the arithmetic that decodes it. Prefill and mixed steps keep cuBLAS
 and `thop_attention`; CUDA graphs do not change their batches. So do the MTP
 layer's draft steps: a draft's bits change how many drafts the trunk accepts,
 never the tokens it emits.
