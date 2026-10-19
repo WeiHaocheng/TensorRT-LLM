@@ -17,11 +17,15 @@ experts, the readout and the lm_head. Only the routed MoE crosses ranks, once
 per MoE block:
 
 1. the router and `fc1_latent_proj` run on the rank's own tokens;
-2. each token's latent, expert ids and routing weights travel as one packed
-   byte row, all-gathered in rank order;
-3. `latent_moe_experts` runs the rank's window over every rank's tokens and
-   returns the window's partial sums unrounded, in fp32;
-4. the partial sums are reduce-scattered in fp32, so every token's ten experts
+2. each token's latent, expert ids and routing weights reach the windows that
+   need them: on a step whose ranks hold about the same number of tokens (every
+   CUDA-graph step), the one-sided all-to-all sends a token only to the ranks
+   owning one of its experts; on a ragged step, one packed byte row per token is
+   all-gathered in rank order (`_moe_comm`);
+3. `latent_moe_experts_fused_act` runs the rank's window over the rows it
+   received and returns the window's partial sums unrounded, in fp32;
+4. the partial sums come back to their tokens' ranks summed in fp32 -- the
+   all-to-all's combine, or the reduce-scatter -- so every token's ten experts
    are added before the one rounding to bf16 HF makes;
 5. `fc2_norm` and `fc2_latent_proj` run on the rank's own tokens.
 
@@ -56,18 +60,20 @@ the state entries read; each target's `step_args` projects the prepared
 metadata onto the explicit arguments its forward passes, including every
 rank's token count, which the routed MoE's collectives are sized by.
 
-Numerics across batches. Every step runs its GEMMs through cuBLAS and its
-attention through `thop_attention`: a decode step's generation kernels, an MTP
-verify's over 1 + D tokens a row, a prefill's context kernel. cuBLAS picks its
-kernel by the rank's row count and the attention kernels by the rank's batch,
-and some of them split their sums differently, so a request's logits and the
-state it writes move in the last bits with the batch it runs in: a padded
-CUDA-graph batch against the same step run eagerly, a verify token against the
-MTP-off decode step of the same token. Greedy output can therefore part
-between such runs where the top two tokens are nearly tied; the gates bound
-every parting by a near-tie band measured on this target. The MTP layer's
-draft steps run the same kernels: a draft's bits change which drafts the trunk
-accepts, and the tokens it emits are the verify's own greedy choices.
+Numerics across batches. Every step runs its attention through
+`thop_attention` -- a decode step's generation kernels, an MTP verify's over
+1 + D tokens a row, a prefill's context kernel -- and its bf16 GEMMs through
+cuBLAS, or, on a CUDA-graph step's few rows, the low-M kernel certified for
+that row count (`_dense`). Those pick their kernels by the rank's row count and
+the attention kernels by the rank's batch, and some of them split their sums
+differently, so a request's logits and the state it writes move in the last
+bits with the batch it runs in: a padded CUDA-graph batch against the same step
+run eagerly, a verify token against the MTP-off decode step of the same token.
+Greedy output can therefore part between such runs where the top two tokens are
+nearly tied; the gates bound every parting by a near-tie band measured on this
+target. The MTP layer's draft steps run the same kernels: a draft's bits change
+which drafts the trunk accepts, and the tokens it emits are the verify's own
+greedy choices.
 """
 
 import weakref
@@ -85,23 +91,35 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.moe_a2a_combine import (
+    moe_a2a_combine,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.moe_a2a_dispatch import (
+    moe_a2a_dispatch,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_update import (
     causal_conv1d_update,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_varlen import (
-    causal_conv1d_varlen,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_verify import (
     causal_conv1d_verify,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.triton_causal_conv1d_varlen import (  # noqa: E501
+    triton_causal_conv1d_varlen,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.flashinfer_gdp_chunk import (
+    flashinfer_gdp_chunk,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_gates import gdp_gates
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import gdp_recurrent
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_verify import gdp_verify
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
-    latent_moe_experts,
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.dsv3_router_gemm import (
+    dsv3_router_gemm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.lowm_plan import lowm_entry
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts_fused_act import (  # noqa: E501
+    latent_moe_experts_fused_act,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
@@ -110,7 +128,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm import gated_rmsnorm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm_multirow import (
+    gated_rmsnorm_multirow,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.wide_residual import (
     wide_residual,
 )
@@ -120,6 +140,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
@@ -582,6 +603,8 @@ class _Dims(NamedTuple):
     conv_k: slice  # K0..K2
     conv_q: slice  # Q
     top_k: int
+    num_experts: int
+    latent: int
     routed_scale: float
     clamp: float
     dispatch_latent: slice  # the latent's bf16 bytes within a packed dispatch row
@@ -620,6 +643,8 @@ def _dims(cfg) -> _Dims:
         conv_k=slice(n_h * value_dim, n_h * (value_dim + key_dim)),
         conv_q=slice(n_h * (value_dim + key_dim), conv_dim),
         top_k=cfg.num_experts_per_tok,
+        num_experts=cfg.n_routed_experts,
+        latent=cfg.moe_latent_size,
         routed_scale=cfg.routed_scaling_factor,
         clamp=cfg.activation_clamp_value,
         dispatch_latent=slice(0, ids_start),
@@ -630,13 +655,61 @@ def _dims(cfg) -> _Dims:
     )
 
 
-def _moe_sizes(all_rank_num_tokens) -> list[int] | None:
-    """The per-rank row counts the routed MoE's two collectives take: None when every rank
-    holds the same count (the padded form: every CUDA-graph step, where the ranks run one
-    common batch), else every rank's count in rank order (the ragged form: eager steps, where
-    ranks prefill independently)."""
+#: The routed MoE takes the one-sided all-to-all when the busiest rank's rows are at most this
+#: share above the mean (sum >= share x ranks x max): its receive layout pads every source rank
+#: to the busiest one, which the experts then scan. Measured (survey-comm): ~8.8 ns per padding
+#: row in the experts call against ~2.2-3.9 ns per token of transfer saved.
+_A2A_BALANCE = 0.8
+
+
+class _MoeComm(NamedTuple):
+    """How a step's routed MoE crosses the ranks, read off every rank's row count.
+
+    `a2a`: the one-sided all-to-all (`moe_a2a_dispatch` / `moe_a2a_combine`) when the ranks'
+    counts are balanced (`_A2A_BALANCE`), which every CUDA-graph step is (the ranks run one
+    common padded batch); else the packed all-gather and the fp32 reduce-scatter. `sizes` is
+    what those two collectives take: None when every rank holds the same count, else every
+    rank's count in rank order. `max_rows` is the busiest rank's count, the all-to-all's
+    `runtime_max_tokens_per_rank`, which every rank passes alike.
+    """
+
+    a2a: bool
+    sizes: list[int] | None
+    max_rows: int
+
+
+def _moe_comm(all_rank_num_tokens) -> _MoeComm:
+    """The routed MoE's communication for a step whose ranks hold these row counts."""
     counts = [int(n) for n in all_rank_num_tokens]
-    return None if len(set(counts)) == 1 else counts
+    busiest = max(counts)
+    return _MoeComm(
+        a2a=sum(counts) >= _A2A_BALANCE * len(counts) * busiest,
+        sizes=None if len(set(counts)) == 1 else counts,
+        max_rows=busiest,
+    )
+
+
+def _dense(x: torch.Tensor, weight_t: torch.Tensor, graph: bool) -> torch.Tensor:
+    """bf16 `x @ weight_t`: on a CUDA-graph step, the low-M entry certified for these rows,
+    width and output (`lowm_entry`); cuBLAS otherwise. The low-M kernels compile per shape on
+    first use and cost ~60 us of host per eager call, so they run only where a graph replays
+    them: the engine runs every graph batch eagerly on its graph metadata before capturing it,
+    which compiles each shape before capture."""
+    low_m = lowm_entry(x.shape[0], x.shape[1], weight_t.shape[1]) if graph else None
+    return cublas_mm(x, weight_t) if low_m is None else low_m(x, weight_t)
+
+
+#: Router rows `dsv3_router_gemm`'s own kernel serves at 512 experts over hidden 3072; cuBLAS
+#: is the faster router GEMM from about 12 rows.
+_ROUTER_KERNEL_ROWS = 8
+
+
+def _router_logits(routed: torch.Tensor, router_t: torch.Tensor, graph: bool) -> torch.Tensor:
+    """fp32 router logits, HF's fp32 GEMM over the bf16 operands: `dsv3_router_gemm` for a
+    CUDA-graph step's few rows, cuBLAS otherwise."""
+    if graph and routed.shape[0] <= _ROUTER_KERNEL_ROWS:
+        return dsv3_router_gemm(routed, router_t)
+    return cublas_mm(routed, router_t, None, torch.float32)
 
 
 class Nemotron4NanoPreviewDep4ModelingV2(DecoderModel):
@@ -653,7 +726,13 @@ class Nemotron4NanoPreviewDep4ModelingV2(DecoderModel):
         # global ids [expert_offset, expert_offset + local_experts).
         self.expert_offset = d.expert_offset
         self.local_experts = d.local_experts
+        self.mapping = mapping
+        # The engine's per-rank token budget: the most rows a rank feeds one MoE block.
+        self.max_num_tokens = model_config.max_num_tokens
         self.w = _weights.MODEL_WEIGHTS.declare(d)
+        # The one-sided all-to-all's workspace (MNNVL memory over the group), built with the
+        # real weights in `post_load_weights`, on every rank together and outside any capture.
+        self.a2a: NVLinkOneSided | None = None
 
         self.layer_types = d.layer_types
         self.gdp_layers = tuple(i for i, t in enumerate(d.layer_types) if t in _GDP_BLOCKS)
@@ -676,7 +755,8 @@ class Nemotron4NanoPreviewDep4ModelingV2(DecoderModel):
         self._decode: "DecodeTarget | None" = None
 
     def post_load_weights(self) -> None:
-        """Construct the two targets, now that the weights are real.
+        """Build the routed MoE's all-to-all workspace and construct the two targets, now that
+        the weights are real.
 
         Must only be called after meta init is over, never from `__init__`, where the
         shell's containers are still meta.
@@ -684,7 +764,35 @@ class Nemotron4NanoPreviewDep4ModelingV2(DecoderModel):
         Named for the shell hook that drives it. Not an override: that hook lives on
         DecoderModelForCausalLM, and a core derives from DecoderModel, which has no
         such method -- so there is no super() to call here.
+
+        The workspace is collective: every rank builds it here, in the same order, before any
+        step. Its combine region is sized for fp32 rows, the dtype the windows' partial sums
+        cross in. A ragged step's all-gather and reduce-scatter open their communicator on
+        first use, a second or two on every rank; the engine's warm-up runs balanced steps
+        only, which take the all-to-all, so one small ragged pair runs here instead, beside
+        the workspace, rather than inside the first ragged step a served engine meets.
         """
+        d = _dims(self.model_config.pretrained_config.text_config)
+        self.a2a = NVLinkOneSided(
+            self.mapping,
+            d.num_experts,
+            d.top_k,
+            self.max_num_tokens,
+            hidden_size=d.latent,
+            dtype=torch.float32,
+        )
+        sizes = [1 + r for r in range(self.dp_size)]
+        row_bytes = d.dispatch_weights.stop
+        allgather(
+            torch.zeros(sizes[self.rank], row_bytes, dtype=torch.uint8, device="cuda"),
+            sizes,
+            self.dp_group,
+        )
+        reducescatter(
+            torch.zeros(sum(sizes), d.latent, dtype=torch.float32, device="cuda"),
+            sizes,
+            self.dp_group,
+        )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -875,9 +983,11 @@ class PrefillTarget:
         take one slot each, and every one of them the same number of tokens: one, or 1 + D
         under MTP, whose states go to the `intermediate_*` buffers. `query_start_loc` counts
         one token per generation row, so only its first `num_contexts + 1` entries hold
-        under MTP. `moe_sizes` is what the routed MoE's collectives take: every rank's token
-        count this step, in rank order, ragged here since ranks prefill independently -- or
-        None when they agree.
+        under MTP. `max_ctx_len` is the longest context row's token count, read off the host
+        copy of `seq_lens`: it picks `flashinfer_gdp_chunk`'s kernel without a device round
+        trip. `moe` is how the routed MoE crosses the ranks, read off every rank's token count
+        this step (`_moe_comm`): ragged steps, where ranks prefill independently, take the
+        all-gather and reduce-scatter; balanced ones the all-to-all.
         """
         state = _state_metadata(md)
         views = self.core.state_views(md.kv_cache_manager)
@@ -889,8 +999,8 @@ class PrefillTarget:
             num_rows=num_rows,
             num_contexts=num_contexts,
             num_ctx_tokens=md.num_ctx_tokens,
+            max_ctx_len=int(md.seq_lens[:num_contexts].max()) if num_contexts else 0,
             query_start_loc=state.query_start_loc,
-            query_start_loc_long=state.query_start_loc_long,
             has_initial_state=state.has_initial_states[:num_contexts],
             state_slots=state.state_slots[:num_rows],
             kv_layer=views.kv_layer,
@@ -899,7 +1009,7 @@ class PrefillTarget:
             intermediate_ssm=views.intermediate_ssm,
             intermediate_conv=views.intermediate_conv,
             # The attention-DP group: how many rows every rank feeds the routed MoE.
-            moe_sizes=_moe_sizes(md.all_rank_num_tokens),
+            moe=_moe_comm(md.all_rank_num_tokens),
         )
 
     def _mtp_step_args(self, md: TrtllmAttentionMetadata, all_rank_num_tokens) -> dict:
@@ -914,7 +1024,7 @@ class PrefillTarget:
         return dict(
             attention=self._attention_args(md),
             kv_layer=md.kv_cache_manager.layer_offsets[self._mtp.attention.layer],
-            moe_sizes=_moe_sizes(all_rank_num_tokens),
+            moe=_moe_comm(all_rank_num_tokens),
         )
 
     def forward(
@@ -962,7 +1072,7 @@ class PrefillTarget:
                 routed, x = self._streams_step(streams, update, L.write, L.next_reads)
                 continue
             _, shared = self._streams_step(streams, update, L.write, (L.shared_read,))
-            update = self._moe(routed, shared, L.moe, step["moe_sizes"])
+            update = self._moe(routed, shared, L.moe, step["moe"])
             routed, x = self._streams_step(streams, update, L.moe_write, L.next_reads)
         return x
 
@@ -993,7 +1103,12 @@ class PrefillTarget:
     def _gdp(self, x: torch.Tensor, g: _Gdp, step: dict) -> torch.Tensor:
         """`Nemotron4GDPMixer` over a mixed batch: the context rows' tokens through the
         varlen conv and the chunked recurrence, each from zero or from its slot; then the
-        generation rows' tokens, each row from its slot (`_gdp_generation`)."""
+        generation rows' tokens, each row from its slot (`_gdp_generation`).
+
+        The chunked recurrence is FlashInfer's GDN prefill over the Householder-expanded
+        tokens; it compiles its two kernels (context-parallel for a long row, the per-row one
+        otherwise) on the first call that needs each, which the engine's warm-up makes: one
+        `max_num_tokens` prompt, then many short ones."""
         d = self._d
         num_ctx_tokens, num_contexts, num_rows = (
             step["num_ctx_tokens"],
@@ -1012,7 +1127,7 @@ class PrefillTarget:
             conv_out = torch.empty(
                 num_ctx_tokens, d.conv.stop - d.conv.start, dtype=proj.dtype, device=proj.device
             ).t()
-            causal_conv1d_varlen(
+            triton_causal_conv1d_varlen(
                 proj[ctx, d.conv].t(),
                 g.conv,
                 None,
@@ -1026,7 +1141,7 @@ class PrefillTarget:
             )
             vkq = conv_out.t()
             outs.append(
-                gdp_chunk(
+                flashinfer_gdp_chunk(
                     vkq[:, d.conv_q].view(num_ctx_tokens, d.gdp_heads, d.gdp_key),
                     vkq[:, d.conv_k].view(
                         num_ctx_tokens, d.gdp_householder, d.gdp_heads, d.gdp_key
@@ -1038,9 +1153,10 @@ class PrefillTarget:
                     beta[ctx],
                     ssm_states,
                     slots,
-                    step["query_start_loc_long"][: num_contexts + 1],
+                    step["query_start_loc"][: num_contexts + 1],
                     step["has_initial_state"],
                     d.gdp_scale,
+                    step["max_ctx_len"],
                 )
             )
         if num_rows > num_contexts:
@@ -1056,15 +1172,12 @@ class PrefillTarget:
                 )
             )
         out = outs[0] if len(outs) == 1 else torch.cat(outs)
-        y = gated_rmsnorm(
+        y = gated_rmsnorm_multirow(
             out.view(num_tokens, d.gdp_value_dim),
+            proj[:, : d.gdp_value_dim],
             g.norm,
-            None,
             d.gdp_eps,
-            z=proj[:, : d.gdp_value_dim],
-            group_size=d.gdp_value,
-            norm_before_gate=False,
-            is_rms_norm=True,
+            d.gdp_value,
         )
         return cublas_mm(y, g.out_proj)
 
@@ -1132,16 +1245,23 @@ class PrefillTarget:
         return out.view(num_tokens, d.gdp_heads, d.gdp_value)
 
     def _moe(
-        self, routed: torch.Tensor, shared: torch.Tensor, m: _Moe, sizes: list[int] | None
+        self, routed: torch.Tensor, shared: torch.Tensor, m: _Moe, comm: _MoeComm
     ) -> torch.Tensor:
         """`Nemotron4MoE` with its routed experts split over the ranks.
 
         This rank routes its own tokens at model width (fp32 logits) and projects them
-        into the latent space; every rank's tokens are gathered, each rank runs its window
-        of the experts over all of them, and the windows' fp32 partial sums come back to
-        the tokens' own ranks summed, then rounded once to bf16 -- HF's single fp32 sum
-        over a token's ten experts. `fc2_norm`, the projection back up and the shared
-        expert run on this rank's tokens.
+        into the latent space; each rank runs its window of the experts over every rank's
+        tokens that route into it, and the windows' fp32 partial sums come back to the
+        tokens' own ranks summed, then rounded once to bf16 -- HF's single fp32 sum over a
+        token's ten experts. `fc2_norm`, the projection back up and the shared expert run
+        on this rank's tokens.
+
+        The experts are `latent_moe_experts_fused_act`: `latent_moe_experts`' result bit for
+        bit, its prompt-sized calls' up GEMM and activation fused. How the rows cross the
+        ranks is `comm`'s (`_moe_comm`): a ragged step all-gathers every rank's rows packed
+        in one byte row and reduce-scatters the window partials; a balanced one sends each
+        token only to the ranks owning one of its experts and sums its partials back there.
+        Both sum a token's four partials in fp32 and round once.
         """
         d, core = self._d, self.core
         weights, ids = noaux_tc_op(
@@ -1153,26 +1273,67 @@ class PrefillTarget:
             d.routed_scale,
         )
         latent = cublas_mm(routed, m.fc1_latent)
-        # One byte row per token -- latent | ids | weights -- so one all-gather moves all three.
-        packed = torch.cat(
-            [latent.view(torch.uint8), ids.view(torch.uint8), weights.view(torch.uint8)], dim=1
+        if comm.a2a:
+            recv, combine_offset = moe_a2a_dispatch(
+                ids,
+                [latent, ids, weights],
+                core.a2a.workspace,
+                core.a2a.moe_a2a_metainfo,
+                comm.max_rows,
+                core.rank,
+                core.dp_size,
+                d.top_k,
+                d.num_experts,
+                expert_id_payload_index=1,
+                invalid_token_expert_id=-1,
+            )
+            # Receive rows no token was sent to carry expert ids -1: no window's expert.
+            partial = latent_moe_experts_fused_act(
+                recv[0].view(-1, d.latent),
+                recv[1].view(-1, d.top_k),
+                recv[2].view(-1, d.top_k),
+                m.experts_up,
+                m.experts_down,
+                d.clamp,
+                core.expert_offset,
+                core.local_experts,
+                torch.float32,
+            )
+            experts = moe_a2a_combine(
+                partial.view(core.dp_size, comm.max_rows, d.latent),
+                latent.shape[0],
+                core.a2a.workspace,
+                core.a2a.moe_a2a_metainfo,
+                comm.max_rows,
+                core.rank,
+                core.dp_size,
+                d.top_k,
+                combine_offset,
+                False,
+            )
+        else:
+            # One byte row per token -- latent | ids | weights -- so one all-gather moves all three.
+            packed = torch.cat(
+                [latent.view(torch.uint8), ids.view(torch.uint8), weights.view(torch.uint8)], dim=1
+            )
+            gathered = allgather(packed, comm.sizes, core.dp_group)
+            latent_dtype, ids_dtype, weights_dtype = _DISPATCH_DTYPES
+            partial = latent_moe_experts_fused_act(
+                gathered[:, d.dispatch_latent].view(latent_dtype),
+                gathered[:, d.dispatch_ids].view(ids_dtype),
+                gathered[:, d.dispatch_weights].view(weights_dtype),
+                m.experts_up,
+                m.experts_down,
+                d.clamp,
+                core.expert_offset,
+                core.local_experts,
+                torch.float32,
+            )
+            experts = reducescatter(partial, comm.sizes, core.dp_group)
+        # The one rounding HF makes, after the fp32 sum of the four windows' partials.
+        experts = cublas_mm(
+            flashinfer_rmsnorm(experts.to(latent.dtype), m.fc2_norm, d.eps), m.fc2_latent
         )
-        gathered = allgather(packed, sizes, core.dp_group)
-        latent_dtype, ids_dtype, weights_dtype = _DISPATCH_DTYPES
-        partial = latent_moe_experts(
-            gathered[:, d.dispatch_latent].view(latent_dtype),
-            gathered[:, d.dispatch_ids].view(ids_dtype),
-            gathered[:, d.dispatch_weights].view(weights_dtype),
-            m.experts_up,
-            m.experts_down,
-            d.clamp,
-            core.expert_offset,
-            core.local_experts,
-            torch.float32,
-        )
-        # The four windows' partial sums added in fp32, then the one rounding HF makes.
-        experts = reducescatter(partial, sizes, core.dp_group).to(latent.dtype)
-        experts = cublas_mm(flashinfer_rmsnorm(experts, m.fc2_norm, d.eps), m.fc2_latent)
         shared = cublas_mm(softclamp_relu2(cublas_mm(shared, m.shared_up), d.clamp), m.shared_down)
         return torch.add(experts, shared)
 
@@ -1218,7 +1379,7 @@ class PrefillTarget:
             cublas_mm(attn_out, m.attention.o), x, m.pre_moe_norm, d.eps
         )
         out, _ = flashinfer_fused_add_rmsnorm(
-            self._moe(routed, shared, m.moe, step["moe_sizes"]), x, m.final_norm, d.eps
+            self._moe(routed, shared, m.moe, step["moe"]), x, m.final_norm, d.eps
         )
         return out
 
@@ -1227,11 +1388,12 @@ class DecodeTarget:
     """The specialization: routed to only when there are no context rows on this rank.
 
     Every row is a generation row: one token, or under MTP the 1 + D tokens a verify
-    runs. The GEMMs run through cuBLAS and attention through `thop_attention`'s
-    generation kernels, as a prefill step's generation rows do; the GDP and conv run
-    their decode entries for one token and their verify entries for 1 + D. The routed
-    MoE makes the collectives PrefillTarget makes. This is the target CUDA graphs
-    capture, at every padded batch size.
+    runs. Attention runs `thop_attention`'s generation kernels, as a prefill step's
+    generation rows do; the GDP and conv run their decode entries for one token and their
+    verify entries for 1 + D. The bf16 GEMMs run through `_dense`: the low-M entries on a
+    CUDA-graph step's few rows, cuBLAS otherwise; the router through `_router_logits`. The
+    routed MoE crosses the ranks as PrefillTarget's does, by the same rule. This is the
+    target CUDA graphs capture, at every padded batch size.
     """
 
     def __init__(self, core: Nemotron4NanoPreviewDep4ModelingV2) -> None:
@@ -1338,13 +1500,15 @@ class DecodeTarget:
         entry is `PAD_SLOT_ID`, and every rank runs the same batch, so `moe_sizes` is None.
         The padding rows' attention reads the padding dummy's own pages, the attention-DP
         dummy's its own. An eager decode step can meet ranks that prefill, and then carries
-        their counts.
+        their counts. `graph` says the step runs on CUDA-graph metadata -- captured, or one of
+        the eager runs the engine makes of each graph batch before capturing it.
         """
         state = _state_metadata(md)
         views = self.core.state_views(md.kv_cache_manager)
         num_rows = md.num_seqs
         return dict(
             attention=self._attention_args(md),
+            graph=md.is_cuda_graph,
             # Recurrent state: one slot per row, placeholder rows on PAD_SLOT_ID.
             num_rows=num_rows,
             state_slots=state.state_slots[:num_rows],
@@ -1354,7 +1518,7 @@ class DecodeTarget:
             intermediate_ssm=views.intermediate_ssm,
             intermediate_conv=views.intermediate_conv,
             # The attention-DP group: how many rows every rank feeds the routed MoE.
-            moe_sizes=_moe_sizes(md.all_rank_num_tokens),
+            moe=_moe_comm(md.all_rank_num_tokens),
         )
 
     def _mtp_step_args(self, md: TrtllmAttentionMetadata, all_rank_num_tokens) -> dict:
@@ -1368,8 +1532,9 @@ class DecodeTarget:
         """
         return dict(
             attention=self._attention_args(md),
+            graph=md.is_cuda_graph,
             kv_layer=md.kv_cache_manager.layer_offsets[self._mtp.attention.layer],
-            moe_sizes=_moe_sizes(all_rank_num_tokens),
+            moe=_moe_comm(all_rank_num_tokens),
         )
 
     def forward(
@@ -1385,6 +1550,7 @@ class DecodeTarget:
         d = self._d
         self._check_step_contract(attn_metadata)
         step = self.step_args(attn_metadata)
+        graph = step["graph"]
 
         h = (
             nn.functional.embedding(input_ids, self._embed)
@@ -1403,7 +1569,7 @@ class DecodeTarget:
                 # within a row's tokens. NoPE; q_scaling 1 keeps the softmax scale at
                 # head_dim**-0.5 = 1/16.
                 attn_out = thop_attention(
-                    q=cublas_mm(x, L.mixer.qkv),
+                    q=_dense(x, L.mixer.qkv, graph),
                     output=attn_out,
                     local_layer_idx=step["kv_layer"][L.mixer.layer],
                     num_heads=d.heads_q,
@@ -1412,14 +1578,16 @@ class DecodeTarget:
                     **step["attention"],
                     **_CALL_CONSTANTS,
                 )
-                update = cublas_mm(attn_out, L.mixer.o)
+                update = _dense(attn_out, L.mixer.o, graph)
             else:
-                update = cublas_mm(softclamp_relu2(cublas_mm(x, L.mixer.up), d.clamp), L.mixer.down)
+                update = _dense(
+                    softclamp_relu2(_dense(x, L.mixer.up, graph), d.clamp), L.mixer.down, graph
+                )
             if L.moe is None:
                 routed, x = self._streams_step(streams, update, L.write, L.next_reads)
                 continue
             _, shared = self._streams_step(streams, update, L.write, (L.shared_read,))
-            update = self._moe(routed, shared, L.moe, step["moe_sizes"])
+            update = self._moe(routed, shared, L.moe, step["moe"], graph)
             routed, x = self._streams_step(streams, update, L.moe_write, L.next_reads)
         return x
 
@@ -1451,21 +1619,19 @@ class DecodeTarget:
         """`Nemotron4GDPMixer` for the rows' tokens, each row continuing from its slot
         (`_gdp_generation`); placeholder rows (`PAD_SLOT_ID`) read zeros and write nothing."""
         d = self._d
-        proj = cublas_mm(x, g.in_proj)  # [B * T, 18528] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
+        # [B * T, 18528] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
+        proj = _dense(x, g.in_proj, step["graph"])
         num_tokens = proj.shape[0]
         beta, decay = gdp_gates(proj[:, d.beta], proj[:, d.decay], g.neg_a, g.dt_bias)
         out = self._gdp_generation(proj, beta, decay, g, step["state_slots"], step)
-        y = gated_rmsnorm(
+        y = gated_rmsnorm_multirow(
             out.view(num_tokens, d.gdp_value_dim),
+            proj[:, : d.gdp_value_dim],
             g.norm,
-            None,
             d.gdp_eps,
-            z=proj[:, : d.gdp_value_dim],
-            group_size=d.gdp_value,
-            norm_before_gate=False,
-            is_rms_norm=True,
+            d.gdp_value,
         )
-        return cublas_mm(y, g.out_proj)
+        return _dense(y, g.out_proj, step["graph"])
 
     def _gdp_generation(
         self,
@@ -1531,48 +1697,88 @@ class DecodeTarget:
         return out.view(num_tokens, d.gdp_heads, d.gdp_value)
 
     def _moe(
-        self, routed: torch.Tensor, shared: torch.Tensor, m: _Moe, sizes: list[int] | None
+        self, routed: torch.Tensor, shared: torch.Tensor, m: _Moe, comm: _MoeComm, graph: bool
     ) -> torch.Tensor:
-        """`Nemotron4MoE` with its routed experts split over the ranks.
+        """`Nemotron4MoE` with its routed experts split over the ranks, as PrefillTarget's.
 
-        This rank routes its own tokens at model width (fp32 logits) and projects them
-        into the latent space; every rank's tokens are gathered, each rank runs its window
-        of the experts over all of them, and the windows' fp32 partial sums come back to
-        the tokens' own ranks summed, then rounded once to bf16 -- HF's single fp32 sum
-        over a token's ten experts. `fc2_norm`, the projection back up and the shared
-        expert run on this rank's tokens.
+        The same computation, the same experts entry and the same collectives by the same rule
+        (`_moe_comm`; every CUDA-graph step is balanced, so it takes the all-to-all), its GEMMs
+        through `_dense` and `_router_logits`.
         """
         d, core = self._d, self.core
         weights, ids = noaux_tc_op(
-            cublas_mm(routed, m.router, None, torch.float32),
+            _router_logits(routed, m.router, graph),
             m.router_bias,
             1,
             1,
             d.top_k,
             d.routed_scale,
         )
-        latent = cublas_mm(routed, m.fc1_latent)
-        # One byte row per token -- latent | ids | weights -- so one all-gather moves all three.
-        packed = torch.cat(
-            [latent.view(torch.uint8), ids.view(torch.uint8), weights.view(torch.uint8)], dim=1
+        latent = _dense(routed, m.fc1_latent, graph)
+        if comm.a2a:
+            recv, combine_offset = moe_a2a_dispatch(
+                ids,
+                [latent, ids, weights],
+                core.a2a.workspace,
+                core.a2a.moe_a2a_metainfo,
+                comm.max_rows,
+                core.rank,
+                core.dp_size,
+                d.top_k,
+                d.num_experts,
+                expert_id_payload_index=1,
+                invalid_token_expert_id=-1,
+            )
+            # Receive rows no token was sent to carry expert ids -1: no window's expert.
+            partial = latent_moe_experts_fused_act(
+                recv[0].view(-1, d.latent),
+                recv[1].view(-1, d.top_k),
+                recv[2].view(-1, d.top_k),
+                m.experts_up,
+                m.experts_down,
+                d.clamp,
+                core.expert_offset,
+                core.local_experts,
+                torch.float32,
+            )
+            experts = moe_a2a_combine(
+                partial.view(core.dp_size, comm.max_rows, d.latent),
+                latent.shape[0],
+                core.a2a.workspace,
+                core.a2a.moe_a2a_metainfo,
+                comm.max_rows,
+                core.rank,
+                core.dp_size,
+                d.top_k,
+                combine_offset,
+                False,
+            )
+        else:
+            # One byte row per token -- latent | ids | weights -- so one all-gather moves all three.
+            packed = torch.cat(
+                [latent.view(torch.uint8), ids.view(torch.uint8), weights.view(torch.uint8)], dim=1
+            )
+            gathered = allgather(packed, comm.sizes, core.dp_group)
+            latent_dtype, ids_dtype, weights_dtype = _DISPATCH_DTYPES
+            partial = latent_moe_experts_fused_act(
+                gathered[:, d.dispatch_latent].view(latent_dtype),
+                gathered[:, d.dispatch_ids].view(ids_dtype),
+                gathered[:, d.dispatch_weights].view(weights_dtype),
+                m.experts_up,
+                m.experts_down,
+                d.clamp,
+                core.expert_offset,
+                core.local_experts,
+                torch.float32,
+            )
+            experts = reducescatter(partial, comm.sizes, core.dp_group)
+        # The one rounding HF makes, after the fp32 sum of the four windows' partials.
+        experts = _dense(
+            flashinfer_rmsnorm(experts.to(latent.dtype), m.fc2_norm, d.eps), m.fc2_latent, graph
         )
-        gathered = allgather(packed, sizes, core.dp_group)
-        latent_dtype, ids_dtype, weights_dtype = _DISPATCH_DTYPES
-        partial = latent_moe_experts(
-            gathered[:, d.dispatch_latent].view(latent_dtype),
-            gathered[:, d.dispatch_ids].view(ids_dtype),
-            gathered[:, d.dispatch_weights].view(weights_dtype),
-            m.experts_up,
-            m.experts_down,
-            d.clamp,
-            core.expert_offset,
-            core.local_experts,
-            torch.float32,
+        shared = _dense(
+            softclamp_relu2(_dense(shared, m.shared_up, graph), d.clamp), m.shared_down, graph
         )
-        # The four windows' partial sums added in fp32, then the one rounding HF makes.
-        experts = reducescatter(partial, sizes, core.dp_group).to(latent.dtype)
-        experts = cublas_mm(flashinfer_rmsnorm(experts, m.fc2_norm, d.eps), m.fc2_latent)
-        shared = cublas_mm(softclamp_relu2(cublas_mm(shared, m.shared_up), d.clamp), m.shared_down)
         return torch.add(experts, shared)
 
     def mtp_forward(
@@ -1599,15 +1805,16 @@ class DecodeTarget:
         d, m = self._d, self._mtp
         self._check_mtp_contract(attn_metadata, all_rank_num_tokens)
         step = self._mtp_step_args(attn_metadata, all_rank_num_tokens)
+        graph = step["graph"]
 
         # The next token's embedding first, then the previous step's hidden state.
         e = flashinfer_rmsnorm(nn.functional.embedding(input_ids, embed_tokens), m.enorm, d.eps)
         h = flashinfer_rmsnorm(hidden_states, m.hnorm, d.eps)
-        x = cublas_mm(torch.cat((e, h), dim=-1), m.eh)
+        x = _dense(torch.cat((e, h), dim=-1), m.eh, graph)
         # The shortcut block on an ordinary residual: routing reads the block input.
         routed = flashinfer_rmsnorm(x, m.shortcut_norm, d.eps)
         attn_out = thop_attention(
-            q=cublas_mm(flashinfer_rmsnorm(x, m.input_norm, d.eps), m.attention.qkv),
+            q=_dense(flashinfer_rmsnorm(x, m.input_norm, d.eps), m.attention.qkv, graph),
             output=torch.empty(x.shape[0], d.q_width, dtype=x.dtype, device=x.device),
             local_layer_idx=step["kv_layer"],
             num_heads=d.heads_q,
@@ -1618,10 +1825,10 @@ class DecodeTarget:
         )
         # In place: the attention output becomes the shared expert's input, `x` the residual.
         shared, x = flashinfer_fused_add_rmsnorm(
-            cublas_mm(attn_out, m.attention.o), x, m.pre_moe_norm, d.eps
+            _dense(attn_out, m.attention.o, graph), x, m.pre_moe_norm, d.eps
         )
         out, _ = flashinfer_fused_add_rmsnorm(
-            self._moe(routed, shared, m.moe, step["moe_sizes"]), x, m.final_norm, d.eps
+            self._moe(routed, shared, m.moe, step["moe"], graph), x, m.final_norm, d.eps
         )
         return out
 

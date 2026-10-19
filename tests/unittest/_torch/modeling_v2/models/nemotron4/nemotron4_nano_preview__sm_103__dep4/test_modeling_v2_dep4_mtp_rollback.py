@@ -3,7 +3,8 @@
 """GPU test: an MTP verify step of the nemotron4 dep4 target's GDP mixer rolls back to the accepted
 tokens, on every rank of one node.
 
-Under one-model MTP-Eagle a generation row carries its last token and D drafts. The target's GDP
+Under one-model MTP-Eagle a generation row carries its last token and D drafts, at every draft
+length dep4 runs (`J.DRAFTS`). The target's GDP
 mixer runs the row's 1 + D tokens from its state slot without writing it, and stores the state
 after every token in the hybrid cache manager's per-position buffers; after acceptance the
 engine's worker commits the last accepted token's state into the slot (`update_mamba_states`). A
@@ -58,14 +59,23 @@ def _devices_or_skip() -> str:
     return ",".join(devices[: J.WORLD_SIZE])
 
 
-@pytest.fixture(scope="module")
-def measured(tmp_path_factory) -> list:
-    """Every rank's records, from one run of the 4-rank job."""
+@pytest.fixture(scope="module", params=J.DRAFTS, ids=[f"draft{d}" for d in J.DRAFTS])
+def measured(request, tmp_path_factory) -> list:
+    """Every rank's records, from one run of the 4-rank job at one draft length."""
     checkpoint = _checkpoint_or_skip()
     devices = _devices_or_skip()
-    out = tmp_path_factory.mktemp("dep4_mtp_rollback") / "records.json"
+    out = tmp_path_factory.mktemp(f"dep4_mtp_rollback_d{request.param}") / "records.json"
     completed = subprocess.run(
-        [sys.executable, str(_JOB), "--out", str(out), "--checkpoint", checkpoint],
+        [
+            sys.executable,
+            str(_JOB),
+            "--out",
+            str(out),
+            "--checkpoint",
+            checkpoint,
+            "--draft",
+            str(request.param),
+        ],
         env=dict(os.environ, CUDA_VISIBLE_DEVICES=devices),
         capture_output=True,
         text=True,
@@ -87,7 +97,7 @@ def test_verify_then_commit_matches_decode_over_the_accepted_tokens(measured, ki
     """On every rank, with the rank's own manager of `kind`: `case`'s verify writes no slot, the
     commit writes only the step's rows' engine slots (never a context row's), and each real row's
     committed state is its slot after the accepted decode steps -- the conv state bit for bit, the
-    recurrent state within `J.STATE_ULP` -- with the states after one, two and three tokens
+    recurrent state within `J.STATE_ULP` -- with the states after each of the 1 + D tokens
     differing pairwise by more than that; the verify's GDP entry outputs are within `J.OUT_ULP` of
     the decode steps'. Prints, per rank, the recurrent state's largest distance in units of its
     band, the outputs' in bf16 ulps and the least distance between positions in bands (`-s`)."""
@@ -103,7 +113,11 @@ def test_verify_then_commit_matches_decode_over_the_accepted_tokens(measured, ki
         print(f"rank {r['rank']} {r['manager']} {case}: {len(r['failures'])} failures{measures}")
         assert not r["failures"], "\n".join(r["failures"])
         assert r["distinct"], (
-            f"rank {r['rank']}: the states after 1..3 tokens do not all differ beyond the band"
+            f"rank {r['rank']}: the states after 1..{1 + r['draft']} tokens do not all differ "
+            "beyond the band"
         )
-    if case in ("padded", "mixed"):
-        assert {n for r in records for n in r["accepted"]} == {1, 2, 3}
+    draft = records[0]["draft"]
+    if case == "padded":
+        assert {n for r in records for n in r["accepted"]} == set(range(1, 2 + draft))
+    if case == "mixed":
+        assert max(n for r in records for n in r["accepted"]) == 1 + draft

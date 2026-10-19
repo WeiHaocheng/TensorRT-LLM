@@ -197,9 +197,13 @@ def test_verify_at_the_length_limit(measured) -> None:
     records = measured["limit"]
     assert len(records) == J.WORLD_SIZE
     for r in records:
+        worst = ", ".join(
+            f"{key} {max(w[key] for w in r['worst']):.4g}" for key in J.WORST_KEYS if r["worst"]
+        )
         print(
             f"limit rank {r['rank']}: lengths up to {r['longest']}, max_seq_len {r['bound']}, "
-            f"attention window {r['window']} (net {J.MAX_SEQ_LEN}), {r['compared']} rows compared"
+            f"attention window {r['window']} (net {J.MAX_SEQ_LEN}), {r['compared']} rows compared; "
+            f"worst {worst}"
         )
         assert r["longest"] == J.MAX_SEQ_LEN + J.DRAFT - 1, r
         assert min(r["bound"], r["window"]) >= r["longest"] > J.MAX_SEQ_LEN, r
@@ -213,7 +217,7 @@ def test_the_band_tells_a_state_one_token_off(measured) -> None:
     """The bands have teeth: a verify that starts from the state one token too far -- every GDP
     slot holding the state after t0 already, as a rollback that kept a rejected draft would leave
     it -- moves every probe's logits by more than twice the logit band, and one of its top gaps by
-    more than the gap band, each probe alone on its rank. (Measured: at least 4.547 and 0.753.)"""
+    more than the gap band, each probe alone on its rank. (Measured: at least 4.546 and 0.752.)"""
     records = measured["teeth"]
     assert len(records) == J.WORLD_SIZE
     for r in records:
