@@ -238,6 +238,77 @@ def test_a_row_does_not_depend_on_its_batch(heads: int) -> None:
         )
 
 
+def _split_conv(proj: torch.Tensor, spec, keep_row_stride: bool):
+    """q, k and v of a batch's in_proj rows, split out of the conv columns as
+    `Nemotron4GDPMixer` packs them: through `.view`, or through `as_strided` with the
+    in_proj width as the row stride."""
+    h, nh, dk, dv = spec["heads"], spec["householder"], spec["key_dim"], spec["value_dim"]
+    start, parts = spec["conv_offset"], []
+    for inner in ((nh, h, dv), (nh, h, dk), (h, dk)):
+        size = math.prod(inner)
+        if keep_row_stride:
+            strides = [math.prod(inner[i + 1 :]) for i in range(len(inner))]
+            parts.append(
+                proj.as_strided(
+                    (proj.shape[0], *inner),
+                    (proj.stride(0), *strides),
+                    proj.storage_offset() + start,
+                )
+            )
+        else:
+            parts.append(proj[:, start : start + size].view(proj.shape[0], *inner))
+        start += size
+    v, k, q = parts
+    return q, k, v
+
+
+@pytest.mark.parametrize("heads", HEADS)
+def test_a_lone_request_rounds_as_in_a_batch_with_the_batch_row_stride(heads: int) -> None:
+    """The note's caveat, at both geometries: a request alone gets the bits it gets
+    inside a batch through views that keep the in_proj width as their row stride.
+    Through `.view`, a one-row batch takes the inner block's size as its row stride
+    instead. At tp1's 18528 that changes nothing -- both are multiples of 16 -- while
+    at a tp4 rank's 4632, which is not, Triton compiles another variant of the kernel
+    and the state moves."""
+    spec = _cell_spec(heads, 4)
+    g = torch.Generator(device="cuda").manual_seed(41)
+    h, dk, dv = spec["heads"], spec["key_dim"], spec["value_dim"]
+    proj = F.silu(torch.randn(4, spec["proj_width"], generator=g, device="cuda")).to(torch.bfloat16)
+    _, _, _, decay, beta = _inputs(spec, 4, g)
+    pool = torch.randn(6, h, dv, dk, generator=g, device="cuda") * 0.1
+    slots = torch.arange(4, dtype=torch.int32, device="cuda")
+
+    def state_of_row_0(rows: torch.Tensor, batch: int, keep_row_stride: bool) -> torch.Tensor:
+        state = pool.clone()
+        q, k, v = _split_conv(rows, spec, keep_row_stride)
+        op(
+            q,
+            k,
+            v,
+            decay[:batch].clone(),
+            beta[:batch].clone(),
+            state,
+            slots[:batch],
+            spec["scale"],
+        )
+        return state[0]
+
+    in_batch = state_of_row_0(proj, 4, keep_row_stride=False)
+    alone = state_of_row_0(proj[:1].clone(), 1, keep_row_stride=True)
+    assert torch.equal(alone.view(torch.int32), in_batch.view(torch.int32)), (
+        f"{heads} heads: alone with the batch's row stride, the state differs from the batch's"
+    )
+    viewed = state_of_row_0(proj[:1].clone(), 1, keep_row_stride=False)
+    moved = int((viewed.view(torch.int32) != in_batch.view(torch.int32)).sum())
+    if spec["proj_width"] % 16 == 0:
+        assert moved == 0, f"{heads} heads: a one-row .view moved {moved} state elements"
+    else:
+        assert moved, (
+            f"{heads} heads: a one-row .view no longer moves the state; the hazard the "
+            "note describes is gone"
+        )
+
+
 def test_reference_agrees_with_the_vendored_fla_kernel() -> None:
     """`reference`'s pool layout, step order and padding against an
     implementation written by someone else: the vendored fused-recurrent
