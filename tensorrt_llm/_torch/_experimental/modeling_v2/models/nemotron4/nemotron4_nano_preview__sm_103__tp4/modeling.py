@@ -67,8 +67,8 @@ decode step's one token. cuBLAS picks its kernel by the row count, and at three
 of a rank's GEMM shapes -- its slice of the GDP `in_proj`, the router and
 `fc1_latent_proj` -- the kernels it picks sum differently: decode and verify run
 those through `invariant_mm`, and generation attention through
-`invariant_gen_attention`, whose KV split is fixed and whose program for a
-verify token is the one that decodes it. The all-reduce moves nothing: it forms
+`invariant_gen_attention`, whose KV split is fixed and whose kernels compute a
+verify token with the arithmetic that decodes it. The all-reduce moves nothing: it forms
 every element's sum by one formula -- fp32, rank order, one rounding --
 whatever the row count or the row's place in the message. Prefill and mixed
 steps keep cuBLAS and `thop_attention`; CUDA graphs do not change their
