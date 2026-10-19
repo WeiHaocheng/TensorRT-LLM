@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 # The checkpoint keeps 3 residual streams of its 3072-wide hidden state
@@ -130,6 +131,10 @@ def _wide_residual_kernel(
         _rmsnorm_row(acc1, g1, y1_ptr + row * stride_y, cols, mask, inv_hidden, eps)
 
 
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_WIDE_RESIDUAL = Launch(_wide_residual_kernel)
+
+
 class WideResidual(OpWrapper):
     """Between two branches: optionally write a branch update into the streams, then read them
     once or twice, each read RMS-normed with its own weight. One kernel launch.
@@ -193,7 +198,7 @@ class WideResidual(OpWrapper):
         normed = torch.empty(num_tokens, hidden, dtype=streams.dtype, device=streams.device)
         normed2 = torch.empty_like(normed) if two_reads else None
         if num_tokens:
-            _wide_residual_kernel[(num_tokens,)](
+            _WIDE_RESIDUAL[(num_tokens,)](
                 streams,
                 update,
                 retention,

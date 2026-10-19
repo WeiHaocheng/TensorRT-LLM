@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 #: Channels per program and warps per program: one channel per thread. Measured at batch 1, 8,
@@ -136,6 +137,10 @@ def _cell(
             tokens=tokens, batch=batch, pad_rows=pad_rows, pool=pool, graph=graph, **geometry
         ),
     )
+
+
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_CAUSAL_CONV1D_VERIFY = Launch(_causal_conv1d_verify_kernel)
 
 
 class CausalConv1dVerify(OpWrapper):
@@ -294,7 +299,7 @@ class CausalConv1dVerify(OpWrapper):
         batch, dim, tokens = x.shape
         if batch == 0:
             return x
-        _causal_conv1d_verify_kernel[(batch, triton.cdiv(dim, _BLOCK))](
+        _CAUSAL_CONV1D_VERIFY[(batch, triton.cdiv(dim, _BLOCK))](
             x,
             weight,
             conv_state,

@@ -10,6 +10,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 # The decode entry's tile, warp count and grid cap. Each token's update has to
@@ -161,6 +162,10 @@ def _gdp_verify_kernel(
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
     """HF `l2norm`: `x * rsqrt(sum(x * x) + 1e-6)` over the head dim."""
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + 1e-6)
+
+
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_GDP_VERIFY = Launch(_gdp_verify_kernel)
 
 
 class GdpVerify(OpWrapper):
@@ -473,7 +478,7 @@ class GdpVerify(OpWrapper):
         if num_rows == 0:
             return out
         grid = (triton.cdiv(value_dim, _BLOCK_V), min(num_rows, _MAX_GRID_ROWS))
-        _gdp_verify_kernel[grid](
+        _GDP_VERIFY[grid](
             q,
             k,
             v,

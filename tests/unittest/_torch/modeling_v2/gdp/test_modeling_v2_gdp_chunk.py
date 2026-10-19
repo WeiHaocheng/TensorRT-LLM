@@ -17,7 +17,7 @@ from triton.runtime.autotuner import Autotuner
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp import gdp_chunk as gdp_chunk_module
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import (
-    _chunk_list,
+    _chunk_lists,
     _decay_cumsum_kernel,
     _expand_kernel,
     _jit,
@@ -400,10 +400,14 @@ def test_the_stages_are_the_vendored_ones_bitwise(cell) -> None:
     assert torch.equal(raw, want_raw), "the entry's pool differs from the vendored stages'"
 
 
-def _host_chunk_list(cu_steps, steps, chunk_size):
-    """`_chunk_list` the way the wrappers build it: on the host, exactly as long as
-    the batch's chunk count."""
-    return prepare_chunk_indices(cu_steps, chunk_size), prepare_chunk_offsets(cu_steps, chunk_size)
+def _host_chunk_lists(cu_seqlens, num_householder, steps, sizes):
+    """`_chunk_lists` the way the wrappers build the lists: on the host, each exactly as
+    long as the batch's chunk count."""
+    cu_steps = cu_seqlens.long() * num_householder
+    return cu_steps, [
+        (prepare_chunk_indices(cu_steps, size), prepare_chunk_offsets(cu_steps, size))
+        for size in sizes
+    ]
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -417,7 +421,7 @@ def test_the_bound_sized_grids_change_no_bit(cell, monkeypatch) -> None:
     want = op(**args).clone()
     want_raw = raw.clone()
     raw.copy_(raw_before)
-    monkeypatch.setattr(gdp_chunk_module, "_chunk_list", _host_chunk_list)
+    monkeypatch.setattr(gdp_chunk_module, "_chunk_lists", _host_chunk_lists)
     got = op(**args)
     assert torch.equal(got, want), "the exact grids' output differs from the bound grids'"
     assert torch.equal(raw, want_raw), "the exact grids' pool differs from the bound grids'"
@@ -487,29 +491,35 @@ def test_two_processes_give_identical_bits() -> None:
     assert digests[0] == digests[1], f"two processes disagree: {digests}"
 
 
-@pytest.mark.parametrize("chunk_size", [16, 32, 64])
-def test_the_device_chunk_list_is_the_host_list(chunk_size) -> None:
-    """`_chunk_list` against the host builders the wrappers call,
-    `prepare_chunk_indices` and `prepare_chunk_offsets`: one to 300 sequences, past
-    the kernel's 64-sequence block, with lengths of one sub-step, exact multiples of
-    the chunk, one past them, and anything up to 2100. The entries past the real
-    chunks name the last sequence and a chunk past its end, and one sequence gets no
-    such entry at all."""
-    g = torch.Generator().manual_seed(chunk_size)
+@pytest.mark.parametrize("sizes", [(64, 16), (32, 64), (16, 16)])
+@pytest.mark.parametrize("num_householder", [1, 3])
+def test_the_device_chunk_lists_are_the_host_lists(sizes, num_householder) -> None:
+    """`_chunk_lists` against the host builders the wrappers call, for both of its
+    chunk sizes from one launch: `cu_steps` is the token offsets times the
+    Householder count, and each list's `prepare_chunk_indices` and
+    `prepare_chunk_offsets`. One to 300 sequences, past the kernel's 64-sequence
+    block, with lengths of one sub-step, exact multiples of a chunk, one past them,
+    and anything up to 2100. The entries past the real chunks name the last sequence
+    and a chunk past its end, and one sequence gets no such entry at all."""
+    g = torch.Generator().manual_seed(sizes[0] * 10 + num_householder)
     for num_seqs in (1, 2, 3, 63, 64, 65, 200, 300):
         lens = torch.randint(1, 2100, (num_seqs,), generator=g)
-        lens[1::5] = chunk_size * torch.randint(1, 20, lens[1::5].shape, generator=g)
+        lens[1::5] = sizes[0] * torch.randint(1, 20, lens[1::5].shape, generator=g)
         lens[2::5] = lens[1::5][: lens[2::5].numel()] + 1
         lens[3::5] = 1
         cu = F.pad(lens.cumsum(0), (1, 0)).cuda()
-        chunk_indices, chunk_offsets = _chunk_list(cu, int(lens.sum()), chunk_size)
-        want = prepare_chunk_indices(cu, chunk_size)
-        assert torch.equal(chunk_offsets, prepare_chunk_offsets(cu, chunk_size)), num_seqs
-        assert torch.equal(chunk_indices[: want.shape[0]], want), num_seqs
-        past = chunk_indices[want.shape[0] :].cpu()
-        assert (past[:, 0] == num_seqs - 1).all(), num_seqs
-        assert (past[:, 1] * chunk_size >= int(lens[-1])).all(), num_seqs
-        assert num_seqs > 1 or past.numel() == 0
+        steps = int(lens.sum()) * num_householder
+        cu_steps, lists = _chunk_lists(cu, num_householder, steps, sizes)
+        assert cu_steps.dtype == torch.long
+        assert torch.equal(cu_steps, cu.long() * num_householder), num_seqs
+        for size, (chunk_indices, chunk_offsets) in zip(sizes, lists):
+            want = prepare_chunk_indices(cu_steps, size)
+            assert torch.equal(chunk_offsets, prepare_chunk_offsets(cu_steps, size)), num_seqs
+            assert torch.equal(chunk_indices[: want.shape[0]], want), num_seqs
+            past = chunk_indices[want.shape[0] :].cpu()
+            assert (past[:, 0] == num_seqs - 1).all(), num_seqs
+            assert (past[:, 1] * size >= int(lens[-1]) * num_householder).all(), num_seqs
+            assert num_seqs > 1 or past.numel() == 0
 
 
 def test_the_call_never_waits_for_the_device() -> None:

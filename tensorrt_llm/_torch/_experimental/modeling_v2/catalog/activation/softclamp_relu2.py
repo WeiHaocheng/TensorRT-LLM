@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 #: Elements per program and warps per program. 8 elements per thread is one 16-byte bf16 vector;
@@ -47,6 +48,10 @@ def _softclamp_relu2_kernel(
     c = (CLAMP * libdevice.tanh(x * INV_CLAMP)).to(dt).to(tl.float32)
     r = tl.where(c < 0.0, 0.0, c)
     tl.store(y_ptr + offs, (r * r).to(dt), mask=mask)
+
+
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_SOFTCLAMP_RELU2 = Launch(_softclamp_relu2_kernel)
 
 
 class SoftclampRelu2(OpWrapper):
@@ -158,7 +163,7 @@ class SoftclampRelu2(OpWrapper):
         numel = x.numel()
         if numel:
             clamp = _fp32(activation_clamp)
-            _softclamp_relu2_kernel[(triton.cdiv(numel, _BLOCK),)](
+            _SOFTCLAMP_RELU2[(triton.cdiv(numel, _BLOCK),)](
                 x,
                 y,
                 numel,
