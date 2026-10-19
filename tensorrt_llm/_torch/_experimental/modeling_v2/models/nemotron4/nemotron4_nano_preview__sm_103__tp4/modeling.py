@@ -6,10 +6,20 @@ The text model of the Nemotron4ForConditionalGeneration checkpoint: 44 blocks
 of hidden 3072 on three wide-residual streams -- 12 GDP mixers alone, 4 dense
 relu2 MLPs, 8 attention and 20 GDP mixers each beside a latent MoE (512 routed
 experts at top-10 in a 768-wide latent space, plus a shared expert) -- read out
-of the streams, normed, and projected by an fp32-output lm_head. The
-checkpoint's MTP layer is declared and loaded only under a `speculative_config`
-(weights.py); this target has no draft forward yet. Every weight is the
-checkpoint's bf16, laid out for the entries at load.
+of the streams, normed, and projected by an fp32-output lm_head. Every weight
+is the checkpoint's bf16, laid out for the entries at load.
+
+Speculative decoding. Under one-model MTP-Eagle (the one mode routing admits)
+the checkpoint's MTP layer -- global layer 44, declared and loaded only then
+(weights.py) -- drafts every depth, driven by the engine's worker. A
+generation row then carries 1 + D tokens: its last accepted token and D
+drafts. The trunk verifies them in one step: the GDP mixers run each row's
+tokens from its slot through the verify entries, which leave the slot alone and
+store the state after every token; the worker's commit
+(`update_mamba_states`) promotes the accepted one into the slot, so a rejected
+draft never reaches it. The MTP layer's attention + MoE block is split over
+the ranks as a trunk shortcut block is, its front end and final norm are
+replicated, and its KV lives in the engine's separate draft KV manager.
 
 `tp4` is tensor parallel over the 4 GPUs of one node, without attention DP:
 every rank runs every request. A rank holds 6 of the 24 GDP heads, 4 of the 16
@@ -51,15 +61,19 @@ arguments its forward passes.
 Batch invariance. A decode step computes every row from that row alone, in an
 order that does not depend on how many rows share the step, so a request's
 logits and the state it writes are bitwise the same alone, in any eager batch
-and in a padded CUDA-graph batch, on every rank. cuBLAS picks its kernel by the
-row count, and at three of a rank's GEMM shapes -- its slice of the GDP
-`in_proj`, the router and `fc1_latent_proj` -- the kernels it picks sum
-differently: decode runs those through `invariant_mm`, and generation attention
-through `invariant_gen_attention`, whose KV split is fixed. The all-reduce
-moves nothing: it forms every element's sum by one formula -- fp32, rank order,
-one rounding -- whatever the row count or the row's place in the message.
-Prefill and mixed steps keep cuBLAS and `thop_attention`; CUDA graphs do not
-change their batches.
+and in a padded CUDA-graph batch, on every rank. An MTP verify is such a step
+with 1 + D tokens a row, and its token j gets the bits that token gets as a
+decode step's one token. cuBLAS picks its kernel by the row count, and at three
+of a rank's GEMM shapes -- its slice of the GDP `in_proj`, the router and
+`fc1_latent_proj` -- the kernels it picks sum differently: decode and verify run
+those through `invariant_mm`, and generation attention through
+`invariant_gen_attention`, whose KV split is fixed and whose program for a
+verify token is the one that decodes it. The all-reduce moves nothing: it forms
+every element's sum by one formula -- fp32, rank order, one rounding --
+whatever the row count or the row's place in the message. Prefill and mixed
+steps keep cuBLAS and `thop_attention`; CUDA graphs do not change their
+batches. So do the MTP layer's draft steps: a draft's bits change how many
+drafts the trunk accepts, never the tokens it emits.
 """
 
 import weakref
@@ -86,15 +100,22 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_up
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_varlen import (
     causal_conv1d_varlen,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_verify import (
+    causal_conv1d_verify,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_gates import gdp_gates
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import gdp_recurrent
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_verify import gdp_verify
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.invariant_mm import invariant_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
     latent_moe_experts,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
+    flashinfer_fused_add_rmsnorm,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
@@ -115,6 +136,7 @@ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._utils import prefer_pinned
 
 from . import weights as _weights
@@ -233,7 +255,8 @@ class Nemotron4StateMetadata(Mamba2Metadata):
     hands it no speculative config, and the hybrid managers do not state the
     draft length either, so the shell binds the target's own
     (`for_draft_len`). `state_indices` keeps the engine's slots, the padding
-    dummy's included.
+    dummy's included: the worker's commit (`update_mamba_states`) writes through
+    it and does not skip a negative slot.
     """
 
     #: The longest draft a generation row carries: the target's `max_draft_len`
@@ -341,11 +364,18 @@ class _StateViews(NamedTuple):
     a GDP layer to its pool view: [slots, 6, 64, 128] fp32 and [slots, 4224, 3]
     bf16 -- the rank's heads and conv channels -- any slot stride, inner dims
     dense.
+
+    `intermediate_ssm` / `intermediate_conv` map a GDP layer to the per-position
+    buffers an MTP verify writes ([max_batch, 1 + D, 6, 64, 128] fp32 and
+    [max_batch, 1 + D, 4224, 3] bf16; row g is the step's generation row g), or
+    to None when the manager keeps none (no speculative decoding).
     """
 
     kv_layer: dict[int, int]
     ssm_states: dict[int, torch.Tensor]
     conv_states: dict[int, torch.Tensor]
+    intermediate_ssm: dict[int, torch.Tensor | None]
+    intermediate_conv: dict[int, torch.Tensor | None]
 
 
 class _AllreduceWorkspace(NamedTuple):
@@ -532,6 +562,48 @@ def _layer_views(w, layer_types: tuple[str, ...], row_invariant: bool) -> tuple[
     return tuple(layers)
 
 
+class _Mtp(NamedTuple):
+    """The MTP layer (`Nemotron4MultiTokenPredictionLayer`): its front end and final norm,
+    replicated, around a shortcut attention + MoE block on an ordinary residual, split over the
+    ranks as a trunk shortcut block is. Its output head is the trunk's lm_head."""
+
+    attention: _Attention  # global layer `num_layers`; its KV lives in the worker's draft manager
+    enorm: torch.Tensor  # [hidden], the next token's embedding
+    hnorm: torch.Tensor  # [hidden], the previous step's hidden state
+    eh: torch.Tensor  # [2 * hidden, hidden]: the embedding half first
+    shortcut_norm: torch.Tensor  # [hidden], the routed input
+    input_norm: torch.Tensor  # [hidden], the attention input
+    pre_moe_norm: torch.Tensor  # [hidden], the shared expert's input
+    moe: _Moe
+    final_norm: torch.Tensor  # [hidden]
+
+
+def _mtp_view(w, i: int) -> _Mtp:
+    """The MTP layer's operands, global layer `i`, at this rank's shapes: every GEMM operand the
+    `.t()` view `cublas_mm` reads, in both targets."""
+    return _Mtp(
+        attention=_Attention(layer=i, qkv=w[f"l{i}_qkv"].t(), o=w[f"l{i}_o"].t()),
+        enorm=w[f"l{i}_enorm"],
+        hnorm=w[f"l{i}_hnorm"],
+        eh=w[f"l{i}_eh"].t(),
+        shortcut_norm=w[f"l{i}_shortcut_norm"],
+        input_norm=w[f"l{i}_input_norm"],
+        pre_moe_norm=w[f"l{i}_pre_moe_norm"],
+        moe=_Moe(
+            router=w[f"l{i}_router"].t(),
+            router_bias=w[f"l{i}_router_bias"],
+            fc1_latent=w[f"l{i}_fc1_latent"].t(),
+            experts_up=w[f"l{i}_experts_up"],
+            experts_down=w[f"l{i}_experts_down"],
+            fc2_norm=w[f"l{i}_fc2_norm"],
+            fc2_latent=w[f"l{i}_fc2_latent"].t(),
+            shared_up=w[f"l{i}_shared_up"].t(),
+            shared_down=w[f"l{i}_shared_down"].t(),
+        ),
+        final_norm=w[f"l{i}_mtp_norm"],
+    )
+
+
 class _Dims(NamedTuple):
     """The text config's numbers the forward reads, at one rank's part, and where the rank's
     GDP in_proj packs its parts."""
@@ -616,10 +688,18 @@ class Nemotron4NanoPreviewTp4ModelingV2(DecoderModel):
         self.layer_types = dims.layer_types
         self.gdp_layers = tuple(i for i, t in enumerate(dims.layer_types) if t in _GDP_BLOCKS)
         # The trunk's attention layers. With one-model MTP the engine keeps the MTP layer's
-        # KV (global layer 44) in a separate draft KV cache manager.
+        # KV (global layer 44) in a separate draft KV cache manager, not in the manager that
+        # prepares the step.
         self.attention_layers = tuple(
             i for i, t in enumerate(dims.layer_types) if t in _ATTENTION_BLOCKS
         )
+        # The MTP layer, global layer `num_layers`, exists only under speculative decoding
+        # (weights.py declares it then).
+        self.mtp_layer = len(dims.layer_types) if dims.mtp_layers else None
+        # Tokens a generation row carries: its last token, and under one-model MTP the drafts
+        # it verifies.
+        spec_config = getattr(model_config, "spec_config", None)
+        self.tokens_per_gen_step = 1 if spec_config is None else spec_config.tokens_per_gen_step
         self.state_shapes = _rank_state_shapes(model_config)
         self._checked_manager: weakref.ref | None = None
 
@@ -684,6 +764,12 @@ class Nemotron4NanoPreviewTp4ModelingV2(DecoderModel):
             kv_layer={i: kv_cache_manager.layer_offsets[i] for i in self.attention_layers},
             ssm_states={i: kv_cache_manager.get_ssm_states(i) for i in self.gdp_layers},
             conv_states={i: kv_cache_manager.get_conv_states(i) for i in self.gdp_layers},
+            intermediate_ssm={
+                i: kv_cache_manager.get_intermediate_ssm_states(i) for i in self.gdp_layers
+            },
+            intermediate_conv={
+                i: kv_cache_manager.get_intermediate_conv_states(i) for i in self.gdp_layers
+            },
         )
 
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
@@ -730,22 +816,94 @@ def _state_metadata(md: AttentionMetadata) -> Nemotron4StateMetadata:
     return state
 
 
-def _heads(x: torch.Tensor, cols: slice, *inner: int) -> torch.Tensor:
-    """`x[:, cols]` as `[rows, *inner]`, keeping `x`'s own row stride at every row count.
+def _heads(x: torch.Tensor, cols: slice, *inner: int, tokens: int = 1) -> torch.Tensor:
+    """`x[:, cols]` as `[rows, *inner]`, keeping `x`'s own row stride at every row count; with
+    `tokens` > 1, as `[rows / tokens, tokens, *inner]`, each request's tokens consecutive rows.
 
     `x[:, cols].view(rows, *inner)` gives a one-row batch the inner block's size as its row
     stride -- 768, 2304 or 1152 for the GDP q, k and v -- where every larger batch keeps the
     in_proj output's 4632. gdp_recurrent's kernel is specialized on its strides' divisibility by
     16, on which those disagree, so a request alone would run another compiled variant of it,
-    whose reductions round otherwise, than the same request inside any batch.
+    whose reductions round otherwise, than the same request inside any batch. Here a token's row
+    stride is the in_proj output's at every batch, and a request's the tokens' together.
     """
     strides, size = [], 1
     for n in reversed(inner):
         strides.insert(0, size)
         size *= n
-    return x.as_strided(
-        (x.shape[0], *inner), (x.stride(0), *strides), x.storage_offset() + cols.start
+    rows, row = x.shape[0], x.stride(0)
+    shape, stride = (rows, *inner), (row, *strides)
+    if tokens > 1:
+        shape, stride = (rows // tokens, tokens, *inner), (tokens * row, row, *strides)
+    return x.as_strided(shape, stride, x.storage_offset() + cols.start)
+
+
+def _gdp_rows(
+    proj: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    g: "_Gdp",
+    slots: torch.Tensor,
+    step: dict,
+    d: _Dims,
+) -> torch.Tensor:
+    """The GDP recurrence of a step's generation rows, request-major, each row from its slot;
+    padding rows (`PAD_SLOT_ID`) read zeros and write nothing. `proj` is the rows' in_proj
+    output, whose conv columns become the conv output in place.
+
+    Every row carries the same number of tokens, read off host shapes: the engine pads or
+    truncates each row's drafts to the step's draft length (`resolve_draft_len`), and a step
+    with none skips the worker's commit. One token goes through the decode entries, which update
+    the slot in place. The 1 + D tokens of an MTP verify go through the verify entries: they run
+    the row's tokens from its slot without writing it, and store the state after each token in
+    the manager's per-position buffers, row b for generation row b. The worker's commit
+    (`update_mamba_states`) then promotes the last accepted token's state into the slot, so a
+    rejected draft never reaches it. Both read q, k and v with the in_proj output's row stride
+    for a token (`_heads`), and a verify's request stride is T times it: with the checkpoint's
+    draft length 2 that is 13896, like 4632 not a multiple of 16, so each verify token gets the
+    bits of its decode step. A draft length of 1 or 3 (a `draft_len_schedule`) makes it a
+    multiple of 16, where gdp_verify stays within its band but not decode's bits (its note).
+    """
+    num_rows, num_tokens = slots.shape[0], proj.shape[0]
+    tokens = num_tokens // num_rows
+    ssm_states, conv_states = step["ssm_states"][g.layer], step["conv_states"][g.layer]
+    vkq = proj[:, d.conv]
+    if tokens == 1:
+        causal_conv1d_update(
+            vkq.unsqueeze(-1), conv_states, g.conv, None, True, None, slots, PAD_SLOT_ID
+        )
+        return gdp_recurrent(
+            _heads(vkq, d.conv_q, d.gdp_heads, d.gdp_key),
+            _heads(vkq, d.conv_k, d.gdp_householder, d.gdp_heads, d.gdp_key),
+            _heads(vkq, d.conv_v, d.gdp_householder, d.gdp_heads, d.gdp_value),
+            decay,
+            beta,
+            ssm_states,
+            slots,
+            d.gdp_scale,
+        )
+    conv_width = vkq.shape[1]
+    causal_conv1d_verify(
+        # [rows, channels, tokens]: a token's channels are one in_proj row's conv columns.
+        _heads(vkq, slice(0, conv_width), conv_width, tokens=tokens).transpose(1, 2),
+        conv_states,
+        g.conv,
+        slots,
+        step["intermediate_conv"][g.layer],
+        PAD_SLOT_ID,
     )
+    out = gdp_verify(
+        _heads(vkq, d.conv_q, d.gdp_heads, d.gdp_key, tokens=tokens),
+        _heads(vkq, d.conv_k, d.gdp_householder, d.gdp_heads, d.gdp_key, tokens=tokens),
+        _heads(vkq, d.conv_v, d.gdp_householder, d.gdp_heads, d.gdp_value, tokens=tokens),
+        decay.view(num_rows, tokens, d.gdp_heads),
+        beta.view(num_rows, tokens, d.gdp_householder, d.gdp_heads),
+        ssm_states,
+        slots,
+        step["intermediate_ssm"][g.layer],
+        d.gdp_scale,
+    )
+    return out.view(num_tokens, d.gdp_heads, d.gdp_value)
 
 
 def _check_rows(num_tokens: int, workspace: _AllreduceWorkspace) -> None:
@@ -766,12 +924,16 @@ class PrefillTarget:
         self.core = core
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
         # forward. Each target owns its own flag: the two `step_args` projections differ,
-        # so probing one does not prove the other's fields exist.
+        # so probing one does not prove the other's fields exist. The MTP layer's draft
+        # steps read another projection, off the draft manager the worker swaps in.
         self._contract_pending = step_contract_enabled()
+        self._mtp_contract_pending = step_contract_enabled()
         self._d = _dims(core.model_config.pretrained_config.text_config, core.tp_size)
         self._embed = core.w["embed"]
         self._first_reads = _block_reads(core.w, core.layer_types, 0)
         self._layers = _layer_views(core.w, core.layer_types, row_invariant=False)
+        self._mtp = None if core.mtp_layer is None else _mtp_view(core.w, core.mtp_layer)
+        self._tokens_per_gen_step = core.tokens_per_gen_step
         self._ar = core.allreduce_workspace
 
     def _check_step_contract(self, md) -> None:
@@ -789,6 +951,67 @@ class PrefillTarget:
             raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
         self._contract_pending = False
 
+    def _check_mtp_contract(self, md) -> None:
+        """The same opt-in fail-fast for the MTP layer's draft steps, whose metadata carries
+        the worker's draft KV manager rather than the trunk's."""
+        if not self._mtp_contract_pending:
+            return
+        try:
+            self._mtp_step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"draft-step metadata surface drifted: {exc}") from exc
+        self._mtp_contract_pending = False
+
+    def _attention_args(self, md: TrtllmAttentionMetadata) -> dict:
+        """thop_attention's batch state, off whichever cache manager the metadata carries: the
+        trunk's, or the draft manager the MTP worker swaps in for the MTP layer's steps.
+
+        A generation row may carry 1 + D tokens (an MTP verify, or the MTP layer's first
+        draft step). thop sizes the XQA workspace as if each of `max_num_sequences` rows
+        carried one token, so `max_num_sequences` counts every token a row may carry.
+        """
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace_=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            attention_window_size=md.max_seq_len,
+            num_contexts=md.num_contexts,
+            num_ctx_tokens=md.num_ctx_tokens,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences * self._tokens_per_gen_step,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
+
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto the explicit batch state of thop_attention
         (`attention`) and of the recurrent-state entries, once per forward.
@@ -796,55 +1019,17 @@ class PrefillTarget:
         Rows are the step's requests, contexts first, the same rows in the same order on
         every rank; tokens are packed row by row. The state entries take the context rows'
         slices: `query_start_loc[: num_contexts + 1]`, `state_slots[:num_contexts]`,
-        `has_initial_state`; the generation rows that follow take one token and one slot
-        each (draft tokens come only with MTP, which this target does not run).
+        `has_initial_state`. The generation rows that follow take one slot each, and every
+        one of them the same number of tokens: one, or 1 + D under MTP, whose states go to
+        the `intermediate_*` buffers. `query_start_loc` counts one token per generation row,
+        so only its first `num_contexts + 1` entries hold under MTP.
         """
         state = _state_metadata(md)
         views = self.core.state_views(md.kv_cache_manager)
         num_rows = md.num_seqs
         num_contexts = md.num_contexts
         return dict(
-            attention=dict(
-                sequence_length=md.kv_lens_cuda_runtime,
-                host_past_key_value_lengths=md.kv_lens_runtime,
-                host_total_kv_lens=md.host_total_kv_lens,
-                context_lengths=md.prompt_lens_cuda_runtime,
-                host_context_lengths=md.prompt_lens_cpu_runtime,
-                host_request_types=md.host_request_types_runtime,
-                kv_cache_block_offsets=md.kv_cache_block_offsets,
-                host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
-                host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-                workspace_=md.effective_workspace,
-                tokens_per_block=md.tokens_per_block,
-                max_num_requests=md.max_num_requests,
-                max_context_length=md.max_context_length,
-                max_seq_len=md.max_seq_len,
-                attention_window_size=md.max_seq_len,
-                num_contexts=num_contexts,
-                num_ctx_tokens=md.num_ctx_tokens,
-                trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-                use_paged_context_fmha=md.use_paged_context_fmha,
-                beam_width=md.effective_beam_width,
-                cache_indirection=md.cache_indirection,
-                block_ids_per_seq=md.block_ids_per_seq,
-                max_context_q_len_override=md.max_context_q_len_override,
-                is_cross=md.is_cross,
-                is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-                use_spec_decoding=md.use_spec_decoding,
-                is_spec_dec_tree=md.is_spec_dec_tree,
-                spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-                spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
-                spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-                spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-                spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-                spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-                spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
-                num_sparse_topk=md.num_sparse_topk,
-                flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-                flash_mla_num_splits=md.flash_mla_num_splits,
-                max_num_sequences=md.max_num_sequences,
-                force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
-            ),
+            attention=self._attention_args(md),
             # Recurrent state: rows, their slots and where each context row's tokens start.
             num_rows=num_rows,
             num_contexts=num_contexts,
@@ -856,6 +1041,20 @@ class PrefillTarget:
             kv_layer=views.kv_layer,
             ssm_states=views.ssm_states,
             conv_states=views.conv_states,
+            intermediate_ssm=views.intermediate_ssm,
+            intermediate_conv=views.intermediate_conv,
+        )
+
+    def _mtp_step_args(self, md: TrtllmAttentionMetadata) -> dict:
+        """The MTP layer's batch state, read off the metadata the worker hands each draft
+        step: every call, since the worker rewrites that metadata between draft steps.
+
+        Its KV is global layer `num_layers` in the draft KV manager the worker swaps in (tp4
+        keeps it apart from the trunk's), at that manager's own index.
+        """
+        return dict(
+            attention=self._attention_args(md),
+            kv_layer=md.kv_cache_manager.layer_offsets[self._mtp.attention.layer],
         )
 
     def forward(
@@ -939,8 +1138,8 @@ class PrefillTarget:
     def _gdp(self, x: torch.Tensor, g: _Gdp, step: dict) -> torch.Tensor:
         """`Nemotron4GDPMixer` on this rank's heads over a mixed batch: the context rows'
         tokens through the varlen conv and the chunked recurrence, each from zero or from
-        its slot; then each generation row's one token through the decode conv and
-        recurrence, from its slot. The heads' `out_proj` partials are all-reduced."""
+        its slot; then the generation rows' tokens, each row from its slot (`_gdp_rows`).
+        The heads' `out_proj` partials are all-reduced."""
         d = self._d
         num_ctx_tokens, num_contexts, num_rows = (
             step["num_ctx_tokens"],
@@ -992,30 +1191,15 @@ class PrefillTarget:
             )
         if num_rows > num_contexts:
             gen = slice(num_ctx_tokens, num_tokens)
-            slots = step["state_slots"][num_contexts:num_rows]
-            num_gen = num_tokens - num_ctx_tokens
-            # In place: the conv columns of the in_proj output become the conv output.
-            causal_conv1d_update(
-                proj[gen, d.conv].unsqueeze(-1),
-                conv_states,
-                g.conv,
-                None,
-                True,
-                None,
-                slots,
-                PAD_SLOT_ID,
-            )
-            vkq = proj[gen, d.conv]
             outs.append(
-                gdp_recurrent(
-                    vkq[:, d.conv_q].view(num_gen, d.gdp_heads, d.gdp_key),
-                    vkq[:, d.conv_k].view(num_gen, d.gdp_householder, d.gdp_heads, d.gdp_key),
-                    vkq[:, d.conv_v].view(num_gen, d.gdp_householder, d.gdp_heads, d.gdp_value),
-                    decay[gen],
+                _gdp_rows(
+                    proj[gen],
                     beta[gen],
-                    ssm_states,
-                    slots,
-                    d.gdp_scale,
+                    decay[gen],
+                    g,
+                    step["state_slots"][num_contexts:num_rows],
+                    step,
+                    d,
                 )
             )
         out = outs[0] if len(outs) == 1 else torch.cat(outs)
@@ -1072,16 +1256,64 @@ class PrefillTarget:
             cublas_mm(experts, m.fc2_latent), summed[split:].view(num_tokens, d.hidden)
         )
 
+    def mtp_forward(
+        self,
+        embed_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """`Nemotron4MultiTokenPredictionLayer` over one draft step's rows: here the first,
+        over a mixed step's context rows and generation rows alike.
+
+        Returns the layer's `final_layernorm`-ed output, the hidden state HF hands the next
+        depth and the head: the worker feeds each request's row back as the next step's
+        `hidden_states`, and the shared head projects it with no norm of its own. The front
+        end and the norms are replicated; the block's attention heads, its experts' slice and
+        its shared expert's slice are this rank's, and their partials are all-reduced as a
+        trunk shortcut block's are.
+        """
+        d, m = self._d, self._mtp
+        self._check_mtp_contract(attn_metadata)
+        step = self._mtp_step_args(attn_metadata)
+        _check_rows(input_ids.shape[0], self._ar)
+
+        # The next token's embedding first, then the previous step's hidden state.
+        e = flashinfer_rmsnorm(nn.functional.embedding(input_ids, embed_tokens), m.enorm, d.eps)
+        h = flashinfer_rmsnorm(hidden_states, m.hnorm, d.eps)
+        x = cublas_mm(torch.cat((e, h), dim=-1), m.eh)
+        # The shortcut block on an ordinary residual: routing reads the block input.
+        routed = flashinfer_rmsnorm(x, m.shortcut_norm, d.eps)
+        attn_out = thop_attention(
+            q=cublas_mm(flashinfer_rmsnorm(x, m.input_norm, d.eps), m.attention.qkv),
+            output=torch.empty(x.shape[0], d.q_width, dtype=x.dtype, device=x.device),
+            local_layer_idx=step["kv_layer"],
+            num_heads=d.heads_q,
+            num_kv_heads=d.heads_kv,
+            head_size=d.head_dim,
+            **step["attention"],
+            **_CALL_CONSTANTS,
+        )
+        o = allreduce(cublas_mm(attn_out, m.attention.o), self._ar.buffer, self._ar.flags)
+        # In place: the attention output becomes the shared expert's input, `x` the residual.
+        shared, x = flashinfer_fused_add_rmsnorm(o, x, m.pre_moe_norm, d.eps)
+        out, _ = flashinfer_fused_add_rmsnorm(
+            self._moe(routed, shared, m.moe), x, m.final_norm, d.eps
+        )
+        return out
+
 
 class DecodeTarget:
     """The specialization: routed to only when there are no context rows.
 
     Batch-invariant: every entry it calls computes a row from that row alone, in an order
     the row count does not change, so each request's logits and the state it writes are
-    the same bits whatever batch, padded or not, the step runs in. The GEMMs whose cuBLAS
-    kernel changes with the row count at a rank's shapes run through `invariant_mm`;
-    attention runs through `invariant_gen_attention`, whose KV split is fixed; the
-    all-reduce sums every element by one formula at any row count.
+    the same bits whatever batch, padded or not, the step runs in -- and token j of an MTP
+    verify's 1 + D gets the bits that token gets as a decode step's one token. The GEMMs
+    whose cuBLAS kernel changes with the row count at a rank's shapes run through
+    `invariant_mm`; attention runs through `invariant_gen_attention`, whose KV split is
+    fixed; the all-reduce sums every element by one formula at any row count. The MTP
+    layer's draft steps are not part of this (`mtp_forward`).
     """
 
     def __init__(self, core: Nemotron4NanoPreviewTp4ModelingV2) -> None:
@@ -1089,12 +1321,17 @@ class DecodeTarget:
         self.core = core
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
         # forward. Each target owns its own flag: the two `step_args` projections differ,
-        # so probing one does not prove the other's fields exist.
+        # so probing one does not prove the other's fields exist. The MTP layer's draft
+        # steps read another projection, off the draft manager the worker swaps in.
         self._contract_pending = step_contract_enabled()
+        self._mtp_contract_pending = step_contract_enabled()
         self._d = _dims(core.model_config.pretrained_config.text_config, core.tp_size)
         self._embed = core.w["embed"]
         self._first_reads = _block_reads(core.w, core.layer_types, 0)
         self._layers = _layer_views(core.w, core.layer_types, row_invariant=True)
+        # The MTP layer keeps cuBLAS's layout and kernels here too (`_mtp_view`, `_mtp_moe`).
+        self._mtp = None if core.mtp_layer is None else _mtp_view(core.w, core.mtp_layer)
+        self._tokens_per_gen_step = core.tokens_per_gen_step
         self._ar = core.allreduce_workspace
 
     def _check_step_contract(self, md) -> None:
@@ -1112,37 +1349,116 @@ class DecodeTarget:
             raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
         self._contract_pending = False
 
+    def _check_mtp_contract(self, md) -> None:
+        """The same opt-in fail-fast for the MTP layer's draft steps, whose metadata carries
+        the worker's draft KV manager rather than the trunk's."""
+        if not self._mtp_contract_pending:
+            return
+        try:
+            self._mtp_step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"draft-step metadata surface drifted: {exc}") from exc
+        self._mtp_contract_pending = False
+
+    def _attention_args(self, md: TrtllmAttentionMetadata) -> dict:
+        """thop_attention's batch state for the MTP layer's draft steps, off the draft manager
+        the MTP worker swaps in. The trunk's attention runs invariant_gen_attention, whose
+        batch state is `step_args`'.
+
+        A row may carry 1 + D tokens (the MTP layer's first draft step). thop sizes the XQA
+        workspace as if each of `max_num_sequences` rows carried one token, so
+        `max_num_sequences` counts every token a row may carry.
+        """
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace_=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            attention_window_size=md.max_seq_len,
+            num_contexts=0,
+            num_ctx_tokens=0,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences * self._tokens_per_gen_step,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
+
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto the explicit batch state of
         invariant_gen_attention (`attention`) and of the recurrent-state entries, once per
         forward.
 
-        Every row is one generation token, the same rows in the same order on every rank.
-        Under a CUDA graph the rows include the trailing padding rows, whose `state_slots`
-        entry is `PAD_SLOT_ID`; their attention reads the padding dummy's own pages.
+        Every row is one request carrying the same number of generation tokens, the same rows
+        in the same order on every rank: one, or 1 + D under MTP, whose states go to the
+        `intermediate_*` buffers. Under a CUDA graph the rows include the trailing padding
+        rows, whose `state_slots` entry is `PAD_SLOT_ID`; their attention reads the padding
+        dummy's own pages.
         """
         state = _state_metadata(md)
         views = self.core.state_views(md.kv_cache_manager)
         num_rows = md.num_seqs
         return dict(
             attention=dict(
-                # Lengths count this step's token and are read on the device only, where the
-                # overlap scheduler corrects them.
+                # Lengths count this step's tokens and are read on the device only, where
+                # the overlap scheduler corrects them.
                 sequence_length=md.kv_lens_cuda_runtime,
                 kv_cache_block_offsets=md.kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
                 num_contexts=0,
                 tokens_per_block=md.tokens_per_block,
-                # Sizes the entry's grid: the cache manager's bound on every length.
+                # Sizes the entry's grid: the cache manager's bound on every length, the
+                # drafts a verify appends included.
                 max_seq_len=md.max_seq_len,
             ),
-            # Recurrent state: one row per token, padding rows on PAD_SLOT_ID.
+            # Recurrent state: one slot per row, padding rows on PAD_SLOT_ID.
             num_rows=num_rows,
             state_slots=state.state_slots[:num_rows],
             kv_layer=views.kv_layer,
             ssm_states=views.ssm_states,
             conv_states=views.conv_states,
+            intermediate_ssm=views.intermediate_ssm,
+            intermediate_conv=views.intermediate_conv,
+        )
+
+    def _mtp_step_args(self, md: TrtllmAttentionMetadata) -> dict:
+        """The MTP layer's batch state, read off the metadata the worker hands each draft
+        step: every call, since the worker rewrites that metadata between draft steps.
+
+        Its KV is global layer `num_layers` in the draft KV manager the worker swaps in (tp4
+        keeps it apart from the trunk's), at that manager's own index.
+        """
+        return dict(
+            attention=self._attention_args(md),
+            kv_layer=md.kv_cache_manager.layer_offsets[self._mtp.attention.layer],
         )
 
     def forward(
@@ -1154,7 +1470,12 @@ class DecodeTarget:
         lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """The final normed hidden state of every row: `norm(residual_readout(streams))`."""
+        """The final normed hidden state of every token: `norm(residual_readout(streams))`.
+
+        A token of an MTP verify gets the bits it gets as a decode step's one token: every
+        entry here computes a row from that row alone, and the attention computes token j of
+        a row's 1 + D with the program that decodes it alone over the same keys.
+        """
         d = self._d
         self._check_step_contract(attn_metadata)
         step = self.step_args(attn_metadata)
@@ -1165,6 +1486,8 @@ class DecodeTarget:
             else inputs_embeds
         )
         _check_rows(h.shape[0], self._ar)
+        # Every row carries the same number of tokens, read off host shapes (`_gdp_rows`).
+        tokens_per_seq = h.shape[0] // step["num_rows"]
         streams = h.repeat(1, d.streams)
         attn_out = torch.empty(h.shape[0], d.q_width, dtype=h.dtype, device=h.device)
 
@@ -1173,13 +1496,14 @@ class DecodeTarget:
             if isinstance(L.mixer, _Gdp):
                 update = self._gdp(x, L.mixer, step)
             elif isinstance(L.mixer, _Attention):
-                # Appends the row's K/V to its request's pages, then attends over them. NoPE;
-                # q_scaling 1 keeps the softmax scale at head_dim**-0.5 = 1/16.
+                # Appends the row's K/V to its request's pages, then attends over them, causal
+                # within the row's tokens. NoPE; q_scaling 1 keeps the softmax scale at
+                # head_dim**-0.5 = 1/16.
                 attn_out = invariant_gen_attention(
                     q=cublas_mm(x, L.mixer.qkv),
                     output=attn_out,
                     local_layer_idx=step["kv_layer"][L.mixer.layer],
-                    tokens_per_seq=1,
+                    tokens_per_seq=tokens_per_seq,
                     num_heads=d.heads_q,
                     num_kv_heads=d.heads_kv,
                     head_size=d.head_dim,
@@ -1226,38 +1550,16 @@ class DecodeTarget:
         return (None, normed) if second is None else (normed, normed2)
 
     def _gdp(self, x: torch.Tensor, g: _Gdp, step: dict) -> torch.Tensor:
-        """`Nemotron4GDPMixer` on this rank's heads for one token per row, each continuing
-        from its slot; padding rows (`PAD_SLOT_ID`) read zeros and write nothing. The heads'
-        `out_proj` partials are all-reduced."""
+        """`Nemotron4GDPMixer` on this rank's heads for the rows' tokens, each row continuing
+        from its slot (`_gdp_rows`); padding rows (`PAD_SLOT_ID`) read zeros and write nothing.
+        The heads' `out_proj` partials are all-reduced."""
         d = self._d
-        slots = step["state_slots"]
-        proj = invariant_mm(x, g.in_proj)  # [B, 4632] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
-        num_rows = proj.shape[0]
-        # In place: the conv columns of the in_proj output become the conv output.
-        causal_conv1d_update(
-            proj[:, d.conv].unsqueeze(-1),
-            step["conv_states"][g.layer],
-            g.conv,
-            None,
-            True,
-            None,
-            slots,
-            PAD_SLOT_ID,
-        )
-        vkq = proj[:, d.conv]
+        proj = invariant_mm(x, g.in_proj)  # [B * T, 4632] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
+        num_tokens = proj.shape[0]
         beta, decay = gdp_gates(proj[:, d.beta], proj[:, d.decay], g.neg_a, g.dt_bias)
-        out = gdp_recurrent(
-            _heads(vkq, d.conv_q, d.gdp_heads, d.gdp_key),
-            _heads(vkq, d.conv_k, d.gdp_householder, d.gdp_heads, d.gdp_key),
-            _heads(vkq, d.conv_v, d.gdp_householder, d.gdp_heads, d.gdp_value),
-            decay,
-            beta,
-            step["ssm_states"][g.layer],
-            slots,
-            d.gdp_scale,
-        )
+        out = _gdp_rows(proj, beta, decay, g, step["state_slots"], step, d)
         y = gated_rmsnorm(
-            out.view(num_rows, d.gdp_value_dim),
+            out.view(num_tokens, d.gdp_value_dim),
             g.norm,
             None,
             d.gdp_eps,
@@ -1307,6 +1609,151 @@ class DecodeTarget:
         experts = flashinfer_rmsnorm(summed[:split].view(num_rows, d.latent), m.fc2_norm, d.eps)
         return torch.add(cublas_mm(experts, m.fc2_latent), summed[split:].view(num_rows, d.hidden))
 
+    def _mtp_moe(self, routed: torch.Tensor, shared: torch.Tensor, m: _Moe) -> torch.Tensor:
+        """The MTP layer's `Nemotron4MoE`, on cuBLAS throughout, as PrefillTarget runs it: a draft
+        only proposes tokens the trunk then verifies, so its rows need not be batch-invariant,
+        and its operands are `_mtp_view`'s `.t()` views, which `invariant_mm` would misread.
+        The partials are all-reduced as `_moe`'s are."""
+        d = self._d
+        weights, ids = noaux_tc_op(
+            cublas_mm(routed, m.router, None, torch.float32),
+            m.router_bias,
+            1,
+            1,
+            d.top_k,
+            d.routed_scale,
+        )
+        experts = latent_moe_experts(
+            cublas_mm(routed, m.fc1_latent),
+            ids,
+            weights,
+            m.experts_up,
+            m.experts_down,
+            d.clamp,
+            0,
+            d.num_experts,
+        )
+        shared = cublas_mm(softclamp_relu2(cublas_mm(shared, m.shared_up), d.clamp), m.shared_down)
+        num_rows, split = experts.shape[0], experts.numel()
+        summed = allreduce(
+            torch.cat((experts.view(-1), shared.view(-1))).view(num_rows, -1),
+            self._ar.buffer,
+            self._ar.flags,
+        ).view(-1)
+        experts = flashinfer_rmsnorm(summed[:split].view(num_rows, d.latent), m.fc2_norm, d.eps)
+        return torch.add(cublas_mm(experts, m.fc2_latent), summed[split:].view(num_rows, d.hidden))
+
+    def mtp_forward(
+        self,
+        embed_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """`Nemotron4MultiTokenPredictionLayer` over one draft step's rows, all generation
+        rows: the first step of a decode step (1 + D tokens per request) or any later step
+        (one token per request).
+
+        Returns the layer's `final_layernorm`-ed output, the hidden state HF hands the next
+        depth and the head: the worker feeds each request's row back as the next step's
+        `hidden_states`, and the shared head projects it with no norm of its own.
+
+        The kernels are PrefillTarget's -- cuBLAS, thop_attention -- not the trunk's
+        batch-invariant ones: a draft's bits move with the batch, which can change how many
+        drafts the trunk accepts but never which tokens it emits. The all-reduces are the
+        trunk's, so every rank still forms the same draft.
+        """
+        d, m = self._d, self._mtp
+        self._check_mtp_contract(attn_metadata)
+        step = self._mtp_step_args(attn_metadata)
+        _check_rows(input_ids.shape[0], self._ar)
+
+        # The next token's embedding first, then the previous step's hidden state.
+        e = flashinfer_rmsnorm(nn.functional.embedding(input_ids, embed_tokens), m.enorm, d.eps)
+        h = flashinfer_rmsnorm(hidden_states, m.hnorm, d.eps)
+        x = cublas_mm(torch.cat((e, h), dim=-1), m.eh)
+        # The shortcut block on an ordinary residual: routing reads the block input.
+        routed = flashinfer_rmsnorm(x, m.shortcut_norm, d.eps)
+        attn_out = thop_attention(
+            q=cublas_mm(flashinfer_rmsnorm(x, m.input_norm, d.eps), m.attention.qkv),
+            output=torch.empty(x.shape[0], d.q_width, dtype=x.dtype, device=x.device),
+            local_layer_idx=step["kv_layer"],
+            num_heads=d.heads_q,
+            num_kv_heads=d.heads_kv,
+            head_size=d.head_dim,
+            **step["attention"],
+            **_CALL_CONSTANTS,
+        )
+        o = allreduce(cublas_mm(attn_out, m.attention.o), self._ar.buffer, self._ar.flags)
+        # In place: the attention output becomes the shared expert's input, `x` the residual.
+        shared, x = flashinfer_fused_add_rmsnorm(o, x, m.pre_moe_norm, d.eps)
+        out, _ = flashinfer_fused_add_rmsnorm(
+            self._mtp_moe(routed, shared, m.moe), x, m.final_norm, d.eps
+        )
+        return out
+
+
+class MTPLayer:
+    """The checkpoint's MTP layer, global layer `num_layers`, as the one-model MTP-Eagle worker
+    runs it once per draft depth (`mtp_use_repeated_layer`: one layer serves every depth).
+
+    Its output is already normed by the layer's `final_layernorm`, which is what HF hands the
+    next depth and its head (`Nemotron4MultiTokenPredictionLayer.forward`), so `shared_head`
+    is the trunk's fp32 lm_head alone -- whole on every rank, so every rank forms every draft
+    logit, and the worker's argmax needs no vocabulary gather.
+    """
+
+    def __init__(self, core: Nemotron4NanoPreviewTp4ModelingV2) -> None:
+        self.core = core
+
+    def __call__(self, *args, **kwargs) -> torch.Tensor:
+        return self.forward(*args, **kwargs)
+
+    def shared_head(
+        self, hidden_states, lm_head, attn_metadata, return_context_logits
+    ) -> torch.Tensor:
+        """fp32 draft logits of every row, as the trunk's: HF's fp32 GEMM over the bf16
+        hidden state and lm_head weight."""
+        return cublas_mm(hidden_states, lm_head.weight.t(), None, torch.float32)
+
+    def forward(
+        self,
+        embed_tokens: torch.Tensor,
+        all_rank_num_tokens,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Route the draft step by the phase this call's metadata shows.
+
+        Per call, not per engine step: after the first draft step the worker rewrites
+        `attn_metadata` in place to generation rows only, so one mixed step's draft calls
+        cross from prefill to decode. Every rank holds the same rows, so every rank routes
+        alike and issues the same all-reduces.
+        """
+        return self.core._select_target(attn_metadata).mtp_forward(
+            embed_tokens, input_ids, hidden_states, attn_metadata
+        )
+
+
+class DraftModel:
+    """The container the spec worker reaches the drafter through.
+
+    `embed_tokens` must resolve through the core on every read: this container is built while
+    every parameter is still a meta tensor, and the engine materializes the registry by
+    replacing the tensor objects, so a reference snapshotted here stays on meta.
+    """
+
+    def __init__(self, core: Nemotron4NanoPreviewTp4ModelingV2, lm_head) -> None:
+        self.core = core
+        self.mtp_layers = [MTPLayer(core)]
+        self.lm_head = lm_head
+
+    @property
+    def embed_tokens(self) -> torch.Tensor:
+        return self.core.w["embed"]
+
 
 class ModelingV2Nemotron4NanoPreviewSm103Tp4(
     DecoderModelForCausalLM[Nemotron4NanoPreviewTp4ModelingV2, PretrainedConfig]
@@ -1334,9 +1781,21 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp4(
         self.lm_head = LMHead(text.vocab_size, text.hidden_size, dtype=model_config.torch_dtype)
         self.epilogue = [self.lm_head]
         spec_config = getattr(model_config, "spec_config", None)
+        self.draft_model = None
+        self.spec_worker = None
         if spec_config is not None:
             self.mamba_metadata_cls = Nemotron4StateMetadata.for_draft_len(
                 spec_config.max_draft_len
+            )
+            self.draft_model = DraftModel(self.model, self.lm_head)
+            # tp4 runs no attention DP and no cache transceiver, so the engine keeps the MTP
+            # layer's KV in a separate draft manager, which the worker swaps in for every
+            # draft step only when told to.
+            self.spec_worker = get_spec_worker(
+                spec_config,
+                model_config,
+                model_config.mapping,
+                use_separate_draft_kv_cache=should_use_separate_draft_kv_cache(spec_config),
             )
 
     def load_weights(self, weights, *args, **kwargs):
@@ -1356,19 +1815,18 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp4(
         spec_metadata=None,
         lora_params: dict | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | dict:
         """fp32 logits over the whole vocabulary, one row per request (every token with
-        `return_context_logits`), the same bits on every rank.
+        `return_context_logits`), the same bits on every rank; under speculative decoding,
+        the worker's step: acceptance, the commit of the accepted states, and the next drafts.
 
         HF's lm_head is an fp32 GEMM over the bf16 hidden state and weight
         (`Nemotron4ForCausalLM.forward`); `cublas_mm` with an fp32 output computes the same
         products, exact in fp32, and keeps the fp32 sum, where the default logits processor
-        would round the logits to bf16 first.
+        would round the logits to bf16 first. The worker gets the same logits for each
+        context's last token and every token a generation row verifies (`gather_ids`), and
+        `position_ids` in the engine's [1, T] shape, which it squeezes itself.
         """
-        if spec_metadata is not None:
-            raise NotImplementedError(
-                "nemotron4-nano-preview / sm_103 / tp4 has no MTP draft forward yet"
-            )
         hidden = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1377,7 +1835,21 @@ class ModelingV2Nemotron4NanoPreviewSm103Tp4(
             spec_metadata=spec_metadata,
             lora_params=lora_params,
         )
-        if not return_context_logits:
-            last = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            hidden = hidden[last]
-        return cublas_mm(hidden, self.lm_head.weight.t(), None, torch.float32)
+        if self.spec_worker is None:
+            if not return_context_logits:
+                last = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+                hidden = hidden[last]
+            return cublas_mm(hidden, self.lm_head.weight.t(), None, torch.float32)
+        logits = cublas_mm(
+            hidden[spec_metadata.gather_ids], self.lm_head.weight.t(), None, torch.float32
+        )
+        return self.spec_worker(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden,
+            logits=logits,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=self.draft_model,
+            resource_manager=kwargs.get("resource_manager"),
+        )

@@ -76,6 +76,18 @@ class _HybridManager:
         self.ssm = [block[:, 0] for block in self.blocks[: len(_GDP_LAYERS)]]
         self.conv = [block[:, 0] for block in self.blocks[len(_GDP_LAYERS) :]]
         assert not self.ssm[0].is_contiguous() and not self.conv[0].is_contiguous()
+        # The per-position buffers an MTP verify writes, one row per batch row and one
+        # position per token of 1 + D; a manager built without a speculative config has none.
+        self.intermediate = None
+        if draft_len:
+            positions = 1 + draft_len
+            self.intermediate = (
+                [torch.zeros(_MAX_BATCH, positions, *ssm, device="cuda") for _ in _GDP_LAYERS],
+                [
+                    torch.zeros(_MAX_BATCH, positions, *conv, device="cuda", dtype=torch.bfloat16)
+                    for _ in _GDP_LAYERS
+                ],
+            )
 
     def get_state_indices(self, request_ids, is_padding):
         return [self.slot_of[rid] for rid in request_ids]
@@ -85,6 +97,16 @@ class _HybridManager:
 
     def get_conv_states(self, layer: int) -> torch.Tensor:
         return self.conv[self.mamba_layer_offsets[layer]]
+
+    def get_intermediate_ssm_states(self, layer: int) -> torch.Tensor | None:
+        if self.intermediate is None:
+            return None
+        return self.intermediate[0][self.mamba_layer_offsets[layer]]
+
+    def get_intermediate_conv_states(self, layer: int) -> torch.Tensor | None:
+        if self.intermediate is None:
+            return None
+        return self.intermediate[1][self.mamba_layer_offsets[layer]]
 
     def snapshot(self) -> list[torch.Tensor]:
         return [block.clone() for block in self.blocks]
@@ -156,10 +178,25 @@ def test_state_views_take_the_ranks_pools_and_refuse_the_whole_state():
     assert all(views.ssm_states[i] is manager.get_ssm_states(i) for i in _GDP_LAYERS)
     assert all(views.conv_states[i] is manager.get_conv_states(i) for i in _GDP_LAYERS)
     assert core._checked_manager() is manager
+    # Without speculative decoding the manager keeps no per-position buffers.
+    assert all(views.intermediate_ssm[i] is None for i in _GDP_LAYERS)
+    assert all(views.intermediate_conv[i] is None for i in _GDP_LAYERS)
 
     whole = _HybridManager({}, ssm=(24, 64, 128), conv=(16896, 3))
     with pytest.raises(RuntimeError, match="must split the state over the tensor-parallel ranks"):
         Nemotron4NanoPreviewTp4ModelingV2.state_views(_core(rank=1), whole)
+
+
+def test_state_views_take_the_verify_buffers_of_each_gdp_layer():
+    """Under MTP the manager keeps, per GDP layer, the per-position buffers a verify writes and
+    the commit reads; the views hand each layer its own, read off the manager."""
+    manager = _HybridManager({}, draft_len=2)
+    views = Nemotron4NanoPreviewTp4ModelingV2.state_views(_core(rank=2), manager)
+    for i in _GDP_LAYERS:
+        assert views.intermediate_ssm[i] is manager.get_intermediate_ssm_states(i)
+        assert views.intermediate_conv[i] is manager.get_intermediate_conv_states(i)
+        assert tuple(views.intermediate_ssm[i].shape[1:]) == (3, *_SSM)
+        assert tuple(views.intermediate_conv[i].shape[1:]) == (3, *_CONV)
 
 
 def test_state_views_refuse_a_manager_without_the_gdp_layers():
