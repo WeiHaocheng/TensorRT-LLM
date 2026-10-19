@@ -413,17 +413,25 @@ def _as_loaded(pretrained_config, spec_config):
     [
         dict(max_draft_len=2),
         dict(max_draft_len=3),
+        dict(max_draft_len=4),
+        dict(max_draft_len=5),
         dict(max_draft_len=2, speculative_model=_DUMMY_MODEL),
     ],
-    ids=["trained_depth", "one_depth_beyond", "speculative_model_is_the_checkpoint"],
+    ids=[
+        "trained_depth",
+        "one_depth_beyond",
+        "two_depths_beyond",
+        "three_depths_beyond",
+        "speculative_model_is_the_checkpoint",
+    ],
 )
 def test_nemotron4_tp1_with_mtp_eagle_matches(mode, spec_kwargs):
     """The checkpoint's MTP layer through the one-model MTP-Eagle loop.
 
     Two depths are declared over one repeated layer, so the engine reads one
     stored layer and resolves MTP-Eagle, at the trained draft length or, on
-    tp1, one depth beyond it. A ``speculative_model`` naming the checkpoint
-    itself still drafts with its own MTP layer.
+    tp1, one to three depths beyond it. A ``speculative_model`` naming the
+    checkpoint itself still drafts with its own MTP layer.
     """
     pretrained_config = _nemotron4_config()
     spec_config = _as_loaded(pretrained_config, MTPDecodingConfig(**spec_kwargs))
@@ -508,19 +516,19 @@ def test_nemotron4_with_mtp_eagle_on_another_topology_names_the_topology():
 _NEMOTRON4_TOPOLOGIES = {"tp1": {}, "dep4": _DEP4, "tp4": _TP4}
 
 #: The draft lengths each target runs, as its decline message states them.
-_NEMOTRON4_DRAFTS = {"tp1": "2 or 3", "dep4": "2", "tp4": "2"}
+_NEMOTRON4_DRAFTS = {"tp1": "2, 3, 4 or 5", "dep4": "2", "tp4": "2"}
 
 
 @pytest.mark.parametrize(
     "topology, max_draft_len",
-    [("tp1", 1), ("tp1", 4), ("dep4", 1), ("dep4", 3), ("tp4", 1), ("tp4", 3)],
+    [("tp1", 1), ("tp1", 6), ("dep4", 1), ("dep4", 3), ("tp4", 1), ("tp4", 3)],
 )
 def test_nemotron4_declines_another_draft_length(topology, max_draft_len):
     """Every target runs the checkpoint's trained depth, two drafts, the length its MTP
-    identity, acceptance and GSM8K gates run, and tp1 also the repeated layer's next depth,
-    three; each declines another length by name. On tp4 the message also says why the length
-    is structural there: a verify request's stride decides whether its tokens round as
-    decode's do."""
+    identity, acceptance and GSM8K gates run, and tp1 also the repeated layer's next three
+    depths, three to five; each declines another length by name. On tp4 the message also
+    says why the length is structural there: a verify request's stride decides whether its
+    tokens round as decode's do."""
     pretrained_config = _nemotron4_config()
     spec_config = _as_loaded(pretrained_config, MTPDecodingConfig(max_draft_len=max_draft_len))
     assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()

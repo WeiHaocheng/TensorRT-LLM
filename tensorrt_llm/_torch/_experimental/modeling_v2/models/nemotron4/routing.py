@@ -131,10 +131,11 @@ def _text_shape(text_config: Any) -> dict:
 #: request. It is the length the MTP identity, acceptance and GSM8K gates run.
 _DRAFT_LEN = 2
 
-#: The draft lengths a target runs beyond `_DRAFT_LEN`. tp1 also runs three: the
-#: repeated layer drafts a third depth and a verify step carries 4 tokens per
-#: request, a length its own MTP identity and acceptance gates run.
-_MORE_DRAFT_LENS = {"tp1": (3,)}
+#: The draft lengths a target runs beyond `_DRAFT_LEN`. tp1 also runs three to
+#: five: the repeated layer drafts a third, fourth and fifth depth, and a verify
+#: step carries 4, 5 or 6 tokens per request, lengths its own MTP identity and
+#: acceptance gates run.
+_MORE_DRAFT_LENS = {"tp1": (3, 4, 5)}
 
 
 def _draft_lens(topology: Optional[str]) -> tuple[int, ...]:
@@ -143,8 +144,9 @@ def _draft_lens(topology: Optional[str]) -> tuple[int, ...]:
 
 
 def _drafts(lengths: tuple[int, ...]) -> str:
-    """`(2,)` as "2", `(2, 3)` as "2 or 3"."""
-    return " or ".join(str(n) for n in lengths)
+    """`(2,)` as "2", `(2, 3)` as "2 or 3", `(2, 3, 4, 5)` as "2, 3, 4 or 5"."""
+    *rest, last = (str(n) for n in lengths)
+    return f"{', '.join(rest)} or {last}" if rest else last
 
 
 def _speculation_declined(spec_config: Optional[Any], topology: Optional[str]) -> Optional[str]:
@@ -202,7 +204,7 @@ def _speculation_declined(spec_config: Optional[Any], topology: Optional[str]) -
     lengths = _draft_lens(topology)
     if spec_config.max_draft_len not in lengths:
         why = f"the target runs {_drafts(lengths)} drafts, " + (
-            "the checkpoint's trained depth and the repeated layer's next one, which are "
+            "the checkpoint's trained depth and the repeated layer's next ones, which are "
             "the lengths its gates certify"
             if len(lengths) > 1
             else "the checkpoint's trained depth, which is the length its gates certify"

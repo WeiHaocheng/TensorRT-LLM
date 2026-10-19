@@ -13,7 +13,7 @@ Checked here bit for bit, on layer 0's real weights, through the target's own mi
 (`DecodeTarget._gdp` for a decode step, `PrefillTarget._gdp` for a mixed one) and the engine's
 own hybrid managers built with an MTP-Eagle config (`MambaHybridCacheManagerV2`, the default,
 and `CppMambaHybridCacheManager`), committing with the manager's `update_mamba_states`, at
-both draft lengths tp1 runs (D = 2, the checkpoint's trained depth, and D = 3):
+every draft length tp1 runs (D = 2, the checkpoint's trained depth, and 3 to 5):
 
 - every real row's committed recurrent and conv state equals the slot after `accepted` decode
   steps (T = 1 calls of the same mixer) over the same tokens, for every accepted count;
@@ -46,8 +46,8 @@ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 assert torch.cuda.is_available(), "the GDP mixer and the hybrid cache managers run on a CUDA device"
 
 _LAYER = 0  # a `linear_attention` block; every GDP mixer of the model is the same mixer
-#: The draft lengths tp1 runs: the checkpoint's trained depth, and the repeated layer's next one.
-_DRAFTS = (2, 3)
+#: The draft lengths tp1 runs: the checkpoint's trained depth, and the repeated layer's next three.
+_DRAFTS = (2, 3, 4, 5)
 _MAX_BATCH = 8
 _PREFIX = f"model.language_model.layers.{_LAYER}."
 
@@ -264,8 +264,13 @@ def _assert_states_equal(manager, slots, expected, what: str) -> None:
 
 
 #: Per T = 1 + D, the accepted counts of the 5 real rows in each of the two verify rounds: every
-#: count 1..T in each round.
-_ROUNDS = {3: ([3, 1, 2, 3, 1], [1, 2, 3, 2, 3]), 4: ([4, 1, 2, 3, 4], [1, 4, 3, 2, 4])}
+#: count 1..T in each round up to T = 5; at T = 6, one more count than rows, in the two together.
+_ROUNDS = {
+    3: ([3, 1, 2, 3, 1], [1, 2, 3, 2, 3]),
+    4: ([4, 1, 2, 3, 4], [1, 4, 3, 2, 4]),
+    5: ([5, 1, 3, 4, 2], [2, 5, 4, 1, 3]),
+    6: ([6, 1, 3, 5, 2], [4, 6, 2, 1, 5]),
+}
 
 
 @torch.inference_mode()
@@ -315,7 +320,7 @@ def test_mixed_step_commits_only_its_generation_rows(manager, layer, text_config
     order = torch.randperm(num_slots, generator=torch.Generator().manual_seed(11)).tolist()
     context_slot, slots = order[0], order[1:4]
     _prime(manager, decode, layer, text_config, g, slots, steps=4)
-    accepted = {3: [2, 3, 1], 4: [4, 1, 3]}[tokens]
+    accepted = {3: [2, 3, 1], 4: [4, 1, 3], 5: [5, 2, 4], 6: [6, 4, 1]}[tokens]
 
     start = _snapshot(manager)
     context = _rows(layer, text_config, g, 37)
