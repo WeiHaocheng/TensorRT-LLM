@@ -3,10 +3,10 @@
 """GPU test for the gated_rmsnorm catalog entry, at nemotron4-nano-preview's tp1 and tp4-rank
 shapes.
 
-The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
-guard. This file turns a cell into the tensors a target hands the op -- the recurrence output
-and the gate columns of an in_proj-shaped buffer -- and holds the inputs the guard exists to
-refuse.
+The entry owns what is certified: `CELLS` is the list and `reference` the gate. This file turns a
+cell into the tensors a target hands the op -- the recurrence output and the gate columns of an
+in_proj-shaped buffer -- and pins what the kernel shares with `_layer_norm_fwd`, the TensorRT-LLM
+op it replaced: the bits.
 """
 
 import math
@@ -18,9 +18,10 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm import (
     gated_rmsnorm as op,
 )
+from tensorrt_llm._torch.modules.mamba.layernorm_gated import _layer_norm_fwd
 
 __extra_import_path__ = [".."]
-from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
+from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "gated_rmsnorm requires a CUDA device"
 
@@ -53,10 +54,10 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     """The final rounding may differ, and nothing else.
 
     Kernel and reference compute the same fp32 expression from the same bf16 inputs and round
-    once to bf16. The kernel's sigmoid (`tl.sigmoid`), its 64-term sum and its `1 / sqrt` are
-    not torch's `F.silu`, `mean` and `rsqrt`, but they differ by a few fp32 ulps, ~1e-7
-    relative. So an output can only land on the neighbouring bf16 value, and only when its fp32
-    value sits on a rounding boundary. Measured over every cell at five seeds each: the 1- and
+    once to bf16. The kernel's sigmoid (`1 / (1 + exp(-z))`), its 64-term sum and its
+    `1 / sqrt` are not torch's `F.silu`, `mean` and `rsqrt`, but they differ by a few fp32 ulps,
+    ~1e-7 relative. So an output can only land on the neighbouring bf16 value, and only when its
+    fp32 value sits on a rounding boundary. Measured over every cell at five seeds each: the 1- and
     3-token cells are bit-identical, and from 1024 tokens up at most 1.53e-5 of the outputs
     differ at all (2.0e-5 at a tp4 rank's 384 channels), each by exactly one ulp of its own
     value.
@@ -141,13 +142,48 @@ def test_a_packed_gate_gives_the_same_bits(num_heads: int) -> None:
     assert torch.equal(sliced, packed)
 
 
-def test_guard_refuses_row_offsets_past_int32() -> None:
-    """Accepted by the op, and a different row's memory is normalized in its place.
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_bits_equal_layer_norm_fwd(cell) -> None:
+    """Every output has the bits of `_layer_norm_fwd`, the op this entry called before its kernel.
 
-    Rows strided by 3 * 2**29 elements put row 2's offset at 3 * 2**30, which int32 wraps to
-    -2**30. Starting x 2**30 elements into a buffer of 2**32 elements and one row keeps the
-    wrapped address inside it -- at the buffer's start, where a sentinel row sits. So the op
-    does not fault: it returns row 2 as the norm of the sentinel.
+    The kernel keeps that op's per-group arithmetic and reduction order -- two adjacent channels
+    per lane, then a butterfly over one warp -- so whatever was measured with it (goldens, batch
+    invariance, CUDA-graph and MTP identity) holds unchanged. A different order shows up here at
+    once: the reference's own order already parts from the op on up to 1.53e-5 of the outputs.
+    """
+    _, kwargs = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
+    expected, _, _ = _layer_norm_fwd(**kwargs)
+    assert torch.equal(op(**kwargs), expected)
+
+
+def test_refuses_every_other_form() -> None:
+    """The kernel computes one form; a call asking for another gets a ValueError, not that form."""
+    _, kwargs = _build(op.CELLS[0].spec, seed=13)
+    others = dict(
+        z=None,
+        bias=torch.zeros_like(kwargs["weight"]),
+        out=torch.empty_like(kwargs["x"]),
+        norm_before_gate=True,
+        is_rms_norm=False,
+        fp8_scale=torch.ones((), dtype=torch.float32, device="cuda"),
+        gate_activation="sigmoid",
+        weight_is_delta=True,
+    )
+    for name, value in others.items():
+        with pytest.raises(ValueError, match="computes one form"):
+            op(**dict(kwargs, **{name: value}))
+    with pytest.raises(ValueError, match="power of two"):
+        op(**dict(kwargs, group_size=48))
+
+
+def test_row_offsets_past_int32_are_exact() -> None:
+    """A row 2**31 elements or more into x is read where it is.
+
+    Rows strided by 3 * 2**29 elements put row 2's offset at 3 * 2**30. An int32 offset wraps that
+    to -2**30 -- which `_layer_norm_fwd`'s kernel does, normalizing the memory 2**30 elements
+    before x's start in row 2's place. Starting x 2**30 elements into a buffer of 2**32 elements
+    and one row puts a sentinel row exactly there, so a wrapped read would return the sentinel's
+    norm. The kernel forms offsets in int64, and row 2 is the reference's.
     """
     free_bytes, _ = torch.cuda.mem_get_info()
     if free_bytes < 12 * 2**30:
@@ -170,17 +206,11 @@ def test_guard_refuses_row_offsets_past_int32() -> None:
         norm_before_gate=False,
         is_rms_norm=True,
     )
-    unguarded = op(**kwargs)
     expected = op.reference(**kwargs)
     sentinel_norm = op.reference(**dict(kwargs, x=sentinel[None], z=kwargs["z"][2:]))[0]
-    assert _ulp_distance(unguarded[:2], expected[:2]).max() <= 1, "rows below the wrap are wrong"
-    assert _ulp_distance(unguarded[2], sentinel_norm).max() <= 1, (
-        "the hazard this guard covers is gone: row 2 is no longer the sentinel's norm"
+    assert _ulp_distance(sentinel_norm, expected[2]).max() > 1, (
+        "the sentinel's norm cannot be told from row 2's"
     )
-    assert _ulp_distance(unguarded[2], expected[2]).max() > 1, "row 2 came out right"
-
-    with pytest.raises(AssertionError, match="in int32"):
-        with validating(op):
-            op(**kwargs)
+    assert _ulp_distance(op(**kwargs), expected).max() <= 1, "a row past int32 offsets is misread"
     del buf, x, sentinel
     torch.cuda.empty_cache()
