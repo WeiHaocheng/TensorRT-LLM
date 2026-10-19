@@ -5,11 +5,11 @@
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into what the target hands the entry -- a latent batch, top-10
 routing over 512 experts, the window's expert weights -- and holds what a cell cannot show:
-the activation on every bf16 input, the two paths giving the same bits and the counting sort
-the stable sort's layout, rows that do not depend on their batch (across the switch between
-the paths), CUDA-graph replay, the band's distance from the plausible wrong orders, what the
-fp32 output is, the four expert-parallel windows adding up to the whole, and the input the
-guard refuses.
+the activation on every bf16 input, the two paths giving the same bits, the counting sort and
+the grouped path's gather giving the stable sort's layout, rows that do not depend on their
+batch (across the switch between the paths), CUDA-graph replay, the band's distance from the
+plausible wrong orders, what the fp32 output is, the four expert-parallel windows adding up
+to the whole, and the input the guard refuses.
 """
 
 import zlib
@@ -20,9 +20,10 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
     _FUSED_TILES,
-    _clamped_relu2_weighted_kernel,
+    _activate_rows,
     _count_sort,
     _experts,
+    _sort_and_gather,
     _sort_slots,
     _tiles_for,
 )
@@ -193,6 +194,22 @@ def test_the_counting_sort_is_the_stable_sorts_layout(cell) -> None:
     assert torch.equal(offs, want_offs)
 
 
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_the_grouped_paths_gather_is_the_sorts_layout(cell) -> None:
+    """The grouped path's one pass after the sort, against the torch ops it replaces -- the
+    inverse permutation scattered and x's rows gathered by token -- on every cell's routing and
+    window: the same `inv` for every slot, in the window or not, and every row's x."""
+    spec = cell.spec
+    x, ids, _ = _routing(spec, torch.Generator(device="cuda").manual_seed(_seed(cell)))
+    window = (spec["local_expert_offset"], spec["num_local_experts"])
+    order, inv, offs, xg = _sort_and_gather(x, ids, *window)
+    want_order, want_inv, want_offs = _sort_slots(ids, *window)
+    assert torch.equal(order, want_order)
+    assert torch.equal(inv, want_inv)
+    assert torch.equal(offs, want_offs)
+    assert torch.equal(xg, x.index_select(0, want_order // spec["top_k"]))
+
+
 @pytest.mark.parametrize("cell", _FUSED_CELLS, ids=[c.why[:44] for c in _FUSED_CELLS])
 def test_the_fused_path_gives_the_grouped_paths_bits(cell) -> None:
     """Every cell the fused path takes, through both paths: the same output, bit for bit.
@@ -273,30 +290,30 @@ def test_the_partition_band_refuses_a_boundary_slip(windows) -> None:
 
 
 @pytest.mark.parametrize("weight", [1.0, 0.31640625, 3.16, 0.123456789])
-def test_the_activation_pass_is_the_checkpoints_on_every_bf16_value(weight) -> None:
+@pytest.mark.parametrize("clamp", [16.0, 10.0], ids=["clamp 16", "clamp 10"])
+def test_the_activation_pass_is_the_checkpoints_on_every_bf16_value(clamp, weight) -> None:
     """Every bf16 bit pattern through the entry's activation pass and through the checkpoint's
     torch ops (`Nemotron4ClampedActivation`, relu2, the product with the fp32 routing weight):
     the same bits, and NaN exactly where the checkpoint gives NaN.
 
     A cell samples the activation; this covers its whole input space, which leaves the GEMMs'
-    accumulation order as the only difference the band has to hold.
+    accumulation order as the only difference the band has to hold. The checkpoint's clamp is
+    16; a clamp of 10, whose reciprocal is not exact, shows that h / clamp is computed the way
+    torch computes the checkpoint's division by a scalar. The fused path's epilogue calls the
+    same helper, so this pins it too.
     """
     vals = torch.arange(-32768, 32768, dtype=torch.int32, device="cuda").to(torch.int16)
     vals = vals.view(torch.bfloat16).reshape(16, 4096)
     w = torch.full((16,), weight, dtype=torch.float32, device="cuda")
     got = vals.clone()
-    _clamped_relu2_weighted_kernel[(16,)](
+    _activate_rows(
         got,
         w,
         torch.arange(16, device="cuda"),
         torch.tensor([16], dtype=torch.int32, device="cuda"),
-        got.stride(0),
-        N=4096,
-        CLAMP=16.0,
-        BLOCK_N=4096,
-        num_warps=8,
+        clamp,
     )
-    clamped = (16.0 * torch.tanh(vals.float() / 16.0)).to(torch.bfloat16)
+    clamped = (clamp * torch.tanh(vals.float() / clamp)).to(torch.bfloat16)
     want = (torch.square(torch.relu(clamped)) * w[:, None]).to(torch.bfloat16)
     nan = torch.isnan(want)
     assert torch.equal(torch.isnan(got), nan)

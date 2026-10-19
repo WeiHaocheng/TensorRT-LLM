@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import struct
+
 import torch
 import triton
 import triton.language as tl
@@ -119,19 +121,32 @@ _FUSED_TILES = (
 )
 
 
+def _fp32_reciprocal(clamp: float) -> float:
+    """fp32(1 / fp32(clamp)), the factor torch multiplies by when it divides a CUDA tensor by a
+    Python scalar -- which is how the checkpoint computes h / clamp. For a power of two such as
+    the checkpoint's 16 the product is the quotient itself."""
+    c = struct.unpack("f", struct.pack("f", clamp))[0]
+    return struct.unpack("f", struct.pack("f", 1.0 / c))[0]
+
+
 @triton.jit
-def _clamped_relu2_weighted(h, w, CLAMP: tl.constexpr):
+def _clamped_relu2_weighted(h, w, CLAMP: tl.constexpr, INV_CLAMP: tl.constexpr):
     """bf16(w * bf16(relu(bf16(c*tanh(h/c)))^2)), for a bf16 `h` held in fp32 and an fp32 `w`.
 
     Each rounding is the checkpoint's: the clamp is computed in fp32 from the bf16 GEMM output
     and rounded, relu² runs on bf16 tensors (one fp32 product, rounded), and the bf16 result times
-    the fp32 routing weight is an fp32 product rounded once. `div_rn` and libdevice's tanh are the
-    correctly rounded division and the same tanhf torch's CUDA kernel calls. `c < 0` rather than a
-    max keeps a NaN a NaN, as torch.relu does.
+    the fp32 routing weight is an fp32 product rounded once. h/c is h times INV_CLAMP, c's fp32
+    reciprocal (`_fp32_reciprocal`), as torch computes the checkpoint's division by a scalar.
+    libdevice's tanh is the same tanhf torch's CUDA kernel calls.
+
+    The relu is taken first, on h: tanh keeps the sign and maps 0 to 0, so the clamp of relu(h)
+    is the relu of the clamp, for every input. A max that propagates NaN keeps a NaN a NaN, as
+    torch.relu does. Both reorderings -- the reciprocal for the division, the relu first -- are
+    measured faster and pinned bitwise on every bf16 input by the entry's test.
     """
-    c = (CLAMP * libdevice.tanh(tl.math.div_rn(h, CLAMP))).to(tl.bfloat16).to(tl.float32)
-    r = tl.where(c < 0.0, 0.0, c)
-    s = (r * r).to(tl.bfloat16).to(tl.float32)
+    r = tl.maximum(h, 0.0, propagate_nan=tl.PropagateNan.ALL)
+    c = (CLAMP * libdevice.tanh(r * INV_CLAMP)).to(tl.bfloat16).to(tl.float32)
+    s = (c * c).to(tl.bfloat16).to(tl.float32)
     return (s * w).to(tl.bfloat16)
 
 
@@ -144,19 +159,48 @@ def _clamped_relu2_weighted_kernel(
     stride_h,
     N: tl.constexpr,
     CLAMP: tl.constexpr,
+    INV_CLAMP: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """One row of the up-projection output, in place: `_clamped_relu2_weighted` with the row's
-    routing weight. The grouped-GEMM path's activation pass."""
+    """BLOCK_N columns of one row of the up-projection output, in place:
+    `_clamped_relu2_weighted` with the row's routing weight. The grouped-GEMM path's activation
+    pass; a row at or past `n_valid` is left as it is."""
     row = tl.program_id(0)
     if row < tl.load(n_valid_ptr):
         w = tl.load(w_ptr + tl.load(order_ptr + row)).to(tl.float32)
-        base = h_ptr + row.to(tl.int64) * stride_h
-        for n0 in tl.static_range(0, N, BLOCK_N):
-            offs = n0 + tl.arange(0, BLOCK_N)
-            mask = offs < N
-            h = tl.load(base + offs, mask=mask, other=0.0).to(tl.float32)
-            tl.store(base + offs, _clamped_relu2_weighted(h, w, CLAMP), mask=mask)
+        offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = offs < N
+        ptrs = h_ptr + row.to(tl.int64) * stride_h + offs
+        h = tl.load(ptrs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(ptrs, _clamped_relu2_weighted(h, w, CLAMP, INV_CLAMP), mask=mask)
+
+
+def _activate_rows(
+    h: torch.Tensor,
+    topk_weights: torch.Tensor,
+    order: torch.Tensor,
+    n_valid: torch.Tensor,
+    activation_clamp: float,
+) -> None:
+    """The grouped-GEMM path's activation pass over `h` [rows, N], in place: row r is slot
+    `order[r]`'s, weighted by `topk_weights` read flat at that slot; rows from `n_valid` (a
+    one-element device tensor) on are skipped. One program per row and up to 4096 columns, four
+    warps -- 32 elements a thread at the checkpoint's 4096 -- the fastest configuration measured
+    on the target's own prefill inputs."""
+    n = h.shape[1]
+    block_n = min(4096, triton.next_power_of_2(n))
+    _clamped_relu2_weighted_kernel[(h.shape[0], triton.cdiv(n, block_n))](
+        h,
+        topk_weights,
+        order,
+        n_valid,
+        h.stride(0),
+        N=n,
+        CLAMP=float(activation_clamp),
+        INV_CLAMP=_fp32_reciprocal(activation_clamp),
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
 
 
 @triton.jit
@@ -248,6 +292,7 @@ def _up_act_kernel(
     K: tl.constexpr,
     TOPK: tl.constexpr,
     CLAMP: tl.constexpr,
+    INV_CLAMP: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -283,7 +328,7 @@ def _up_act_kernel(
         a_ptrs += BLOCK_K * stride_xk
         b_ptrs += BLOCK_K * stride_uk
     w = tl.load(w_ptr + slot, mask=rmask, other=0.0).to(tl.float32)
-    y = _clamped_relu2_weighted(acc.to(tl.bfloat16).to(tl.float32), w[:, None], CLAMP)
+    y = _clamped_relu2_weighted(acc.to(tl.bfloat16).to(tl.float32), w[:, None], CLAMP, INV_CLAMP)
     tl.store(
         h_ptr + rows.to(tl.int64)[:, None] * stride_h + offs_n[None, :], y, mask=rmask[:, None]
     )
@@ -377,26 +422,98 @@ def _sum_slots_kernel(
     tl.store(out_ptr + t.to(tl.int64) * stride_out + offs_l, out, mask=lmask)
 
 
+@triton.jit
+def _gather_rows_kernel(
+    x_ptr,
+    order_ptr,
+    inv_ptr,
+    xg_ptr,
+    n_rows,
+    stride_xt,
+    stride_xk,
+    stride_g,
+    L: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    """BLOCK_R rows of the grouped GEMMs' input, after the sort: row r holds slot `order[r]`, so
+    it takes the row of x of that slot's token, and `inv[order[r]] = r`. The row gather and the
+    inverse permutation in one pass."""
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    rmask = rows < n_rows
+    slot = tl.load(order_ptr + rows, mask=rmask, other=0)
+    tl.store(inv_ptr + slot, rows.to(tl.int32), mask=rmask)
+    src = x_ptr + (slot // TOPK).to(tl.int64)[:, None] * stride_xt
+    dst = xg_ptr + rows.to(tl.int64)[:, None] * stride_g
+    for l0 in tl.static_range(0, L, BLOCK_L):
+        cols = l0 + tl.arange(0, BLOCK_L)
+        mask = rmask[:, None] & (cols < L)[None, :]
+        row = tl.load(src + cols[None, :] * stride_xk, mask=mask)
+        tl.store(dst + cols[None, :], row, mask=mask)
+
+
+def _sort_keys(
+    topk_ids: torch.Tensor, local_expert_offset: int, num_local_experts: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The stable sort of the (token, k) slots by local expert: `order` (int64 [T*K], the slot
+    each row holds) and `offs` (int32 [num_local_experts], each expert's end row -- the form
+    `torch._grouped_mm` takes). A slot whose expert is outside the window is keyed past the last
+    local expert, so it lands at or past `offs[-1]`, where nothing reads it. The keys are sorted
+    as int16 when they fit: the same stable order from half the radix sort's passes."""
+    local = topk_ids.reshape(-1).to(torch.int32) - local_expert_offset
+    in_window = (local >= 0) & (local < num_local_experts)
+    key = torch.where(in_window, local, num_local_experts)
+    if num_local_experts < torch.iinfo(torch.int16).max:
+        key = key.to(torch.int16)
+    sorted_key, order = torch.sort(key, stable=True)
+    bounds = torch.arange(num_local_experts, dtype=key.dtype, device=key.device)
+    offs = torch.searchsorted(sorted_key, bounds, right=True, out_int32=True)
+    return order, offs
+
+
 def _sort_slots(
     topk_ids: torch.Tensor, local_expert_offset: int, num_local_experts: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Lay the (token, k) slots out as grouped-GEMM rows: grouped by local expert, ascending.
 
-    Returns `order` (int64 [T*K], the slot each row holds), `inv` (int32 [T*K], the row each
-    slot went to) and `offs` (int32 [num_local_experts], each expert's end row -- the form
-    `torch._grouped_mm` takes). A slot whose expert is outside the window is keyed past the last
-    local expert, so it lands at or past `offs[-1]`, where nothing reads it. The sort is stable:
-    within an expert the rows keep slot order. Device-side throughout, no host sync.
+    Returns `order` and `offs` (`_sort_keys`) and `inv` (int32 [T*K], the row each slot went
+    to). The sort is stable: within an expert the rows keep slot order. Device-side throughout,
+    no host sync. The layout both paths' sorts give, in torch ops.
     """
-    local = topk_ids.reshape(-1).to(torch.int32) - local_expert_offset
-    in_window = (local >= 0) & (local < num_local_experts)
-    key = torch.where(in_window, local, num_local_experts)
-    sorted_key, order = torch.sort(key, stable=True)
-    bounds = torch.arange(num_local_experts, dtype=key.dtype, device=key.device)
-    offs = torch.searchsorted(sorted_key, bounds, right=True, out_int32=True)
+    order, offs = _sort_keys(topk_ids, local_expert_offset, num_local_experts)
     inv = torch.empty(order.numel(), dtype=torch.int32, device=order.device)
     inv.scatter_(0, order, torch.arange(order.numel(), dtype=torch.int32, device=order.device))
     return order, inv, offs
+
+
+def _sort_and_gather(
+    x: torch.Tensor, topk_ids: torch.Tensor, local_expert_offset: int, num_local_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The grouped-GEMM path's layout: `_sort_slots`' `order`, `inv` and `offs`, the same
+    values, plus each row's x (`xg` [T*K, latent], x's dtype) -- the sort, then one pass
+    (`_gather_rows_kernel`) for the inverse permutation and the gather."""
+    order, offs = _sort_keys(topk_ids, local_expert_offset, num_local_experts)
+    rows = order.numel()
+    inv = torch.empty(rows, dtype=torch.int32, device=x.device)
+    xg = torch.empty(rows, x.shape[1], dtype=x.dtype, device=x.device)
+    block_r = 8
+    _gather_rows_kernel[(triton.cdiv(rows, block_r),)](
+        x,
+        order,
+        inv,
+        xg,
+        rows,
+        x.stride(0),
+        x.stride(1),
+        xg.stride(0),
+        L=x.shape[1],
+        TOPK=topk_ids.shape[1],
+        BLOCK_R=block_r,
+        BLOCK_L=min(256, triton.next_power_of_2(x.shape[1])),
+        num_warps=4,
+    )
+    return order, inv, offs, xg
 
 
 def _count_sort(
@@ -458,19 +575,9 @@ def _experts(
     latent, intermediate = x.shape[1], up_proj.shape[1]
     w = topk_weights.reshape(-1)
     if tiles is None:
-        order, inv, offs = _sort_slots(topk_ids, local_expert_offset, num_local_experts)
-        h = torch._grouped_mm(x.index_select(0, order // top_k), up_proj.transpose(1, 2), offs=offs)
-        _clamped_relu2_weighted_kernel[(order.numel(),)](
-            h,
-            w,
-            order,
-            offs[-1:],
-            h.stride(0),
-            N=intermediate,
-            CLAMP=float(activation_clamp),
-            BLOCK_N=min(4096, triton.next_power_of_2(intermediate)),
-            num_warps=8,
-        )
+        order, inv, offs, xg = _sort_and_gather(x, topk_ids, local_expert_offset, num_local_experts)
+        h = torch._grouped_mm(xg, up_proj.transpose(1, 2), offs=offs)
+        _activate_rows(h, w, order, offs[-1:], activation_clamp)
         o = torch._grouped_mm(h, down_proj.transpose(1, 2), offs=offs)
     else:
         block_m, (up_n, up_k, up_warps, up_stages), (dn_n, dn_k, dn_warps, dn_stages) = tiles
@@ -504,6 +611,7 @@ def _experts(
             K=latent,
             TOPK=top_k,
             CLAMP=float(activation_clamp),
+            INV_CLAMP=_fp32_reciprocal(activation_clamp),
             BLOCK_M=block_m,
             BLOCK_N=up_n,
             BLOCK_K=up_k,
@@ -583,11 +691,12 @@ class LatentMoeExperts(OpWrapper):
     entry), a Triton grouped GEMM computes the up projection straight from each slot's token row
     and applies the activation and routing weight as the tile leaves the accumulator, and a
     Triton grouped GEMM computes the down projection. Larger batches: a stable torch sort of the
-    slots, a row gather of `x`, `torch._grouped_mm` for up_proj, a Triton pass applying the
-    activation and the routing weight in place, and `torch._grouped_mm` for down_proj. Either
-    way a Triton pass then sums each token's rows in fp32. The paths round at the same points
-    and accumulate every GEMM output over K in fp32 in the same order, so a row has the same
-    bits whichever path computed it.
+    slots, one Triton pass gathering each row's x and writing the inverse permutation,
+    `torch._grouped_mm` for up_proj, a Triton pass applying the activation and the routing
+    weight in place, and `torch._grouped_mm` for down_proj. Either way a Triton pass then sums
+    each token's rows in fp32. The paths round at the same points and accumulate every GEMM
+    output over K in fp32 in the same order, so a row has the same bits whichever path computed
+    it.
     """
 
     ARCHS = frozenset({Arch.SM_103})
