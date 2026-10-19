@@ -2215,6 +2215,99 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     return {};
 }
 
+// The MNNVL all-reduce of `input` whose sum is a wide residual step's update: written into `streams` in place
+// (`S_k <- bf16(bf16(r_k * S_k) + w_k * sum)`), then one or two normed reads of the streams returned. The sum itself
+// is the one mnnvl_fusion_allreduce returns, bit for bit, and is not returned.
+std::vector<torch::Tensor> mnnvlAllreduceWideResidual(torch::Tensor const& input, torch::Tensor& streams,
+    torch::Tensor const& retention, torch::Tensor const& write, torch::Tensor const& read_factors,
+    torch::Tensor const& norm_weight, double eps, torch::optional<torch::Tensor> const& read_factors2,
+    torch::optional<torch::Tensor> const& norm_weight2, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags)
+{
+    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    TORCH_CHECK(
+        mcast_mem != nullptr, "[mnnvlAllreduceWideResidual] comm_buffer must be obtained from a mcastBuffer instance.");
+    TORCH_CHECK(mcast_mem->isMapped(), "[mnnvlAllreduceWideResidual] MNNVL workspace handles are not attached.");
+
+    auto const bf16 = torch::kBFloat16;
+    auto aligned = [](torch::Tensor const& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0; };
+    TORCH_CHECK(input.scalar_type() == bf16 && input.dim() == 2 && input.is_contiguous() && aligned(input),
+        "[mnnvlAllreduceWideResidual] input must be a contiguous, 16-byte aligned 2-D bf16 tensor");
+    int64_t const numTokens = input.size(0);
+    int64_t const hidden = input.size(1);
+    TORCH_CHECK(hidden % 8 == 0 && hidden <= 3072,
+        "[mnnvlAllreduceWideResidual] the hidden width must be a multiple of 8 and at most 3072, got ", hidden);
+    int64_t const numStreams = read_factors.numel();
+    TORCH_CHECK(streams.scalar_type() == bf16 && streams.dim() == 2 && streams.size(0) == numTokens
+            && streams.size(1) == numStreams * hidden && streams.stride(1) == 1 && streams.stride(0) >= streams.size(1)
+            && streams.stride(0) % 8 == 0 && aligned(streams),
+        "[mnnvlAllreduceWideResidual] streams must be bf16 [T, n * hidden] with unit-stride, 16-byte aligned rows");
+
+    auto checkVector = [&](torch::Tensor const& t, int64_t numel, char const* name)
+    {
+        TORCH_CHECK(t.scalar_type() == bf16 && t.is_contiguous() && t.numel() == numel && aligned(t)
+                && t.device() == input.device(),
+            "[mnnvlAllreduceWideResidual] ", name, " must be a contiguous bf16 tensor of ", numel,
+            " elements on the input's device");
+    };
+    checkVector(retention, numStreams, "retention");
+    checkVector(write, numStreams, "write");
+    checkVector(read_factors, numStreams, "read_factors");
+    checkVector(norm_weight, hidden, "norm_weight");
+    TORCH_CHECK(read_factors2.has_value() == norm_weight2.has_value(),
+        "[mnnvlAllreduceWideResidual] a second read needs both read_factors2 and norm_weight2");
+    bool const twoReads = read_factors2.has_value();
+    if (twoReads)
+    {
+        checkVector(read_factors2.value(), numStreams, "read_factors2");
+        checkVector(norm_weight2.value(), hidden, "norm_weight2");
+    }
+
+    torch::Tensor normed = torch::empty({numTokens, hidden}, input.options());
+    torch::Tensor normed2 = twoReads ? torch::empty({numTokens, hidden}, input.options()) : torch::Tensor();
+    if (numTokens == 0)
+    {
+        return twoReads ? std::vector<torch::Tensor>{normed, normed2} : std::vector<torch::Tensor>{normed};
+    }
+
+    auto params = tensorrt_llm::kernels::mnnvl::AllReduceWideResidualParams();
+    params.nRanks = mcast_mem->getWorldSize();
+    params.rank = mcast_mem->getRank();
+    params.numTokens = static_cast<int>(numTokens);
+    params.tokenDim = static_cast<int>(hidden);
+    params.numStreams = static_cast<int>(numStreams);
+    params.bufferPtrsDev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    params.bufferPtrLocal = comm_buffer.mutable_data_ptr();
+    params.multicastPtr = mcast_mem->getMulticastPtr();
+    params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
+    params.input = input.const_data_ptr();
+    params.streams = streams.mutable_data_ptr();
+    params.streamsRowStride = streams.stride(0);
+    params.retention = retention.const_data_ptr();
+    params.write = write.const_data_ptr();
+    params.readFactors = read_factors.const_data_ptr();
+    params.normWeight = norm_weight.const_data_ptr();
+    params.readFactors2 = twoReads ? read_factors2.value().const_data_ptr() : nullptr;
+    params.normWeight2 = twoReads ? norm_weight2.value().const_data_ptr() : nullptr;
+    params.epsilon = static_cast<float>(eps);
+    params.invTokenDim = static_cast<float>(1.0 / static_cast<double>(hidden));
+    params.normedOut = normed.mutable_data_ptr();
+    params.normedOut2 = twoReads ? normed2.mutable_data_ptr() : nullptr;
+    params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+    // mnnvl_fusion_allreduce's switch between its one-shot and two-shot kernels, so the sum is formed by the same
+    // kernel at every size.
+    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8 * 2;
+    if (static_cast<size_t>(numTokens * hidden * params.nRanks) * input.itemsize() <= kOneShotSizeThreshold)
+    {
+        tensorrt_llm::kernels::mnnvl::oneshotAllreduceWideResidualOp(params);
+    }
+    else
+    {
+        tensorrt_llm::kernels::mnnvl::twoshotAllreduceWideResidualOp(params);
+    }
+    return twoReads ? std::vector<torch::Tensor>{normed, normed2} : std::vector<torch::Tensor>{normed};
+}
+
 torch::Tensor minimax_allreduce_rms(torch::Tensor const& input, torch::Tensor const& norm_weight,
     torch::Tensor workspace, int64_t const rank, int64_t const nranks, double const eps,
     bool const trigger_completion_at_end_)
@@ -2317,6 +2410,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? scale=None, int fusion_op=0) -> "
         "Tensor[]");
     m.def(
+        "mnnvl_allreduce_wide_residual(Tensor input, Tensor(a!) streams, Tensor retention, Tensor write, "
+        "Tensor read_factors, Tensor norm_weight, float eps, Tensor? read_factors2, Tensor? norm_weight2, "
+        "Tensor(b!) comm_buffer, Tensor buffer_flags) -> Tensor[]");
+    m.def(
         "allreduce("
         "Tensor input,"
         "Tensor? residual,"
@@ -2414,6 +2511,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mnnvl_fusion_allreduce", &tensorrt_llm::torch_ext::mnnvlFusionAllReduce);
+    m.impl("mnnvl_allreduce_wide_residual", &tensorrt_llm::torch_ext::mnnvlAllreduceWideResidual);
     m.impl("allreduce", &tensorrt_llm::torch_ext::allreduce_raw);
     m.impl("autotuned_allreduce", &tensorrt_llm::torch_ext::autotunedAllreduce);
     m.impl("register_allreduce_tactic", &tensorrt_llm::torch_ext::registerAllReduceTactic);

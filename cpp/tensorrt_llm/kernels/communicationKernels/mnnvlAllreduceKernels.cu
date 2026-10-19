@@ -1401,6 +1401,486 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     }
 }
 
+// ============================== All-reduce + wide residual ==============================
+//
+// The all-reduce's sum is the update of a wide residual step: it is written into the residual streams and never
+// stored on its own. One CTA per token row, one thread per eight columns, for every row count and on both the
+// one-shot and the two-shot path, so the variance of a normed read is always summed in the same order and a row's
+// outputs do not depend on how many rows share the call.
+
+//! The most threads a wide-residual CTA has: one per eight columns, so a hidden width of at most 3072.
+constexpr int kMaxWideResidualThreads = 384;
+
+namespace detail
+{
+
+struct WideResidualKernelParams
+{
+    __nv_bfloat16 const* shardPtr;
+    __nv_bfloat16** inputPtrs;
+    __nv_bfloat16* bufferInputPtr;
+    __nv_bfloat16* mcastPtr;
+    uint32_t* bufferFlags;
+    __nv_bfloat16* streams;
+    int64_t streamsRowStride;
+    __nv_bfloat16 const* retention;
+    __nv_bfloat16 const* write;
+    __nv_bfloat16 const* readFactors;
+    __nv_bfloat16 const* normWeight;
+    __nv_bfloat16 const* readFactors2;
+    __nv_bfloat16 const* normWeight2;
+    __nv_bfloat16* normedOut;
+    __nv_bfloat16* normedOut2;
+    float epsilon;
+    float invTokenDim;
+    int numTokens;
+    int tokenDim;
+    int nRanks;
+    int rank;
+};
+
+//! Sum `kN` values over the CTA in an order set by the CTA's shape alone: within each warp by butterfly, then the
+//! warps' partials in warp order. Every thread receives the sums. blockDim.x must be a multiple of 32 and at most
+//! kMaxWideResidualThreads; one call per CTA.
+template <int kN>
+inline __device__ void blockReduceSumFixedOrder(float (&v)[kN])
+{
+    constexpr int kMaxWarps = kMaxWideResidualThreads / static_cast<int>(kWARP_SIZE);
+    __shared__ float partials[kN][kMaxWarps];
+    int const lane = threadIdx.x & kLANE_ID_MASK;
+    int const warp = threadIdx.x >> kLOG2_WARP_SIZE;
+    int const numWarps = blockDim.x >> kLOG2_WARP_SIZE;
+#pragma unroll
+    for (int i = 0; i < kN; i++)
+    {
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+        {
+            v[i] += __shfl_xor_sync(0xffffffffU, v[i], mask, kWARP_SIZE);
+        }
+        if (lane == 0)
+        {
+            partials[i][warp] = v[i];
+        }
+    }
+    __syncthreads();
+    // All partials are loaded before the first add; a missing warp contributes +0, which leaves a sum of squares as
+    // it is.
+    float loaded[kN][kMaxWarps];
+#pragma unroll
+    for (int w = 0; w < kMaxWarps; w++)
+    {
+#pragma unroll
+        for (int i = 0; i < kN; i++)
+        {
+            loaded[i][w] = w < numWarps ? partials[i][w] : 0.F;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kN; i++)
+    {
+        float sum = 0.F;
+#pragma unroll
+        for (int w = 0; w < kMaxWarps; w++)
+        {
+            sum += loaded[i][w];
+        }
+        v[i] = sum;
+    }
+}
+
+//! The step's parameters for this thread's columns: the norm weights, and the coefficients as fp32 copies of their
+//! bf16 values. Nothing in a forward writes them, so they may be read before the kernel ahead has finished.
+template <int kStreams, bool TwoReads>
+inline __device__ void loadWideResidualParameters(WideResidualKernelParams const& params, int col, bool inBounds,
+    PackedVec<float4, __nv_bfloat16>& g0, PackedVec<float4, __nv_bfloat16>& g1, float (&r)[kStreams],
+    float (&w)[kStreams], float (&f0)[kStreams], float (&f1)[kStreams])
+{
+    if (inBounds)
+    {
+        g0.packed = loadPacked<float4>(&params.normWeight[col]);
+        if constexpr (TwoReads)
+        {
+            g1.packed = loadPacked<float4>(&params.normWeight2[col]);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < kStreams; k++)
+    {
+        r[k] = __bfloat162float(params.retention[k]);
+        w[k] = __bfloat162float(params.write[k]);
+        f0[k] = __bfloat162float(params.readFactors[k]);
+        f1[k] = TwoReads ? __bfloat162float(params.readFactors2[k]) : 0.F;
+    }
+}
+
+//! This thread's eight columns of the token's stream rows.
+template <int kStreams>
+inline __device__ void loadStreamRows(WideResidualKernelParams const& params, int token, int col, bool inBounds,
+    PackedVec<float4, __nv_bfloat16> (&s)[kStreams])
+{
+    if (inBounds)
+    {
+        __nv_bfloat16 const* row = params.streams + token * params.streamsRowStride + col;
+#pragma unroll
+        for (int k = 0; k < kStreams; k++)
+        {
+            s[k].packed = __ldcg(reinterpret_cast<float4 const*>(row + static_cast<int64_t>(k) * params.tokenDim));
+        }
+    }
+}
+
+//! The wide residual step on this thread's eight columns, given the all-reduced update `u`: each stream written,
+//! `bf16(bf16(r * s) + u * w)`, in registers and in place; each read `x = bf16(sum_k f_k * s_k)` over the written
+//! streams in stream order; then `bf16(g * bf16(x * rsqrt(sum(x^2) / tokenDim + eps)))`. Every product of two bf16
+//! values is exact in fp32, so a fused multiply-add rounds as the separate multiply and add do. Every thread of the
+//! CTA must call this (it reduces across the CTA); a thread past the row's end stores nothing.
+template <int kStreams, bool TwoReads>
+inline __device__ void wideResidualEpilogue(WideResidualKernelParams const& params, int token, int col, bool inBounds,
+    PackedVec<float4, __nv_bfloat16> const& u, PackedVec<float4, __nv_bfloat16> const (&s)[kStreams],
+    float const (&r)[kStreams], float const (&w)[kStreams], float const (&f0)[kStreams], float const (&f1)[kStreams],
+    PackedVec<float4, __nv_bfloat16> const& g0, PackedVec<float4, __nv_bfloat16> const& g1)
+{
+    constexpr int kELTS = 8;
+    constexpr int kReads = TwoReads ? 2 : 1;
+    float x[kReads][kELTS];
+    float squares[kReads];
+#pragma unroll
+    for (int j = 0; j < kReads; j++)
+    {
+        squares[j] = 0.F;
+    }
+    if (inBounds)
+    {
+        __nv_bfloat16* row = params.streams + token * params.streamsRowStride + col;
+        float acc[kReads][kELTS];
+#pragma unroll
+        for (int k = 0; k < kStreams; k++)
+        {
+            PackedVec<float4, __nv_bfloat16> written;
+#pragma unroll
+            for (int i = 0; i < kELTS; i++)
+            {
+                float const kept = __bfloat162float(__float2bfloat16_rn(__bfloat162float(s[k].elements[i]) * r[k]));
+                written.elements[i] = __float2bfloat16_rn(kept + __bfloat162float(u.elements[i]) * w[k]);
+                float const sk = __bfloat162float(written.elements[i]);
+                acc[0][i] = k == 0 ? f0[k] * sk : acc[0][i] + f0[k] * sk;
+                if constexpr (TwoReads)
+                {
+                    acc[1][i] = k == 0 ? f1[k] * sk : acc[1][i] + f1[k] * sk;
+                }
+            }
+            *reinterpret_cast<float4*>(row + static_cast<int64_t>(k) * params.tokenDim) = written.packed;
+        }
+#pragma unroll
+        for (int j = 0; j < kReads; j++)
+        {
+#pragma unroll
+            for (int i = 0; i < kELTS; i++)
+            {
+                x[j][i] = __bfloat162float(__float2bfloat16_rn(acc[j][i]));
+                squares[j] += x[j][i] * x[j][i];
+            }
+        }
+    }
+    blockReduceSumFixedOrder<kReads>(squares);
+    if (inBounds)
+    {
+        int64_t const offset = static_cast<int64_t>(token) * params.tokenDim + col;
+#pragma unroll
+        for (int j = 0; j < kReads; j++)
+        {
+            PackedVec<float4, __nv_bfloat16> const& g = j == 0 ? g0 : g1;
+            float const rcpRms = rsqrtf(squares[j] * params.invTokenDim + params.epsilon);
+            PackedVec<float4, __nv_bfloat16> y;
+#pragma unroll
+            for (int i = 0; i < kELTS; i++)
+            {
+                float const normed = __bfloat162float(__float2bfloat16_rn(x[j][i] * rcpRms));
+                y.elements[i] = __float2bfloat16_rn(__bfloat162float(g.elements[i]) * normed);
+            }
+            *reinterpret_cast<float4*>((j == 0 ? params.normedOut : params.normedOut2) + offset) = y.packed;
+        }
+    }
+}
+
+} // namespace detail
+
+using detail::WideResidualKernelParams;
+using detail::loadWideResidualParameters;
+using detail::loadStreamRows;
+using detail::wideResidualEpilogue;
+
+template <uint8_t WorldSize, int kStreams, bool TwoReads>
+__global__ void __launch_bounds__(kMaxWideResidualThreads)
+    oneshotAllreduceWideResidualKernel(WideResidualKernelParams params)
+{
+    using T = __nv_bfloat16;
+    using PackedType = float4;
+    constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
+    constexpr uint32_t kELT_SIZE = sizeof(T);
+    int const token = blockIdx.x;
+    int const packedIdx = threadIdx.x;
+    int const col = packedIdx * kELTS_PER_THREAD;
+    bool const inBounds = col < params.tokenDim;
+
+    PackedVec<PackedType, T> g0, g1;
+    float r[kStreams], w[kStreams], f0[kStreams], f1[kStreams];
+    loadWideResidualParameters<kStreams, TwoReads>(params, col, inBounds, g0, g1, r, w, f0, f1);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+    // The next kernel may launch now: it waits for this one to finish before it reads anything this one writes, and
+    // its launch overlaps the wait for the other ranks below.
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
+    // We only use 1 stage for the oneshot allreduce
+    LamportFlags<PackedType, false> flag(params.bufferFlags, 1);
+    T* stagePtrMcast = reinterpret_cast<T*>(flag.getCurLamportBuf(params.mcastPtr, 0));
+    T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], 0));
+
+    // ==================== Broadcast tokens to each rank =============================
+    PackedVec<PackedType, T> val;
+    if (inBounds)
+    {
+        val.packed = loadPacked<PackedType>(&params.shardPtr[static_cast<int64_t>(token) * params.tokenDim + col]);
+        sanitizeLamportPayload(val);
+        reinterpret_cast<PackedType*>(
+            &stagePtrMcast[token * params.tokenDim * WorldSize + params.rank * params.tokenDim])[packedIdx]
+            = val.packed;
+    }
+    // The row's streams, loaded while the other ranks' partials are in flight.
+    PackedVec<PackedType, T> s[kStreams];
+    loadStreamRows<kStreams>(params, token, col, inBounds, s);
+
+    flag.ctaArrive();
+    // ======================= Lamport Sync and clear the output buffer from previous iteration
+    flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
+
+    // ======================= Reduction: allreduce's sum, bit for bit =============================
+    PackedVec<PackedType, T> u;
+    if (inBounds)
+    {
+        u = val;
+#define RUN_ONESHOT_LOCAL_RANK(LOCAL_RANK)                                                                             \
+    case LOCAL_RANK:                                                                                                   \
+        if constexpr (WorldSize > LOCAL_RANK)                                                                          \
+        {                                                                                                              \
+            u = reduceOneshotDeterministicFastPath<WorldSize, LOCAL_RANK, T, PackedType, kELTS_PER_THREAD>(            \
+                val, stagePtrLocal, token, params.tokenDim, packedIdx);                                                \
+        }                                                                                                              \
+        break
+
+        switch (params.rank)
+        {
+            RUN_ONESHOT_LOCAL_RANK(0);
+            RUN_ONESHOT_LOCAL_RANK(1);
+            RUN_ONESHOT_LOCAL_RANK(2);
+            RUN_ONESHOT_LOCAL_RANK(3);
+            RUN_ONESHOT_LOCAL_RANK(4);
+            RUN_ONESHOT_LOCAL_RANK(5);
+            RUN_ONESHOT_LOCAL_RANK(6);
+            RUN_ONESHOT_LOCAL_RANK(7);
+        }
+#undef RUN_ONESHOT_LOCAL_RANK
+    }
+    // =============================== Wide residual ===============================
+    wideResidualEpilogue<kStreams, TwoReads>(params, token, col, inBounds, u, s, r, w, f0, f1, g0, g1);
+    flag.waitAndUpdate({static_cast<uint32_t>(params.numTokens * params.tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
+}
+
+//! The two-shot path's second kernel, in place of rmsNormLamport: waits for each element of the row's broadcast
+//! sum, then runs the wide residual step on it. Launched right behind twoshotAllreduceKernel with
+//! waitForResults = false. That kernel triggers only after its own dependency wait, so every kernel before the
+//! all-reduce has finished when this one starts, and the streams (which the all-reduce does not touch) can be read
+//! before the sums arrive.
+//!
+//! One CTA per row. At prefill heights the kernel is a stream of short CTAs, so its throughput is how many fit on an
+//! SM at once: the bound keeps a CTA of the widest row this op takes (3072 columns) at three per SM.
+template <int kStreams, bool TwoReads>
+__global__ __launch_bounds__(kMaxWideResidualThreads, 3) void wideResidualLamport(WideResidualKernelParams params)
+{
+    using T = __nv_bfloat16;
+    constexpr int kELTS_PER_THREAD = sizeof(float4) / sizeof(T);
+    constexpr uint32_t kELT_SIZE = sizeof(T);
+    int const token = blockIdx.x;
+    int const col = threadIdx.x * kELTS_PER_THREAD;
+    bool const inBounds = col < params.tokenDim;
+
+    LamportFlags<float4, false> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
+    T const* sums = reinterpret_cast<T const*>(
+        flag.getCurLamportBuf(reinterpret_cast<void*>(params.bufferInputPtr), MNNVLTwoShotStage::BROADCAST));
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
+    PackedVec<float4, T> g0, g1;
+    float r[kStreams], w[kStreams], f0[kStreams], f1[kStreams];
+    loadWideResidualParameters<kStreams, TwoReads>(params, col, inBounds, g0, g1, r, w, f0, f1);
+    PackedVec<float4, T> s[kStreams];
+    loadStreamRows<kStreams>(params, token, col, inBounds, s);
+
+    flag.ctaArrive();
+    PackedVec<float4, T> u;
+    if (inBounds)
+    {
+        auto loaded = loadPackedVolatile<float4>(&sums[static_cast<int64_t>(token) * params.tokenDim + col]);
+        while (isLamportDirty(loaded))
+        {
+            loaded = loadPackedVolatile<float4>(&sums[static_cast<int64_t>(token) * params.tokenDim + col]);
+        }
+        u.packed = loaded.packed;
+    }
+    wideResidualEpilogue<kStreams, TwoReads>(params, token, col, inBounds, u, s, r, w, f0, f1, g0, g1);
+
+    // As in rmsNormLamport: the kernel before must be done before the buffer flags move on.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+    flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(params.numTokens, params.nRanks) * params.nRanks
+                            * params.tokenDim * kELT_SIZE),
+        static_cast<uint32_t>(params.numTokens * params.tokenDim * kELT_SIZE), 0, 0});
+}
+
+namespace
+{
+constexpr int kWideResidualStreams = 3;
+
+//! One thread per eight columns, rounded up to whole warps: the same CTA for every row count.
+int wideResidualBlockSize(int tokenDim)
+{
+    int const threads = divUp(tokenDim, static_cast<int>(sizeof(float4) / sizeof(__nv_bfloat16)));
+    return divUp(threads, static_cast<int>(detail::kWARP_SIZE)) * static_cast<int>(detail::kWARP_SIZE);
+}
+
+void checkWideResidualParams(AllReduceWideResidualParams const& params, char const* name)
+{
+    static int const kSMVersion = tensorrt_llm::common::getSMVersion();
+    TLLM_CHECK_WITH_INFO(kSMVersion >= 90, "[%s] requires SM 90 or newer.", name);
+    TLLM_CHECK_WITH_INFO(params.numStreams == kWideResidualStreams, "[%s] supports %d residual streams, got %d.", name,
+        kWideResidualStreams, params.numStreams);
+    TLLM_CHECK_WITH_INFO(
+        params.tokenDim % 8 == 0, "[%s] token_dim must be divisible by 8, got %d.", name, params.tokenDim);
+    TLLM_CHECK_WITH_INFO(wideResidualBlockSize(params.tokenDim) <= kMaxWideResidualThreads,
+        "[%s] token_dim %d exceeds %d.", name, params.tokenDim, kMaxWideResidualThreads * 8);
+    TLLM_CHECK_WITH_INFO((params.readFactors2 == nullptr) == (params.normWeight2 == nullptr)
+            && (params.readFactors2 == nullptr) == (params.normedOut2 == nullptr),
+        "[%s] a second read needs its factors, its norm weight and its output.", name);
+}
+
+WideResidualKernelParams toKernelParams(AllReduceWideResidualParams const& params)
+{
+    using T = __nv_bfloat16;
+    return WideResidualKernelParams{reinterpret_cast<T const*>(params.input),
+        reinterpret_cast<T**>(params.bufferPtrsDev), reinterpret_cast<T*>(params.bufferPtrLocal),
+        reinterpret_cast<T*>(params.multicastPtr), params.bufferFlags, reinterpret_cast<T*>(params.streams),
+        params.streamsRowStride, reinterpret_cast<T const*>(params.retention), reinterpret_cast<T const*>(params.write),
+        reinterpret_cast<T const*>(params.readFactors), reinterpret_cast<T const*>(params.normWeight),
+        reinterpret_cast<T const*>(params.readFactors2), reinterpret_cast<T const*>(params.normWeight2),
+        reinterpret_cast<T*>(params.normedOut), reinterpret_cast<T*>(params.normedOut2), params.epsilon,
+        params.invTokenDim, params.numTokens, params.tokenDim, params.nRanks, params.rank};
+}
+} // namespace
+
+void oneshotAllreduceWideResidualOp(AllReduceWideResidualParams const& params)
+{
+    checkWideResidualParams(params, "MNNVL AllReduceWideResidualOneShot");
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    cudaLaunchConfig_t config{
+        .gridDim = dim3(params.numTokens, 1, 1),
+        .blockDim = dim3(wideResidualBlockSize(params.tokenDim), 1, 1),
+        .dynamicSmemBytes = 0,
+        .stream = params.stream,
+        .attrs = attrs,
+        .numAttrs = 1U,
+    };
+    WideResidualKernelParams const kernelParams = toKernelParams(params);
+    bool const twoReads = params.readFactors2 != nullptr;
+
+#define LAUNCH_WIDE_RESIDUAL_KERNEL(WORLD_SIZE)                                                                        \
+    if (twoReads)                                                                                                      \
+    {                                                                                                                  \
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(                                                                            \
+            &config, &oneshotAllreduceWideResidualKernel<WORLD_SIZE, kWideResidualStreams, true>, kernelParams));      \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(                                                                            \
+            &config, &oneshotAllreduceWideResidualKernel<WORLD_SIZE, kWideResidualStreams, false>, kernelParams));     \
+    }
+
+    switch (params.nRanks)
+    {
+    case 2: LAUNCH_WIDE_RESIDUAL_KERNEL(2); break;
+    case 4: LAUNCH_WIDE_RESIDUAL_KERNEL(4); break;
+    case 8: LAUNCH_WIDE_RESIDUAL_KERNEL(8); break;
+    default:
+        TLLM_CHECK_WITH_INFO(
+            false, "[MNNVL AllReduceWideResidualOneShot] supports 2, 4 or 8 ranks, got %d.", params.nRanks);
+    }
+#undef LAUNCH_WIDE_RESIDUAL_KERNEL
+}
+
+void twoshotAllreduceWideResidualOp(AllReduceWideResidualParams const& params)
+{
+    using T = __nv_bfloat16;
+    checkWideResidualParams(params, "MNNVL AllReduceWideResidualTwoShot");
+    int const numTokens = params.numTokens;
+    int const tokenDim = params.tokenDim;
+
+    // The two-shot all-reduce, leaving each row's sum in the broadcast stage for the kernel below.
+    int const arNumThreads = divUp(tokenDim, static_cast<int>(sizeof(float4) / sizeof(T)));
+    cudaLaunchAttribute arAttrs[1];
+    arAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    arAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    cudaLaunchConfig_t arConfig{
+        .gridDim = dim3(numTokens, divUp(arNumThreads, 128), 1),
+        .blockDim = 128,
+        .dynamicSmemBytes = 0,
+        .stream = params.stream,
+        .attrs = arAttrs,
+        .numAttrs = 1U,
+    };
+    MnnvlAllReduceKernelParams<T> arParams{nullptr, nullptr, reinterpret_cast<T const*>(params.input), nullptr, nullptr,
+        reinterpret_cast<T**>(params.bufferPtrsDev), reinterpret_cast<T*>(params.bufferPtrLocal),
+        reinterpret_cast<T*>(params.multicastPtr), nullptr, nullptr, nullptr, numTokens, tokenDim, params.nRanks,
+        params.rank, params.epsilon, params.bufferFlags, false, QuantizationSFLayout::SWIZZLED};
+    switch (params.nRanks)
+    {
+    case 2: TLLM_CUDA_CHECK(cudaLaunchKernelEx(&arConfig, &twoshotAllreduceKernel<2, T>, arParams)); break;
+    case 4: TLLM_CUDA_CHECK(cudaLaunchKernelEx(&arConfig, &twoshotAllreduceKernel<4, T>, arParams)); break;
+    case 8: TLLM_CUDA_CHECK(cudaLaunchKernelEx(&arConfig, &twoshotAllreduceKernel<8, T>, arParams)); break;
+    default:
+        TLLM_CHECK_WITH_INFO(
+            false, "[MNNVL AllReduceWideResidualTwoShot] supports 2, 4 or 8 ranks, got %d.", params.nRanks);
+    }
+
+    // Then each row's wide residual step, as soon as the row's sum lands.
+    cudaLaunchAttribute wrAttrs[1];
+    wrAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    wrAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    cudaLaunchConfig_t wrConfig{
+        .gridDim = dim3(numTokens, 1, 1),
+        .blockDim = dim3(wideResidualBlockSize(tokenDim), 1, 1),
+        .dynamicSmemBytes = 0,
+        .stream = params.stream,
+        .attrs = wrAttrs,
+        .numAttrs = 1U,
+    };
+    WideResidualKernelParams const kernelParams = toKernelParams(params);
+    if (params.readFactors2 != nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&wrConfig, &wideResidualLamport<kWideResidualStreams, true>, kernelParams));
+    }
+    else
+    {
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&wrConfig, &wideResidualLamport<kWideResidualStreams, false>, kernelParams));
+    }
+}
+
 } // namespace kernels::mnnvl
 
 TRTLLM_NAMESPACE_END
