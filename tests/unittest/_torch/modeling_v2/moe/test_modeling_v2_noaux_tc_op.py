@@ -67,6 +67,34 @@ def test_the_fp32_cells_see_the_renormalization() -> None:
     assert missed > 0.1, f"an all-fp32 renormalization reproduced {1 - missed:.1%} of the weights"
 
 
+def test_heavy_ties_route_exactly() -> None:
+    """More than 32 experts at the threshold: the single-group kernel's sort path, held exact.
+
+    The kernel takes as candidates the experts at or above a threshold drawn
+    from its lanes' maxima and ranks them one per lane; when ties put more than
+    32 experts there, it sorts each lane's experts and picks one at a time
+    instead. Continuous logits never get there, so no cell drives that path.
+    Logits on a five-value grid with a zero bias put about 100 experts on the
+    top score of a row; those rows alternate with continuous ones, so both
+    paths run in one launch and the tie order (lower expert first) decides
+    every pick past the first.
+    """
+    g = torch.Generator(device="cuda").manual_seed(17)
+    tokens, experts, topk, scale = 64, 512, 10, 3.16
+    logits = torch.randn(tokens, experts, generator=g, device="cuda", dtype=torch.float32)
+    grid = torch.randint(-2, 3, (tokens, experts), generator=g, device="cuda").float() * 0.5
+    logits[::2] = grid[::2]
+    bias = torch.zeros(experts, dtype=torch.float32, device="cuda")
+    scores = 0.5 * torch.tanh(0.5 * logits) + 0.5
+    at_top = (scores == scores.max(-1, keepdim=True).values).sum(-1)
+    assert (at_top[::2] > 32).all(), "every grid row must put more than 32 experts on its top score"
+
+    weights, ids = op(logits, bias, 1, 1, topk, scale)
+    ref_weights, ref_ids = op.reference(logits, bias, 1, 1, topk, scale)
+    assert torch.equal(ids, ref_ids), "selected experts differ from the reference"
+    assert torch.equal(weights, ref_weights), "combine weights differ from the reference"
+
+
 def test_topk_group_is_not_read_with_one_group() -> None:
     """The note's claim about the single-group kernel, held: nemotron4 passes
     `topk_group=1`, and any other value routes identically."""
