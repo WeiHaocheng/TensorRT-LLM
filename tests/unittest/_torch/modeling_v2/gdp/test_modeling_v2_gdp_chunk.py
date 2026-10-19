@@ -4,17 +4,23 @@
 
 import itertools
 import math
+import os
+import subprocess
+import sys
 import zlib
 
 import pytest
 import torch
 import torch.nn.functional as F
 import triton
+from triton.runtime.autotuner import Autotuner
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp import gdp_chunk as gdp_chunk_module
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import (
     _chunk_list,
     _decay_cumsum_kernel,
-    _expand_qk_kernel,
+    _expand_kernel,
+    _jit,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk as op
 from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
@@ -22,7 +28,7 @@ from tensorrt_llm._torch.modules.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
 )
-from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_o
+from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_kernel_o
 from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from tensorrt_llm._torch.modules.fla.cumsum import chunk_local_cumsum
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices, prepare_chunk_offsets
@@ -249,36 +255,56 @@ def test_guard_refuses_offsets_that_miss_the_tokens() -> None:
             op(**args)
 
 
+#: `chunk_fwd_kernel_o` at the config its autotuner picks for the 8K prefill. The
+#: kernel's configs fall into two groups that round differently (BK 64 / BV 64 on
+#: two warps against the rest), so the comparison pins one, of the larger group.
+_VENDORED_O = dict(BK=64, BV=64, num_warps=4, num_stages=2)
+
+
 def _through_the_wrappers(
     q, k, v, g, beta, state_pool, slots, cu_seqlens, has_initial_state, scale
 ):
-    """The entry's composition run the way the vendored stage wrappers run it: each
-    wrapper builds its chunk list on the host with `prepare_chunk_indices` and sizes
-    its grid from the list's length. The expansion, the decay cumsum, the kernels
-    and their constants are the entry's. Writes the final states into
-    `state_pool[slots]` and returns the output."""
+    """The entry's stages run the way the vendored wrappers run them: each wrapper
+    builds its chunk list on the host with `prepare_chunk_indices`, sizes its grid
+    from the list's length and launches with its own constants (`fwd_h` autotuned).
+    The output stage is the vendored `chunk_fwd_kernel_o` over every sub-step, at
+    `_VENDORED_O`, of which the mixer keeps each token's last. The expansion and the
+    decay cumsum are the entry's. Writes the final states into `state_pool[slots]`
+    and returns the kept output."""
     num_tokens, nh, h, dv = v.shape
     dk = k.shape[-1]
     steps = num_tokens * nh
     cu_steps = cu_seqlens.long() * nh
-    q_steps = q.new_empty(1, steps, h, dk)
-    k_steps = torch.empty_like(q_steps)
-    _expand_qk_kernel[(num_tokens,)](
+    q_norm = q.new_empty(num_tokens, h, dk)
+    k_steps = k.new_empty(1, steps, h, dk)
+    v_steps = v.new_empty(1, steps, h, dv)
+    beta_steps = beta.new_empty(1, steps, h)
+    _expand_kernel[(num_tokens,)](
         q,
         k,
-        q_steps,
+        v,
+        beta,
+        q_norm,
         k_steps,
+        v_steps,
+        beta_steps,
         *q.stride(),
         *k.stride(),
+        *v.stride(),
+        *beta.stride(),
         H=h,
         NH=nh,
         K=dk,
+        V=dv,
         BH=triton.next_power_of_2(h),
         BK=triton.next_power_of_2(dk),
+        BV=triton.next_power_of_2(dv),
         num_warps=4,
     )
-    v_steps = v.contiguous().view(1, steps, h, dv)
-    beta_steps = beta.contiguous().view(1, steps, h)
+    # The vendored output stage takes a query per sub-step: zero but on the last.
+    q_steps = q.new_zeros(num_tokens, nh, h, dk)
+    q_steps[:, -1] = q_norm
+    q_steps = q_steps.view(1, steps, h, dk)
     chunk_indices = prepare_chunk_indices(cu_steps, 64)
     g_cumsum = torch.empty(1, steps, h, dtype=torch.float32, device="cuda")
     _decay_cumsum_kernel[(chunk_indices.shape[0],)](
@@ -317,35 +343,133 @@ def _through_the_wrappers(
         chunk_size=64,
         cu_seqlens=cu_steps,
     )
-    o = chunk_fwd_o(
-        q=q_steps,
-        k=k_steps,
-        v=v_new,
-        h=states,
-        g=g_cumsum,
-        scale=scale,
-        cu_seqlens=cu_steps,
-        chunk_size=64,
+    o = torch.empty_like(v_new)
+    _jit(chunk_fwd_kernel_o)[(triton.cdiv(dv, _VENDORED_O["BV"]), chunk_indices.shape[0], h)](
+        q_steps,
+        k_steps,
+        v_new,
+        states,
+        g_cumsum,
+        o,
+        cu_steps,
+        chunk_indices,
+        scale,
+        T=steps,
+        H=h,
+        Hg=h,
+        K=dk,
+        V=dv,
+        BT=64,
+        USE_G=True,
+        IS_VARLEN=True,
+        **_VENDORED_O,
     )
     state_pool[rows] = final.to(state_pool.dtype)
     return o.view(num_tokens, nh, h, dv)[:, -1].clone()
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_the_launches_match_the_wrappers_bitwise(cell) -> None:
-    """The entry launches each stage's kernel itself, over chunk lists built on the
-    device and grids sized from a bound; the wrappers build the lists on the host
-    and size the grids exactly. Same kernels with the same constants, so the output
-    and the whole pool memory must come back bit for bit -- the extra programs past
-    the real chunks write nothing."""
+def test_the_stages_are_the_vendored_ones_bitwise(cell) -> None:
+    """The entry against `_through_the_wrappers`: the output and the whole pool
+    memory agree bit for bit. So the entry's own launch configs change no bit --
+    `fwd_h`'s configs all round alike, which is what lets the entry pin one -- and
+    `_last_step_o_kernel` computes exactly what the vendored output stage computes
+    for the rows the mixer keeps, while computing no other row."""
     args, raw = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     raw_before = raw.clone()
     want = _through_the_wrappers(**args)
     want_raw = raw.clone()
     raw.copy_(raw_before)
     got = op(**args)
-    assert torch.equal(got, want), "the entry's output differs from the wrappers'"
-    assert torch.equal(raw, want_raw), "the entry's pool differs from the wrappers'"
+    assert torch.equal(got, want), "the entry's output differs from the vendored stages'"
+    assert torch.equal(raw, want_raw), "the entry's pool differs from the vendored stages'"
+
+
+def _host_chunk_list(cu_steps, steps, chunk_size):
+    """`_chunk_list` the way the wrappers build it: on the host, exactly as long as
+    the batch's chunk count."""
+    return prepare_chunk_indices(cu_steps, chunk_size), prepare_chunk_offsets(cu_steps, chunk_size)
+
+
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_the_bound_sized_grids_change_no_bit(cell, monkeypatch) -> None:
+    """The entry builds its chunk lists on the device and sizes every grid from a
+    bound; the same kernels over host-built lists of exactly the batch's chunks
+    must return the same output and leave the same pool memory, bit for bit --
+    the programs past the real chunks write nothing."""
+    args, raw = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
+    raw_before = raw.clone()
+    want = op(**args).clone()
+    want_raw = raw.clone()
+    raw.copy_(raw_before)
+    monkeypatch.setattr(gdp_chunk_module, "_chunk_list", _host_chunk_list)
+    got = op(**args)
+    assert torch.equal(got, want), "the exact grids' output differs from the bound grids'"
+    assert torch.equal(raw, want_raw), "the exact grids' pool differs from the bound grids'"
+
+
+def test_the_call_never_autotunes(monkeypatch) -> None:
+    """Every stage is launched with one fixed config, so no call tunes anything:
+    a tuned stage picks its config from timings that move between processes, and
+    `chunk_fwd_kernel_o`'s configs disagree in the last bits of its output. Any
+    autotuner the call reached, cold or warm, would run here."""
+    reached = []
+    original = Autotuner.run
+
+    def counting(self, *args, **kwargs):
+        reached.append(self.fn.__name__)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Autotuner, "run", counting)
+    args, _ = _build(_spec((3, 509, 2600, 5080), init="mixed"), seed=21)
+    op(**args)
+    torch.cuda.synchronize()
+    assert not reached, f"the call reached an autotuner: {reached}"
+
+
+_DIGEST_SCRIPT = """
+import hashlib, sys, zlib
+sys.path[:0] = [{test_dir!r}, {validating_dir!r}]
+import torch
+import test_modeling_v2_gdp_chunk as t
+cell = next(c for c in t.op.CELLS if c.why == {why!r})
+args, raw = t._build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
+out = t.op(**args)
+torch.cuda.synchronize()
+m = hashlib.sha256()
+for x in (out, raw):
+    m.update(x.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+print("DIGEST", m.hexdigest())
+"""
+
+
+def test_two_processes_give_identical_bits() -> None:
+    """The same cell in two fresh processes returns the same output and leaves the
+    same pool memory, bit for bit. Each process compiles its own kernels and has no
+    tuning state to share: `TRITON_CACHE_AUTOTUNING` is off, so a stage that tuned
+    itself would choose again in each, from its own timings."""
+    cell = next(c for c in op.CELLS if c.spec["init"] == "mixed" and len(c.spec["seq_lens"]) == 4)
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = _DIGEST_SCRIPT.format(
+        test_dir=here, validating_dir=os.path.dirname(here), why=cell.why
+    )
+    env = dict(os.environ, TRITON_CACHE_AUTOTUNING="0")
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        for _ in range(2)
+    ]
+    digests = []
+    for p in procs:
+        stdout, stderr = p.communicate(timeout=900)
+        assert p.returncode == 0, stderr[-4000:]
+        digests.append(next(ln for ln in stdout.splitlines() if ln.startswith("DIGEST")))
+    assert digests[0] == digests[1], f"two processes disagree: {digests}"
 
 
 @pytest.mark.parametrize("chunk_size", [16, 32, 64])
