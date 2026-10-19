@@ -62,7 +62,7 @@ from tensorrt_llm._torch.speculative.utils import (
     update_spec_config_from_model_config,
 )
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi import CudaGraphConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
@@ -189,6 +189,14 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
     MAX_BATCH_SIZE = 896
     MTP_MAX_BATCH_SIZE = 448
 
+    # The MTP leg's kv-cache fraction. The verify's per-position GDP and conv
+    # states (~36 GiB at max_batch_size 448) are allocated before the engine's
+    # profiling forward, and the cache pools take this share of the memory
+    # left after it. At the default 0.9 (44.96 GiB of pools) the first
+    # generation steps found too little left for one of their buffers, a
+    # recovered allocator OOM; 0.8 leaves about 5 GiB more.
+    MTP_KV = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
     # The checkpoint's trained draft depth: its one MTP layer serves both
     # depths. MTPDecodingConfig defaults to a depth of 1, so it is stated.
     MTP_DRAFT_LEN = 2
@@ -257,17 +265,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1(LlmapiAccuracyTestHarness):
         with self._llm(self.MAX_BATCH_SIZE) as llm:
             identity = task.evaluate(llm)
 
-        # The default kv-cache fraction is kept. The verify's per-position GDP
-        # and conv states (~36 GiB at max_batch_size 448) are allocated before
-        # the engine's profiling forward, so the cache pools are sized from the
-        # memory left after them.
-        #
         # Every iteration's stats are kept (``max_stats_len=-1``), so the
         # acceptance length covers the whole run rather than its last 1000
         # iterations.
         with self._llm(
             self.MTP_MAX_BATCH_SIZE,
             speculative_config=MTPDecodingConfig(max_draft_len=self.MTP_DRAFT_LEN),
+            kv_cache_config=self.MTP_KV,
             enable_iter_perf_stats=True,
             max_stats_len=-1,
         ) as llm:
