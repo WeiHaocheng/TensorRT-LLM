@@ -18,9 +18,9 @@ Greedy generation must not depend on how the engine runs a step: with CUDA
 graphs on, a decode step replays a graph captured for a padded batch size;
 with them off, the same step runs eagerly at its own size. Each target computes
 a decode row from that row alone -- its decode GEMMs and generation attention
-are batch-invariant, and under attention DP its routed experts give a token the
-same bits whatever the other ranks hold -- so the two legs must emit the same
-tokens.
+are batch-invariant, under tensor parallelism so are its all-reduces, and under
+attention DP its routed experts give a token the same bits whatever the other
+ranks hold -- so the two legs must emit the same tokens.
 
 Prefill and mixed steps are not batch-invariant, and CUDA graphs never run
 them, so they are identical in both legs only while both legs schedule the
@@ -848,3 +848,76 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4Identity(_CudaGraphIdentity):
         and reported, not gated: prefill and mixed steps are not batch-invariant.
         """
         self._check_identity(monkeypatch)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Tp4Identity(
+    TestModelingV2Nemotron4NanoPreviewSm103Tp1Identity
+):
+    """nemotron4-nano-preview (text model) / sm_103 / tp4: CUDA graphs on against off.
+
+    Tensor parallel over the 4 GPUs of one node, without attention DP: every
+    rank runs every request, in the batches rank 0's executor schedules, and
+    the ranks meet in every block's all-reduce. A rank's decode step computes
+    each row from that row alone, all-reduces included, so tp1's calls, batch
+    check and reports carry over; only the saturation call changes.
+    """
+
+    PARALLEL = dict(tensor_parallel_size=4, moe_tensor_parallel_size=4)
+
+    # The 8K/1K serve config, by the rule tp1's follows: an explicit max_seq_len,
+    # 1024 requests with a CUDA graph for every padded size up to 1024 (the
+    # largest batch tp4's decode-invariance test runs), unchunked prefill in
+    # steps of 8192 tokens plus one row per request, and the state pool sized
+    # for 9.2K-token requests (avg_seq_len).
+    MAX_SEQ_LEN = 9344
+    MAX_BATCH_SIZE = 1024
+    MAX_NUM_TOKENS = 8192 + 1024
+    KV_FRACTION = 0.9
+    AVG_SEQ_LEN = 9216
+
+    def _saturations(self, prompts) -> dict[str, list[_Request]]:
+        """Two long prompts, then MAX_BATCH_SIZE - 2 short requests: one call holding every slot.
+
+        tp1's saturation call with a second long prompt. A tp4 rank's ~8K-token
+        prefill holds the executor for less time than tp1's, little more than a
+        thousand requests take to arrive behind the first. The second long prompt is
+        MAX_NUM_TOKENS - 3 tokens: beside the first one's decode row it leaves no
+        room for a short request (4-12 tokens), and the scheduler, first come
+        first served, stops at the first context that does not fit. So the short
+        requests all wait for the call's third iteration, two prefills after it
+        began, and run in it together. Their output lengths are tp1's: the
+        decode batch shrinks from MAX_BATCH_SIZE rows through every padded graph
+        size down to one row.
+        """
+        first = next(p for p in prompts if p.name == "news_digest").token_ids
+        source = next(p for p in prompts if p.name == "gpqa_explain").token_ids
+        second = (source + first)[: self.MAX_NUM_TOKENS - 3]
+        num_short = self.MAX_BATCH_SIZE - 2
+        lengths = [16 + i % 128 for i in range(num_short - 10)] + [150 + i for i in range(10)]
+        shorts = [
+            _Request(f"saturation{i}", source[7 * i : 7 * i + 4 + i % 9], lengths[i])
+            for i in range(num_short)
+        ]
+        assert len(second) == self.MAX_NUM_TOKENS - 3 <= self.MAX_SEQ_LEN - 16, (
+            "the second long prompt does not fill one iteration's token budget"
+        )
+        assert sum(len(r.token_ids) for r in shorts) + 2 <= self.MAX_NUM_TOKENS, (
+            "the short requests do not fit one iteration beside the two decode rows"
+        )
+        return {
+            "saturation": [
+                _Request("saturation_long", first, 16),
+                _Request("saturation_long2", second, 16),
+            ]
+            + shorts
+        }
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_cuda_graph_identity(self, monkeypatch):
+        """Greedy tokens with CUDA graphs on equal those with CUDA graphs off, on 4 ranks.
+
+        tp1's calls (see its test), with MAX_BATCH_SIZE requests at once
+        passing through all 33 padded graph sizes up to 1024.
+        """
+        super().test_cuda_graph_identity(monkeypatch)
