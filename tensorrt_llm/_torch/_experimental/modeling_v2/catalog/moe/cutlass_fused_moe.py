@@ -109,6 +109,12 @@ class CutlassFusedMoe(OpWrapper):
     measured, this op sits 0.53-0.81 ulp of relative RMS from an fp32 evaluation of the
     checkpoint's math on its real inputs and weights, where the checkpoint's own bf16 loop sits
     0.60-1.11.
+
+    The fused finalize's sum is not repeatable bit for bit: measured, two calls on the same inputs
+    with the same tactics differ in their bits on every prompt- and decode-sized cell tried, single
+    rank and expert-parallel window alike. With the unfused finalize the same calls are bit for
+    bit repeatable. An identity test across two engines that run this op can therefore part on
+    this op alone.
     """
 
     def __call__(
