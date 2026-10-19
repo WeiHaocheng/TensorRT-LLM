@@ -1005,20 +1005,16 @@ def mtp_draft_hidden(
     return outs
 
 
-def greedy_acceptance(
+def greedy_walk(
     token_ids: Sequence[int], drafts: Sequence[Sequence[int]], first_draft_position: int
-) -> list[int]:
-    """The accepted draft count of every verify step of greedy MTP decoding of ``token_ids``.
+) -> list[tuple[int, int]]:
+    """The verify steps of greedy MTP decoding of ``token_ids``: ``(q, accepted)`` per step.
 
     Drafting at position q (the last position whose main-model hidden state is known; token q + 1 is
     the newest greedy token) proposes ``drafts[d][q]`` for token ``q + 2 + d``. The verify step
     accepts the longest matching prefix (a drafts) and the next drafting position is q + 1 + a. The
     walk starts at the prompt's last position and stops when a window would pass the end of the
     sequence, so every counted step had all its drafts checked.
-
-    Returns:
-        The accepted count per verify step; the acceptance length is ``mean(1 + a)``, the quantity
-        ``accuracy_core.acceptance_length_from_iteration_stats`` reports.
     """
     depth = len(drafts)
     steps = []
@@ -1027,9 +1023,47 @@ def greedy_acceptance(
         accepted = 0
         while accepted < depth and drafts[accepted][q] == token_ids[q + 2 + accepted]:
             accepted += 1
-        steps.append(accepted)
+        steps.append((q, accepted))
         q += 1 + accepted
     return steps
+
+
+def greedy_acceptance(
+    token_ids: Sequence[int], drafts: Sequence[Sequence[int]], first_draft_position: int
+) -> list[int]:
+    """The accepted draft count of every verify step of ``greedy_walk``.
+
+    Returns:
+        The accepted count per verify step; the acceptance length is ``mean(1 + a)``, the quantity
+        ``accuracy_core.acceptance_length_from_iteration_stats`` reports.
+    """
+    return [accepted for _, accepted in greedy_walk(token_ids, drafts, first_draft_position)]
+
+
+def draft_scores(logits: torch.Tensor, true_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Greedy drafts from ``logits`` and how decisive each one is about matching the true token.
+
+    The margin is how much some other token's logit has to gain on the draft's before the draft's
+    match with the true token changes: where the draft is the true token, any runner-up taking the
+    top turns a match into a miss (top-1 minus top-2); where it is not, only the true token taking
+    the top turns the miss into a match (top-1 minus the true token's logit). Where the true token
+    is unknown (``true_ids < 0``) it is top-1 minus top-2. Another implementation's draft matches
+    the true token exactly where this one does unless, in its logits, some token gains at least the
+    margin on the token that is top-1 here.
+
+    Args:
+        logits: ``[N, vocab]`` fp32.
+        true_ids: ``[N]`` int64, the token each row's draft proposes a value for, or -1.
+
+    Returns:
+        ``([N] int64 drafts (the argmax), [N] fp32 margins >= 0)``.
+    """
+    ids = logits.argmax(dim=-1)
+    top2 = logits.topk(2, dim=-1).values
+    true_logit = logits.gather(1, true_ids.clamp(min=0)[:, None])[:, 0]
+    keep_runner_up = (ids == true_ids) | (true_ids < 0)
+    margin = torch.where(keep_runner_up, top2[:, 0] - top2[:, 1], top2[:, 0] - true_logit)
+    return ids, margin
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1188,6 +1222,40 @@ class Nemotron4Reference:
         return [self.greedy_ids(h) for h in outs]
 
     @torch.inference_mode()
+    def mtp_draft_scores(
+        self,
+        token_ids: torch.Tensor,
+        hidden: torch.Tensor,
+        mode: str = "eagle",
+        num_depths: int | None = None,
+        rows_per_chunk: int = 2048,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Every depth's greedy draft at every position and its margin (``draft_scores``): one
+        ``([N] int64, [N] fp32)`` per depth.
+
+        Depth d (0-based) at position i proposes token ``i + 2 + d`` of ``token_ids``; past the end
+        of the sequence the true token is unknown. The drafts are ``mtp_drafts``' (the lm_head runs
+        on the same row chunks).
+        """
+        outs = mtp_draft_hidden(
+            token_ids, hidden, self.embed, self.mtp, self.config, num_depths, mode
+        )
+        num = token_ids.shape[0]
+        scores = []
+        for d, depth_hidden in enumerate(outs):
+            true_ids = F.pad(token_ids[2 + d :], (0, 2 + d), value=-1)
+            ids, margins = [], []
+            for start in range(0, num, rows_per_chunk):
+                stop = start + rows_per_chunk
+                chunk_ids, chunk_margins = draft_scores(
+                    self.logits(depth_hidden[start:stop]), true_ids[start:stop]
+                )
+                ids.append(chunk_ids)
+                margins.append(chunk_margins)
+            scores.append((torch.cat(ids), torch.cat(margins)))
+        return scores
+
+    @torch.inference_mode()
     def teacher_forced_mtp_acceptance(
         self,
         token_ids: Sequence[int],
@@ -1207,15 +1275,20 @@ class Nemotron4Reference:
 
         Returns:
             ``drafts`` (per depth, the draft at every position), ``accepted`` (per verify step),
-            ``acceptance_length`` (mean of 1 + accepted), ``verify_steps``, and ``depth_match``: per
+            ``acceptance_length`` (mean of 1 + accepted), ``verify_steps``, ``depth_match`` (per
             depth, the fraction of positions in the continuation whose teacher-forced draft equals
-            the true token.
+            the true token), ``positions`` (the drafting position q of each verify step),
+            ``margins`` (per depth, ``draft_scores``' margin at every position) and
+            ``step_margins`` (per depth, the margin at each verify step's position).
         """
         ids = torch.tensor(list(token_ids), dtype=torch.long, device=self.device)
         if hidden is None:
             hidden = self.forward(ids, logits=None).hidden
-        drafts = [d.tolist() for d in self.mtp_drafts(ids, hidden, mode, num_depths)]
-        accepted = greedy_acceptance(list(token_ids), drafts, prompt_len - 1)
+        scores = self.mtp_draft_scores(ids, hidden, mode, num_depths)
+        drafts = [draft.tolist() for draft, _ in scores]
+        margins = [margin.tolist() for _, margin in scores]
+        walk = greedy_walk(list(token_ids), drafts, prompt_len - 1)
+        accepted = [a for _, a in walk]
         depth_match = []
         for d, draft in enumerate(drafts):
             positions = range(prompt_len - 1, len(token_ids) - 2 - d)
@@ -1227,4 +1300,7 @@ class Nemotron4Reference:
             verify_steps=len(accepted),
             acceptance_length=(sum(accepted) + len(accepted)) / max(len(accepted), 1),
             depth_match=depth_match,
+            positions=[q for q, _ in walk],
+            margins=margins,
+            step_margins=[[margin[q] for q, _ in walk] for margin in margins],
         )
