@@ -30,6 +30,22 @@ _NEMOTRON4_DISPATCH_SPLITS = (
     (2048, [1, 3, 1, 2048], "mixed step, rank 3 prefills 2048 tokens"),
 )
 
+#: The per-rank token counts of its dep4 serving steps, in the same form. A serve config prefills
+#: unchunked under a per-rank step budget of one 8192-token prompt plus a decode batch (tp1's
+#: serves 9088), so a step that carries a prompt gathers 8192 rows and up per rank; 16384 is the
+#: budget of two prompts. A ragged step is what attention DP makes of that: ranks prefilling a
+#: prompt beside ranks that only decode, and idle ranks running their one-token dummy request.
+_NEMOTRON4_SERVING_SPLITS = (
+    (4096, None, "4096 tokens per rank, over an MTP decode batch of 1024 x 3"),
+    (8192, None, "one prompt per rank, 8192 tokens"),
+    (9216, None, "one prompt and 1024 decodes per rank, 9216 tokens"),
+    (16384, None, "two prompts per rank, 16384 tokens"),
+    (9088, [9088, 896, 1, 8193], "ragged serving step, busiest rank 0"),
+    (9216, [513, 9216, 8192, 1], "ragged serving step, busiest rank 1"),
+    (16384, [8193, 1024, 16384, 4096], "ragged serving step, busiest rank 2"),
+    (8192, [1, 1, 1, 8192], "rank 3 prefills one prompt, the others idle"),
+)
+
 
 def _nemotron4_dispatch(why: str, rows: int, sizes: Optional[List[int]] = None) -> Cell:
     return Cell(
@@ -66,7 +82,8 @@ class Allgather(OpWrapper):
     # (`_pad_attention_dp_dummy_request`). That is also why one token per rank
     # has no ragged cell. The ragged cells move the busiest rank through every
     # position. The reduce-scatter entry certifies the same per-rank counts,
-    # because one step's gather and reduce-scatter carry them both.
+    # because one step's gather and reduce-scatter carry them both. The serving
+    # cells carry those counts up to the step budgets its serve configs set.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one row per rank, hidden 7168",
@@ -82,7 +99,7 @@ class Allgather(OpWrapper):
         ),
         *(
             _nemotron4_dispatch(f"nemotron4 dep4 {what}, packed dispatch rows", rows, sizes)
-            for rows, sizes, what in _NEMOTRON4_DISPATCH_SPLITS
+            for rows, sizes, what in _NEMOTRON4_DISPATCH_SPLITS + _NEMOTRON4_SERVING_SPLITS
         ),
     )
 
@@ -95,11 +112,17 @@ class Allgather(OpWrapper):
     `[:, 1576:].view(torch.float32)`. Those views are strided, with one row
     every 1616 bytes, not contiguous.
 
+    Every cell is certified on both symbols `process_group` selects: the `_pg`
+    symbol, by ranks that rendezvous over torch.distributed with MPI disabled,
+    and the MPI-session symbol (`process_group=None`, the call a dep4 serving
+    world makes), by ranks that `mpirun` starts. On each, a cell is driven
+    eagerly and replayed from a CUDA graph on fresh rows.
+
     CUDA graph behaviour -- capture at every engine batch size, replays
     surviving eager calls of other shapes, the captured sizes vector being held
     -- is not a cell axis either: it is about the op across capture and replay
     rather than about an input configuration, and the matrix carries it as its
-    own named checks.
+    own named checks. Those checks drive the `_pg` symbol only.
     """
 
     def __call__(

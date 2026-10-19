@@ -46,6 +46,20 @@ _NEMOTRON4_COMBINE_SPLITS = (
     (2048, [1, 3, 1, 2048], "mixed step, rank 3 prefills 2048 tokens"),
 )
 
+#: The per-rank token counts of its dep4 serving steps, in the same form: the heights its
+#: all-gather is certified at up to the step budgets its serve configs set (one 8192-token
+#: prompt plus a decode batch per rank; 16384 for two prompts).
+_NEMOTRON4_SERVING_SPLITS = (
+    (4096, None, "4096 tokens per rank, over an MTP decode batch of 1024 x 3"),
+    (8192, None, "one prompt per rank, 8192 tokens"),
+    (9216, None, "one prompt and 1024 decodes per rank, 9216 tokens"),
+    (16384, None, "two prompts per rank, 16384 tokens"),
+    (9088, [9088, 896, 1, 8193], "ragged serving step, busiest rank 0"),
+    (9216, [513, 9216, 8192, 1], "ragged serving step, busiest rank 1"),
+    (16384, [8193, 1024, 16384, 4096], "ragged serving step, busiest rank 2"),
+    (8192, [1, 1, 1, 8192], "rank 3 prefills one prompt, the others idle"),
+)
+
 
 def _nemotron4_combine(
     why: str, rows_per_rank: int, dtype: torch.dtype, sizes: Optional[List[int]] = None
@@ -80,8 +94,10 @@ class Reducescatter(OpWrapper):
     # expert sums. Every rank applies its 128-expert window to every rank's
     # tokens in the 768-wide latent space, and each token's sum goes back to the
     # rank that owns the token. bf16 and fp32 partials are both certified at
-    # every height, so the target can round once after the sum rather than
-    # before it.
+    # every decode and chunk height, so the target can round once after the sum
+    # rather than before it. The serving cells carry those heights up to the
+    # step budgets its serve configs set, in fp32 only: that is what the dep4
+    # forward reduces.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one row per rank after the split, hidden 7168",
@@ -100,6 +116,10 @@ class Reducescatter(OpWrapper):
             for rows, sizes, what in _NEMOTRON4_COMBINE_SPLITS
             for name, dtype in (("bf16", torch.bfloat16), ("fp32", torch.float32))
         ),
+        *(
+            _nemotron4_combine(f"nemotron4 dep4 {what}, fp32 partials", rows, torch.float32, sizes)
+            for rows, sizes, what in _NEMOTRON4_SERVING_SPLITS
+        ),
     )
 
     note = """
@@ -114,8 +134,15 @@ class Reducescatter(OpWrapper):
     A bf16 call therefore rounds to bf16 after every partial, and an fp32 call
     stays in fp32 until the caller casts.
 
+    Every cell is certified on both symbols `process_group` selects: the `_pg`
+    symbol, by ranks that rendezvous over torch.distributed with MPI disabled,
+    and the MPI-session symbol (`process_group=None`, the call a dep4 serving
+    world makes), by ranks that `mpirun` starts. On each, a cell is driven
+    eagerly and replayed from a CUDA graph on fresh partials. The summation
+    order above is pinned on the `_pg` symbol only.
+
     CUDA graph behaviour is carried by the matrix's own named checks rather
-    than as a cell axis.
+    than as a cell axis; those checks drive the `_pg` symbol only.
     """
 
     def __call__(
@@ -186,11 +213,11 @@ class Reducescatter(OpWrapper):
         #
         #   not in the map at all -- float64, quint4x2 and the rest reach
         #   `TorchUtils::dataType()`, which throws. That call is *inside* the
-        #   group: reducescatterOp.cpp opens with ncclGroupStart() on line 21,
-        #   converts on line 25, and the matching ncclGroupEnd() on line 57 is
-        #   never reached. The communicator is left mid-group, and the
-        #   collectives after this one return invalid data. A guard here turns
-        #   that into a Python error before the group opens.
+        #   group: `ReducescatterOp::run_list` in reducescatterOp.cpp converts
+        #   the dtype after its `ncclGroupStart()`, so the matching
+        #   `ncclGroupEnd()` is never reached. The communicator is left
+        #   mid-group, and the collectives after this one return invalid data.
+        #   A guard here turns that into a Python error before the group opens.
         assert input.dtype in _SUMMABLE_DTYPES, (
             f"{input.dtype} is not summable by this op; it is accepted and then "
             f"either summed as raw bytes or thrown on inside an open NCCL group, "

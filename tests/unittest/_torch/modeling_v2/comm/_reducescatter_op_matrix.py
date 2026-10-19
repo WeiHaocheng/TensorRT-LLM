@@ -12,16 +12,13 @@ from taking the calling run down with it.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _reducescatter_op_matrix.py
 
-That runs two jobs, in this order. The first is the matrix proper: every
-`CHECKS` entry on `world_size` ranks, and it must exit 0. The second is a
-four-rank sub-job of its own that deliberately mispairs this op against an
-all-gather of a *different* byte count, which is the one call-order
-divergence that hangs instead of returning wrong data — it cannot live in
-the first job, because a job that wedges never reports. The launcher
-certifies it out of band: every rank marks the file system before issuing
-the pair, none marks it afterwards, and the job is ended by its own
-watchdog. That sub-job doubles as the harness's positive control, since it
-is a real collective deadlock this launcher has to survive.
+That runs two jobs, in this order, one per symbol the entry's `process_group`
+selects. The first job's ranks rendezvous over torch.distributed with MPI
+disabled and drive the `_pg` symbol through every check in `CHECKS`. The
+second job's ranks are an MPI world that `mpirun` starts, as a dep4 serving
+engine's workers are, and drive the MPI-session symbol (`process_group=None`,
+the call the dep4 targets make) through `MPI_SESSION_CHECKS`: every certified
+cell, eagerly and replayed from a CUDA graph. Both must exit 0.
 
 Not a pytest module, despite the `check_*` bodies. They are one fixed
 sequence inside a single 4-rank job rather than independent cases: each reads
@@ -33,19 +30,21 @@ keeps it uncollectable however pytest is pointed at this tree.
 
 The collected entry point is
 `tests/unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py`:
-it starts this job and turns its exit code into an assertion. Both halves are
-started by file path: the launcher must not import `tensorrt_llm` (that calls
-CUDA nor torch.distributed state of its own), and the
-ranks reach the catalog by absolute import, so neither needs a package.
+it starts both jobs and turns the exit code into an assertion. Both halves are
+started by file path: the launcher must not import `tensorrt_llm` -- that
+calls `MPI_Init`, and an MPI-initialized process cannot start `mpirun` -- and
+the ranks reach the catalog by absolute import, so neither needs a package.
 """
 
 import functools
 import os
 import random
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -58,12 +57,11 @@ assert torch.cuda.is_available(), "reducescatter requires CUDA devices"
 _WORKER_FLAG = "--rank-worker"
 DEADLINE_S = 1800
 
-# The wedge sub-job's budget. A pair that is going to return does so in
-# microseconds, so a rank still inside it GRACE seconds later is wedged; the
-# watchdog then ends its own process, because a rank blocked in a NCCL kernel
-# that will never complete has no other way out. CAP covers the sub-job's
-# import and communicator bring-up before the pair is issued (~50 s measured)
-# plus the driver's teardown of four contexts holding a spinning kernel.
+_MPI_WORKER_FLAG = "--mpi-session-rank-worker"
+_PID_DIR_ENV = "MODELING_V2_REDUCESCATTER_PID_DIR"
+# The MPI-session job's own deadline, enforced the same way. The jobs run one
+# after the other, so `_rank_job` grants the launcher both budgets.
+MPI_DEADLINE_S = 600
 
 HIDDEN = 2560  # DeepSeek-V3-Lite hidden size, the caller that motivates this
 
@@ -88,6 +86,7 @@ BF16_U = 2.0**-8
 
 # Bound inside the rank body, never in the launcher: importing the entry
 # pulls in tensorrt_llm, which calls MPI_Init at import, and an
+# MPI-initialized launcher could not start the MPI-session job's `mpirun`.
 reducescatter: Any = None
 entry: Any = None
 PG_BOXED: Any = None
@@ -440,6 +439,36 @@ def check_certified_cells() -> None:
             out = reducescatter(x, spec["sizes"], GROUP)
         assert out.shape == (split[RANK], *trailing), (cell.why, out.shape)
         _assert_bitwise(out, _ref(split, RANK, seed, dtype, trailing), cell.why)
+        dist.barrier()
+
+
+def check_certified_cells_replay_from_a_cuda_graph() -> None:
+    """Every cell, captured once into a CUDA graph and replayed on fresh partials.
+
+    A serving engine captures a step's collectives once and replays them with
+    new partials in the same buffers, so the captured reduce-scatter has to
+    read its input again on every replay. Each replay is checked against
+    partials written after the capture. A cell's graph is released before the
+    next cell is captured, so the largest cells never hold their buffers at once.
+    """
+    for i, cell in enumerate(entry.reducescatter.CELLS):
+        spec = cell.spec
+        rows, trailing, dtype = spec["rows_per_rank"], spec["trailing"], spec["dtype"]
+        split = [rows] * WORLD if spec["sizes"] is None else list(spec["sizes"])
+        x = _input(RANK, split, 9500 + 13 * i, dtype, trailing)
+        _warm_up_off_capture_stream(lambda: reducescatter(x, spec["sizes"], GROUP))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = reducescatter(x, spec["sizes"], GROUP)
+        for seed in (9600 + 13 * i, 9700 + 13 * i):
+            x.copy_(_input(RANK, split, seed, dtype, trailing))
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph.replay()
+            _assert_bitwise(
+                captured, _ref(split, RANK, seed, dtype, trailing), f"{cell.why}, replayed"
+            )
+        del graph, captured
         dist.barrier()
 
 
@@ -1302,6 +1331,7 @@ CHECKS = (
     # call, and every later test needs the communicator it builds.
     check_cuda_graph_captures_a_cold_first_call,
     check_certified_cells,
+    check_certified_cells_replay_from_a_cuda_graph,
     check_uniform_reduce_scatter,
     check_ragged_reduce_scatter,
     check_output_is_fresh_and_input_is_untouched,
@@ -1335,6 +1365,14 @@ CHECKS = (
     check_the_guard_refuses_every_dtype_it_cannot_sum,
     # Stays last: the raise it asserts leaves every later collective in the
     # process returning garbage, so nothing can run after it.
+)
+
+# What the MPI-session job drives. The eager cells stay first: the MPI-session
+# symbol builds its group's communicator on the group's first call, which a
+# capture cannot do, so a graph may only follow an eager call.
+MPI_SESSION_CHECKS = (
+    check_certified_cells,
+    check_certified_cells_replay_from_a_cuda_graph,
 )
 
 
@@ -1400,6 +1438,67 @@ def _run_one_rank() -> int:
     # that captured collectives into CUDA graphs measurably wedges NCCL's
     # watchdog, and these are throwaway processes the launcher owns anyway.
     sys.stdout.flush()
+    os._exit(0)
+
+
+def _run_one_mpi_session_rank() -> int:
+    """Body of one MPI rank: drive `MPI_SESSION_CHECKS` on the MPI-session
+    symbol; a failing rank exits nonzero and mpirun ends the job."""
+    global RANK, WORLD, GROUP, reducescatter, validating, entry
+    torch.cuda.set_device(int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "0")))
+
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    RANK, WORLD = comm.Get_rank(), comm.Get_size()
+    pid_dir = os.environ.get(_PID_DIR_ENV)
+    if pid_dir:
+        Path(pid_dir, f"rank{RANK}.pid").write_text(str(os.getpid()))
+    assert WORLD >= 2, f"a collective needs at least 2 ranks, got {WORLD}"
+
+    # The checks keep lockstep with torch.distributed's barrier in both jobs.
+    # Here it rides a gloo group, so the only NCCL communicator in the job is
+    # the one the MPI-session symbol builds for GROUP.
+    port = None
+    if RANK == 0:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+    port = comm.bcast(port, root=0)
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=RANK, world_size=WORLD
+    )
+
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
+
+    # `process_group=None` is the MPI-session symbol, the call the dep4 targets
+    # make. As in the `_pg` job, the partial is only the call surface.
+    reducescatter = functools.partial(entry.reducescatter, process_group=None)
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as _validating_cm
+
+    validating = _validating_cm
+    GROUP = list(range(WORLD))
+
+    for check in MPI_SESSION_CHECKS:
+        try:
+            check()
+        except BaseException:
+            import traceback
+
+            print(f"[rank {RANK}] FAILED {check.__name__} (MPI-session symbol)", flush=True)
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(13)
+    dist.barrier()
+    torch.cuda.synchronize()
+    print(f"[rank {RANK}] {len(MPI_SESSION_CHECKS)} MPI-session checks passed", flush=True)
+    sys.stdout.flush()
+    # Finalize so mpirun counts this as a clean exit, then leave without the
+    # rest of the teardown, for the same reason as the `_pg` job.
+    MPI.Finalize()
     os._exit(0)
 
 
@@ -1481,8 +1580,77 @@ def _spawn_ranks() -> None:
         raise AssertionError(f"the {world_size}-rank run failed: {failure}")
 
 
+def _standalone_env() -> Dict[str, str]:
+    """This process's environment, minus any enclosing launcher's identity.
+
+    A launching srun step or MPI job leaves its rank identity in the
+    environment (SLURM_*, PMIX_*, PMI_*, OMPI_*); a nested mpirun that inherited
+    it would join that job instead of starting its own world.
+    """
+    prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_", "I_MPI_", "HYDRA_")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(prefixes)}
+    env["TLLM_DISABLE_MPI"] = "0"
+    return env
+
+
+def _spawn_mpi_session_ranks() -> None:
+    """Start one MPI rank per claimed device under mpirun; kill the job on
+    failure or deadline."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    assert visible, (
+        "set CUDA_VISIBLE_DEVICES to the devices this run owns, "
+        "e.g. export CUDA_VISIBLE_DEVICES=0,1,2,3"
+    )
+    world_size = len([d for d in visible.split(",") if d.strip()])
+    mpirun = shutil.which("mpirun")
+    assert mpirun, "mpirun is not on PATH; the MPI-session job runs its ranks as an MPI world"
+    pid_dir = tempfile.mkdtemp(prefix="reducescatter_matrix_")
+    env = dict(_standalone_env(), **{_PID_DIR_ENV: pid_dir})
+    command = [mpirun, "--oversubscribe", "--bind-to", "none", "-n", str(world_size)]
+    if os.geteuid() == 0:
+        command.insert(1, "--allow-run-as-root")
+    command += [sys.executable, str(Path(__file__).resolve()), _MPI_WORKER_FLAG]
+    print(f"[launcher] {' '.join(command)}", flush=True)
+    job = subprocess.Popen(command, env=env, start_new_session=True)
+
+    def _kill_all() -> None:
+        for sig, grace in ((signal.SIGTERM, 15), (signal.SIGKILL, 0)):
+            try:
+                os.killpg(job.pid, sig)
+            except ProcessLookupError:
+                pass
+            try:
+                job.wait(timeout=grace or None)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        # Ranks forked by mpirun's daemon may sit in their own process groups.
+        for pid_file in Path(pid_dir).glob("rank*.pid"):
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+
+    deadline = time.monotonic() + MPI_DEADLINE_S
+    while job.poll() is None:
+        if time.monotonic() > deadline:
+            _kill_all()
+            raise AssertionError(
+                f"the {world_size}-rank MPI-session run did not finish in {MPI_DEADLINE_S}s (wedged)"
+            )
+        time.sleep(0.5)
+    shutil.rmtree(pid_dir, ignore_errors=True)
+    if job.returncode != 0:
+        raise AssertionError(
+            f"the {world_size}-rank MPI-session run failed: mpirun exited {job.returncode}"
+        )
+
+
 if __name__ == "__main__":
     if _WORKER_FLAG in sys.argv:
         sys.exit(_run_one_rank())
+    if _MPI_WORKER_FLAG in sys.argv:
+        sys.exit(_run_one_mpi_session_rank())
     _spawn_ranks()
+    _spawn_mpi_session_ranks()
     print("OK")
