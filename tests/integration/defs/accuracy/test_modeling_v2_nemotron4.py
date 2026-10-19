@@ -26,15 +26,17 @@ constants stated in it:
 * GSM8K, the accuracy anchor, with MTP off and on (``...Tp1``, ``...Dep4``,
   ``...Tp4``);
 * token identity with CUDA graphs on and off (``...Identity``, criterion A);
-* token identity with MTP on and off (``...MtpIdentity``, criterion B(1));
+* MTP on against MTP off, parting only at a near-tie (``...MtpIdentity``,
+  criterion B(1));
 * the MTP acceptance length against the checkpoint's own MTP layer
   (``...MtpAcceptance``, criterion B(2)).
 
 The legs and checks the identity and acceptance gates share are the harnesses
 beside this file: ``_nemotron4_cuda_graph_identity.py``,
 ``_nemotron4_mtp_identity.py`` and ``_nemotron4_mtp_acceptance.py``. The MTP
-layer's module accuracy (criterion B(3)) and the decode / verify invariance the
-identity gates rest on are unit tests, under
+layer's module accuracy (criterion B(3)), the decode invariance the CUDA-graph
+identity gates rest on, and the verify's measured deviation from decode, which
+the MTP gates' bands rest on, are unit tests, under
 tests/unittest/_torch/modeling_v2/models/nemotron4/.
 
 Every test here passes ``modeling_v2="require"`` to ``LLM``. TensorRT-LLM has no
@@ -396,11 +398,12 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
 
         Sampling is greedy, so a draft is accepted only where it equals the
         target's own next token: MTP on emits the target model's greedy text.
-        A verify gives each of its tokens the bits a decode step gives it, so
-        the two scores can differ only where a prefill or mixed step tips a
-        near-tie the other way. Under attention DP those steps change between
-        any two engines, MTP or not: which rank serves a request, and beside
-        which others, depends on when it arrives.
+        A verify attends through thop_attention, so its tokens sit near the
+        bits a decode step gives them rather than on them, and the two scores
+        can differ where a verify, or a prefill or mixed step, tips a near-tie
+        the other way. Under attention DP those steps change between any two
+        engines, MTP or not: which rank serves a request, and beside which
+        others, depends on when it arrives.
 
         Both legs assert accuracy against the registered reference as they
         run, and the MTP row there carries the same anchor, so MTP on is held
@@ -529,9 +532,10 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4(LlmapiAccuracyTestHarness):
 
         Sampling is greedy, so a draft is accepted only where it equals the
         target's own next token: MTP on emits the target model's greedy text.
-        A verify gives each of its tokens the bits a decode step gives it, so
-        the two scores can differ only where a prefill or mixed step, which
-        the two legs batch differently, tips a near-tie the other way.
+        A verify attends through thop_attention, so its tokens sit near the
+        bits a decode step gives them rather than on them, and the two scores
+        can differ where a verify, or a prefill or mixed step, which the two
+        legs batch differently, tips a near-tie the other way.
 
         Both legs assert accuracy against the registered reference as they
         run, and the MTP row there carries the same anchor, so MTP on is held
@@ -924,6 +928,14 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4Identity(
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpIdentity(_MtpIdentity):
     """nemotron4-nano-preview (text model) / sm_103 / tp1: MTP-Eagle on against off."""
 
+    # How far tp1's verify can move a gap between MTP off's top-1 and another of
+    # its top tokens: the drift band of tp1's verify test
+    # (test_modeling_v2_verify_invariance.py, DRIFT_GAP_BAND), which follows each
+    # fixed prompt alone for the tokens this gate generates, MTP on along MTP
+    # off's own tokens, and measured at most 0.7819 over 6132 positions; plus a
+    # quarter.
+    NEAR_TIE_BAND = 0.98
+
 
 class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
     """nemotron4-nano-preview (text model) / sm_103 / dep4: MTP-Eagle on against off, on 4 ranks.
@@ -939,7 +951,8 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
     it off. That changes only how many rows every routed MoE block gathers
     from the other ranks, and the target gives a token the same bits whatever
     those rows are: the expert window computes each row by itself, and the
-    reduce-scatter's order does not depend on the ranks' counts.
+    reduce-scatter's order does not depend on the ranks' counts. What parts
+    the legs is the verify's attention, as on tp1, by up to NEAR_TIE_BAND.
     """
 
     pytestmark = pytest.mark.skip_less_device(4)
@@ -956,6 +969,14 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
     ALONE_MAX_NUM_TOKENS = 2048
     CHUNKED_PREFILL = True
     BATCH_MAX_NUM_TOKENS = 2048
+
+    # How far dep4's verify can move a gap between MTP off's top-1 and another
+    # of its top tokens: the drift band of dep4's verify test
+    # (test_modeling_v2_dep4_verify_invariance.py, DRIFT_GAP_BAND in its job),
+    # which follows each fixed prompt alone on its rank for the tokens this gate
+    # generates, MTP on along MTP off's own tokens, and measured at most 0.7819
+    # over 6132 positions; plus a quarter.
+    NEAR_TIE_BAND = 0.98
 
     def _ranks(self, prompts) -> dict[str, int]:
         """One long prompt per rank, the short ones dealt round-robin."""
@@ -985,12 +1006,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpIdentity(_MtpIdentity):
     rank runs every request, in the steps rank 0's executor schedules, on its
     quarter of the mixers' heads and of every MLP's and routed expert's
     intermediate width, the MTP layer's included, and the ranks meet in every
-    block's all-reduce. A verify token gets its decode step's bits on every
-    rank: the all-reduce sums a token's four partials by one formula whatever
-    the step's row count, and the GDP verify reads a request's tokens 3 x 4632
-    elements apart at the draft length here, which like the decode step's 4632
-    is not a multiple of 16, so its kernel rounds as the decode kernel does. So
-    tp1's legs, checks and reports carry over unchanged.
+    block's all-reduce. Every rank forms the same logits: the all-reduce sums a
+    token's four partials by one formula whatever the step's row count, and the
+    GDP verify reads a request's tokens 3 x 4632 elements apart at the draft
+    length here, which like the decode step's 4632 is not a multiple of 16, so
+    its kernel rounds as the decode kernel does. What parts the legs is the
+    verify's attention, as on tp1, by up to NEAR_TIE_BAND. So tp1's legs, checks
+    and reports carry over unchanged.
     """
 
     pytestmark = pytest.mark.skip_less_device(4)
@@ -999,6 +1021,15 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpIdentity(_MtpIdentity):
     # 4 GPUs of one node, the mixers' heads and every MLP's and routed expert's
     # intermediate width split four ways.
     PARALLEL = dict(tensor_parallel_size=4, moe_tensor_parallel_size=4)
+
+    # How far tp4's verify can move a gap between MTP off's top-1 and another of
+    # its top tokens: the drift band of tp4's verify test
+    # (test_modeling_v2_tp4_verify_invariance.py, DRIFT_GAP_BAND in its job),
+    # which follows each fixed prompt alone for the tokens this gate generates,
+    # MTP on along MTP off's own tokens, and measured at most 1.2381 over 6132
+    # positions; plus a quarter. A rank attends with 4 of the 16 query heads, so
+    # thop_attention runs other kernels than on tp1, and the band is tp4's own.
+    NEAR_TIE_BAND = 1.55
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
@@ -1016,9 +1047,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
     # (check_goldens.py: free-running logits over the whole vocabulary, 2.0, the
     # larger of its two logit bands; the decode-step one is 1.25), because here
     # the target's MTP layer reads the target trunk's hidden states and the
-    # reference's reads its own, at prefill rows and decode rows alike.
+    # reference's reads its own, at prefill rows and decode rows alike. The trunk
+    # band gains the verify's measured term, 5.0471: with MTP on the trunk
+    # verifies through thop_attention, whose logits drift from the decode steps'
+    # by up to that much along the same tokens (test_modeling_v2_verify_invariance.py,
+    # the drift over 6132 positions of the fixed prompts).
     MTP_LOGIT_ERROR = (2.6806, 2.4847)
-    TRUNK_LOGIT_BAND = 2.0
+    TRUNK_LOGIT_BAND = 2.0 + 5.0471
 
     @skip_not_sm103
     def test_mtp2_acceptance_matches_reference(self, monkeypatch):
@@ -1061,9 +1096,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_MtpAcceptance):
     # (test_modeling_v2_dep4_mtp_layer.py; depth 1: 2.6806 and 2.619, depth 2:
     # 2.8998 and 4.5655, the gain rank 3's), plus the band on the target trunk's
     # logits against the reference's: dep4's trunk passes check_goldens_dep4.py
-    # with tp1's bands, whose free-running logits band is 2.0.
+    # with tp1's bands, whose free-running logits band is 2.0. The trunk band
+    # gains the verify's measured term, 4.5999: with MTP on the trunk verifies
+    # through thop_attention, whose logits drift from the decode steps' by up to
+    # that much along the same tokens (test_modeling_v2_dep4_verify_invariance.py,
+    # the drift over 6132 positions of the fixed prompts).
     MTP_LOGIT_ERROR = (2.6806, 4.5655)
-    TRUNK_LOGIT_BAND = 2.0
+    TRUNK_LOGIT_BAND = 2.0 + 4.5999
 
     def _ranks(self, prompts) -> dict[str, int]:
         """One long prompt per rank, the short ones dealt round-robin.
@@ -1157,9 +1196,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpAcceptance(_MtpAcceptance):
     # on the target trunk's logits against the reference's: tp4's trunk passes
     # check_goldens_tp4.py at tp1's free-running logits band, 2.0, plus its
     # measured tensor-parallel term, 1.1922 (tp4 against tp1 on the same
-    # prompts, largest on an ~8K prompt).
+    # prompts, largest on an ~8K prompt), plus the verify's measured term,
+    # 3.4226: with MTP on the trunk verifies through thop_attention, whose logits
+    # drift from the decode steps' by up to that much along the same tokens
+    # (test_modeling_v2_tp4_verify_invariance.py, the drift over 6132 positions
+    # of the fixed prompts).
     MTP_LOGIT_ERROR = (2.7225, 2.4717)
-    TRUNK_LOGIT_BAND = 3.1922
+    TRUNK_LOGIT_BAND = 3.1922 + 3.4226
 
     def _engine_al(
         self, stats: list[dict], walks: dict[str, list[tuple[int, int]]], ranks: dict[str, int]

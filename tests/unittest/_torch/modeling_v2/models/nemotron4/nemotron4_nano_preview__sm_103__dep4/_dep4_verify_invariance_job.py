@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The 4-rank job behind `test_modeling_v2_dep4_verify_invariance.py`: the dep4 MTP verify step,
-run on every rank of one node on real weights and real cache state, and compared bit for bit with
-the MTP-off decode steps of the same tokens.
+run on every rank of one node on real weights and real cache state, and compared with the MTP-off
+decode steps of the same tokens.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _dep4_verify_invariance_job.py --out <json> [--checkpoint <dir>]
 
@@ -36,18 +36,29 @@ drafter would propose. Every run starts from the same state: each GDP slot is re
 snapshot, and a row's KV appends land at the positions its own attention reads only after them.
 
 The runs (`STEPS`), all four ranks in lockstep, each rank's probes compared on that rank: its
-verify over [t0, t1, t2] inside eager verify batches of every size while the other ranks idle,
-verify, decode or prefill a 2048-token chunk; and inside padded CUDA-graph verify batches with the
-other ranks idle or verifying. Per probe and token j, bitwise: the fp32 logits, the state the verify
-stored for token j in the per-position buffers of all 32 GDP layers against the slot after decode
-step j, and the K/V at the token's position in all 8 attention layers. A verify writes no slot.
+verify over [t0, t1, t2] alone (the guards on) and inside eager verify batches of every size while
+the other ranks idle, verify, decode or prefill a 2048-token chunk; and inside padded CUDA-graph
+verify batches with the other ranks idle or verifying. Every entry of a verify step but one gives
+token j the bits of its decode step -- the GEMMs, the routed MoE's collectives, the GDP and conv
+verify entries -- but its attention runs ``thop_attention``'s generation kernels where decode runs
+``invariant_gen_attention``, so per probe and token j, as tp1's test compares them: bitwise, the
+state the verify stored for token j in the GDP layers before the first attention layer and the K/V
+it appended in that layer; within the bands (`LOGIT_BAND` and the rest), its fp32 logits and its
+state and K/V in every later layer; reported, whether its logits move from its verify alone. A
+verify writes no slot.
 
 Beside them: the routed MoE combine's order over every split the runs make (`combine_layouts`);
 the worker's commit (``update_mamba_states``) after a padded graph verify, on every rank and with
 one rank idle; a request at the length limit, whose verify reaches past ``max_seq_len`` by the
 drafts; a rival -- the verify's ``invariant_mm`` GEMMs put back on ``cublas_mm`` -- that must move
-some token; and the MTP layer's draft step through both targets and ``MTPLayer``. Rank 0 writes
-every rank's records to `--out` as JSON.
+some token's bits before attention; a verify from a state one token too far, which must leave the
+bands; the drift, MTP on along MTP off's own greedy tokens for as many tokens as dep4's MTP
+identity gate generates, each probe alone on its rank in the graph of one, which that gate's
+near-tie band and the acceptance gate's verify term rest on; and the MTP layer's draft step through
+both targets and ``MTPLayer``. The CUDA graphs are captured as the engine captures them: one eager
+forward at every size first, which grows the attention workspace all of them share to what the
+largest call needs, then the captures, which resize nothing. Rank 0 writes every rank's records to
+`--out` as JSON.
 
 Not a pytest module: the ranks run one fixed sequence of collectives in lockstep, and neither this
 file's name nor its functions match pytest's collection patterns. The launcher must not import
@@ -58,6 +69,7 @@ everything that does is imported inside the rank body.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -142,6 +154,7 @@ GRAPH_BATCH_SIZES = (1, 2, 3, 5, 7, 8, 16, 64, 100, 250, 256)
 """Graph verify batches on one rank while the others idle; 3, 5, 7, 100 and 250 leave padding."""
 
 STEPS: tuple[Step, ...] = (
+    *(Step("eager alone, others idle", _one_rank(1, r), False) for r in range(WORLD_SIZE)),
     *(
         Step("eager, others idle", _one_rank(b, r), False)
         for r in range(WORLD_SIZE)
@@ -246,6 +259,39 @@ COMMIT_ROWS = 15
 of 16."""
 COMBINE_WIDTH = 768
 """The latent width the reduce-scatter combines."""
+RIVAL_ROWS = 64
+"""Verify rows per rank in the rival's eager batch: 192 GEMM rows, where cuBLAS splits the dense
+MLPs of layers 1 and 3 otherwise than at one row."""
+SHORT_TOKENS, LONG_TOKENS = 256, 1024
+"""Tokens dep4's MTP identity gate generates per prompt: the first from the prefill, the rest from
+verify steps. The drift follows each probe for the verifies of that many tokens."""
+TOP = 8
+"""The decode reference's top tokens whose gap to its top-1 a verify must keep."""
+WORST_KEYS = ("logit", "gap", "ssm", "conv", "kv")
+"""The compared quantities a run records the worst case of."""
+
+# The bands, derived from measurement as tp1's verify test derives its own (its comment says why
+# a verify token differs from its decode step at all). Measured over every run below, every rank:
+# |logit diff| 0.4539 for each probe's verify alone and 1.012 in eager and graph batches beside
+# idle, verifying, decoding or prefilling ranks; top-gap shift 0.1632 alone, 0.3831 in batches;
+# the later layers' recurrent state, conv state and K/V 0.0495 / 0.08696 / 0.07989 of max
+# |decode|. Each band is its worst case plus a quarter, rounded up.
+LOGIT_BAND = 1.27
+"""max |verify logit - decode logit| over the vocabulary, fp32."""
+GAP_BAND = 0.48
+"""The largest change, verify against decode, of the gap between the decode step's top-1 and any of
+its top `TOP` tokens."""
+SSM_BAND = 0.062
+CONV_BAND = 0.11
+KV_BAND = 0.1
+"""max |verify - decode| / max |decode| per tensor, over the GDP layers after the first attention
+layer (recurrent state fp32, conv state bf16) and the attention layers after it (K/V)."""
+DRIFT_LOGIT_BAND = 5.75
+DRIFT_GAP_BAND = 0.98
+"""The same two quantities over the drift's 6132 matched positions: worst cases 4.5999 (|logit
+diff|, on the 2-shot chat `clips`) and 0.7819 (top-gap shift, on `haiku`), plus a quarter, rounded
+up. dep4's MTP identity gate's near-tie band is DRIFT_GAP_BAND; its MTP acceptance gate's verify
+term is the measured |logit diff|."""
 
 
 # ----------------------------------------------------------------------------------------------
@@ -334,13 +380,20 @@ def spawn_ranks(out: str, checkpoint: str) -> None:
 
 @dataclass
 class Request:
-    """One sequence on one rank: its prompt, and the tokens its verify step feeds -- the prompt's
-    greedy next token t0, then two more."""
+    """One sequence on one rank: its prompt, the tokens its verify step feeds -- the prompt's
+    greedy next token t0, then two more -- and how many tokens dep4's MTP identity gate generates
+    for it."""
 
     rid: int
     name: str
     prompt: tuple
     tokens: tuple = ()
+    generated: int = SHORT_TOKENS
+
+    @property
+    def drift_steps(self) -> int:
+        """The verifies of the drift: every generated token but the prefill's, three a step."""
+        return (self.generated - 1) // TOKENS
 
 
 @dataclass
@@ -410,7 +463,15 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
 
     group = list(range(WORLD_SIZE))
     records: dict[str, list] = dict(
-        combine=[], reference=[], runs=[], commit=[], limit=[], rivals=[], draft=[]
+        combine=[],
+        reference=[],
+        runs=[],
+        commit=[],
+        limit=[],
+        rivals=[],
+        teeth=[],
+        drift=[],
+        draft=[],
     )
 
     # ------------------------------------------------------------------------------------------
@@ -577,17 +638,26 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
     md.mamba_metadata_cls = model.mamba_metadata_cls
     assert md.mamba_metadata_cls.max_draft_len == DRAFT
     gdp_layers, attention_layers = core.gdp_layers, core.attention_layers
+    # Everything a token computes in layers below the first attention layer is upstream of
+    # attention's output.
+    upstream = min(attention_layers)
 
     # The requests: this rank's probes (the tp1 test's twelve, dealt round-robin), its fillers,
     # its loader (a 2048-token prompt it prefills beside other ranks' verify steps) and a request
     # at the length limit, its history zeroed rather than prefilled.
     prompts = P.prompt_set(tokenizer)
     by_name = {p.name: p for p in prompts}
-    specs = [(p.name, p.token_ids) for p in prompts]
-    specs.append(("gpqa_explain[:511]", by_name["gpqa_explain"].token_ids[:511]))
-    specs.append(("gsm8k_multiturn[:4096]", by_name["gsm8k_multiturn"].token_ids[:4096]))
+    specs = [(p.name, p.token_ids, LONG_TOKENS if p.long else SHORT_TOKENS) for p in prompts]
+    specs.append(("gpqa_explain[:511]", by_name["gpqa_explain"].token_ids[:511], SHORT_TOKENS))
+    specs.append(
+        ("gsm8k_multiturn[:4096]", by_name["gsm8k_multiturn"].token_ids[:4096], SHORT_TOKENS)
+    )
     assert len(specs) == 3 * WORLD_SIZE, len(specs)
-    probes = [Request(0, n, tuple(t)) for k, (n, t) in enumerate(specs) if k % WORLD_SIZE == rank]
+    probes = [
+        Request(0, n, tuple(t), generated=g)
+        for k, (n, t, g) in enumerate(specs)
+        if k % WORLD_SIZE == rank
+    ]
     sources = [
         by_name[n].token_ids
         for n in ("gsm8k_fewshot", "gsm8k_multiturn", "news_digest", "gpqa_explain")
@@ -607,8 +677,10 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
     for rid, r in enumerate(resident, start=1):
         r.rid = rid
     for r in resident:
-        # The prompt and the step's three tokens; the manager adds the drafter's extra KV token.
-        added = manager.add_dummy_requests([r.rid], token_nums=[len(r.prompt) + TOKENS])
+        # The prompt and the step's three tokens, a probe's drift besides; the manager adds the
+        # drafter's extra KV token.
+        drift = TOKENS * r.drift_steps if r in probes else 0
+        added = manager.add_dummy_requests([r.rid], token_nums=[len(r.prompt) + drift + TOKENS])
         assert added, f"rank {rank}: no room for {r.name} ({len(r.prompt)} tokens)"
     # The executor's attention-DP dummy for an idle rank, and the runner's MTP padding dummy: each a
     # generation request carrying the step's drafts over a history of as many tokens.
@@ -790,27 +862,73 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             kv=torch.stack([kv_at(r, i, j) for i in attention_layers]),
         )
 
-    def differences(got: dict, ref: dict) -> list:
-        out = []
-        if not equal(got["logits"], ref["logits"]):
-            diff = (got["logits"] - ref["logits"]).abs()
-            out.append(
-                f"logits: {int((diff > 0).sum())} of {diff.numel()} differ, max |diff| "
-                f"{float(diff.max()):.3e}, argmax {int(got['logits'].argmax())} vs "
-                f"{int(ref['logits'].argmax())}"
-            )
+    def relative(got: torch.Tensor, ref: torch.Tensor) -> float:
+        """max |got - ref| / max |ref|."""
+        ref = ref.float()
+        return float((got.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-30))
+
+    def logit_deviation(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
+        """`(max |got - ref|, the largest change of a gap between ref's top-1 and one of its top
+        TOP)`: the second bounds how far `got` can tip a choice `ref` made among its top tokens."""
+        diff = got - ref
+        top = ref.topk(TOP).indices
+        shift = diff[top] - diff[top[0]]
+        return float(diff.abs().max()), float(shift.abs().max())
+
+    def margin_of(logits: torch.Tensor) -> float:
+        """The top-1 minus top-2 logit: how close a greedy choice is to a tie."""
+        two = logits.topk(2).values
+        return float(two[0] - two[1])
+
+    def deviation(got: dict, ref: dict) -> dict:
+        """A verify token against its decode step: bitwise the GDP layers before the first
+        attention layer and the first attention layer's K/V (`exact` lists what differs), by
+        deviation everything after."""
+        exact = []
         for name in ("ssm", "conv"):
             bad = [
-                layer for layer, a, b in zip(gdp_layers, got[name], ref[name]) if not equal(a, b)
+                layer
+                for layer, a, b in zip(gdp_layers, got[name], ref[name])
+                if layer < upstream and not equal(a, b)
             ]
             if bad:
-                out.append(f"{name} state differs in GDP layers {bad}")
-        bad = [
-            layer for layer, a, b in zip(attention_layers, got["kv"], ref["kv"]) if not equal(a, b)
-        ]
-        if bad:
-            out.append(f"appended K/V differs in attention layers {bad}")
+                exact.append(f"{name} state differs bitwise in GDP layers {bad}, before attention")
+        if not equal(got["kv"][0], ref["kv"][0]):
+            exact.append("the K/V appended in the first attention layer differs bitwise")
+        later = [k for k, layer in enumerate(gdp_layers) if layer > upstream]
+        logit, gap = logit_deviation(got["logits"], ref["logits"])
+        return dict(
+            exact=exact,
+            logit=logit,
+            gap=gap,
+            ssm=max(relative(got["ssm"][k], ref["ssm"][k]) for k in later),
+            conv=max(relative(got["conv"][k], ref["conv"][k]) for k in later),
+            kv=max(relative(a, b) for a, b in zip(got["kv"][1:], ref["kv"][1:])),
+            flip=int(got["logits"].argmax()) != int(ref["logits"].argmax()),
+            margin=margin_of(ref["logits"]),
+        )
+
+    def outside(d: dict) -> list:
+        """What of a deviation lies outside the bands."""
+        out = list(d["exact"])
+        for name, key, band in (
+            ("logits", "logit", LOGIT_BAND),
+            ("top-gap shift", "gap", GAP_BAND),
+            ("recurrent state", "ssm", SSM_BAND),
+            ("conv state", "conv", CONV_BAND),
+            ("K/V", "kv", KV_BAND),
+        ):
+            if d[key] > band:
+                out.append(f"{name} {d[key]:.4g} outside its band {band:.4g}")
         return out
+
+    def worst(deviations: list) -> dict:
+        """The worst case of each compared quantity, for the records."""
+        if not deviations:
+            return {}
+        return {key: max(d[key] for d in deviations) for key in WORST_KEYS} | {
+            "flip_margins": [d["margin"] for d in deviations if d["flip"]]
+        }
 
     graphs: dict[int, tuple] = {}
     graph_pool = torch.cuda.graph_pool_handle()
@@ -838,18 +956,30 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
         fill(md, [], [], TOKENS, counts, adp_dummy=True)
         return trunk(md, verify_ids([], 1))[0]
 
-    def run_graph(run: Run) -> torch.Tensor:
-        """One verify step replayed in the captured graph of `run.graph_size`, from the snapshot:
-        this rank's rows (or the attention-DP dummy) padded with the padding dummy's rows; the
-        real rows' logits."""
-        size = run.graph_size
-        idle = not run.rows
-        padding = size - len(run.rows) - int(idle)
-        counts = [size * TOKENS] * WORLD_SIZE
-        if size not in graphs:
+    workspace = {}
+
+    def capture_graphs() -> None:
+        """Capture the verify step at every size of GRAPH_SIZES on every rank, in lockstep, as
+        the runner does: first one eager forward on every size's own CUDA-graph metadata (draft
+        length 2), which grows the attention workspace all of them share to what the largest call
+        needs -- thop_attention resizes it in place when a call needs more -- then at each size
+        two warmup forwards and the capture, which resize nothing. A resize after a capture would
+        move the workspace under the graph, which keeps its old address."""
+        rows = probes + fillers
+        metadata = {}
+        for size in sorted(GRAPH_SIZES, reverse=True):
             gmd = md.create_cuda_graph_metadata(size, False, DRAFT, get_memory_buffers())
-            fill(gmd, [], run.rows, TOKENS, counts, adp_dummy=idle, padding=padding)
-            static_ids[: size * TOKENS].copy_(verify_ids(run.rows, int(idle) + padding))
+            fill(gmd, [], rows[:size], TOKENS, [size * TOKENS] * WORLD_SIZE)
+            static_ids[: size * TOKENS].copy_(verify_ids(rows[:size], 0))
+            trunk(gmd, static_ids[: size * TOKENS])
+            metadata[size] = gmd
+        torch.cuda.synchronize()
+        comm.Barrier()
+        workspace["address"] = metadata[max(GRAPH_SIZES)].cuda_graph_workspace.data_ptr()
+        for size in GRAPH_SIZES:
+            gmd = metadata[size]
+            fill(gmd, [], rows[:size], TOKENS, [size * TOKENS] * WORLD_SIZE)
+            static_ids[: size * TOKENS].copy_(verify_ids(rows[:size], 0))
             ids = static_ids[: size * TOKENS]
             for _ in range(2):
                 trunk(gmd, ids)
@@ -861,12 +991,43 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             torch.cuda.synchronize()
             comm.Barrier()
             graphs[size] = (gmd, graph, out)
-        gmd, graph, out = graphs[size]
+        assert gmd.cuda_graph_workspace.data_ptr() == workspace["address"], (
+            "a capture resized the attention workspace"
+        )
         restore()
-        fill(gmd, [], run.rows, TOKENS, counts, adp_dummy=idle, padding=padding)
-        static_ids[: size * TOKENS].copy_(verify_ids(run.rows, int(idle) + padding))
+
+    def run_graph(run: Run, ids=None, cached=None, from_snapshot: bool = True) -> torch.Tensor:
+        """One verify step replayed in the captured graph of `run.graph_size`: this rank's rows
+        (or the attention-DP dummy) padded with the padding dummy's rows; the real rows' logits.
+        Each row feeds its three tokens over its prompt from the snapshot, or `ids` over `cached`
+        tokens from the slots as they are when `from_snapshot` is off."""
+        size = run.graph_size
+        idle = not run.rows
+        padding = size - len(run.rows) - int(idle)
+        counts = [size * TOKENS] * WORLD_SIZE
+        gmd, graph, out = graphs[size]
+        assert gmd.cuda_graph_workspace.data_ptr() == workspace["address"], (
+            "the attention workspace moved under the captured graphs"
+        )
+        if from_snapshot:
+            restore()
+        fill(gmd, [], run.rows, TOKENS, counts, cached=cached, adp_dummy=idle, padding=padding)
+        if ids is None:
+            ids = verify_ids(run.rows, int(idle) + padding)
+        else:
+            ids = torch.cat([ids, noise(int(idle) * TOKENS + padding * TOKENS)])
+        static_ids[: size * TOKENS].copy_(ids)
         graph.replay()
         return out[: len(run.rows) * TOKENS]
+
+    def commit_rows(meta, accepted: list) -> None:
+        """The worker's commit after a verify step: `update_mamba_states` with the engine's own
+        slots, placeholder rows included, each row's accepted count (its last token's, 1 to 3)."""
+        manager.update_mamba_states(
+            attn_metadata=meta,
+            num_accepted_tokens=torch.tensor(accepted, dtype=torch.int32, device="cuda"),
+            state_indices=meta.mamba_metadata.state_indices,
+        )
 
     def execute(run: Run, counts: list) -> torch.Tensor:
         return run_graph(run) if run.graph_size else run_eager(run, counts)
@@ -967,6 +1128,8 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
         for r in fillers:
             r.tokens = r.tokens + tuple(torch.randint(0, vocab, (DRAFT,), generator=g).tolist())
         loader.tokens = (0,)
+        capture_graphs()
+    say(f"graphs captured at {sorted(graphs)} on every rank, after a warmup at every size")
     for r in probes:
         steps = reference[r.rid]
         records["reference"].append(
@@ -991,21 +1154,35 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
         )
     say(f"reference: {len(probes)} probes' three decode steps alone on every rank")
 
+    alone = {}
+
     def run_and_compare(run: Run, counts: list, ref: dict, what: str) -> dict:
-        """Run `run`, compare its probes' tokens with `ref`, and list the slots it wrote that its
+        """Run `run`, compare its probes' tokens with `ref` (`deviation`), report how many of its
+        probes' verify logits move from their verify alone, and list the slots it wrote that its
         kind does not allow: a verify writes none, a decode only its rows', a prefill only the
-        loader's, the attention-DP dummy none."""
+        loader's, the attention-DP dummy none. A probe's verify alone (eager, the other ranks
+        idle) is the first verify of it a run makes alone."""
         logits = execute(run, counts)
-        diffs, differing = [], 0
+        failures, deviations = [], []
         for pos in run.probes:
             r = run.rows[pos]
-            found = [
-                f"token {j}: {d}"
-                for j in range(TOKENS)
-                for d in differences(verify_token(r, pos, j, logits), ref[r.rid][j])
-            ]
-            differing += bool(found)
-            diffs += [f"{what}, rank {rank}, {r.name} at row {pos}: {d}" for d in found]
+            for j in range(TOKENS):
+                d = deviation(verify_token(r, pos, j, logits), ref[r.rid][j])
+                deviations.append(d)
+                failures += [
+                    f"{what}, rank {rank}, {r.name} at row {pos}, token {j}: {f}"
+                    for f in outside(d)
+                ]
+        moved, moved_logit = 0, 0.0
+        if run.kind == "verify":
+            for pos in run.probes:
+                r = run.rows[pos]
+                mine = logits[pos * TOKENS : (pos + 1) * TOKENS]
+                if len(run.rows) == 1 and not run.graph_size and r.rid not in alone:
+                    alone[r.rid] = mine.clone()
+                elif r.rid in alone and not equal(mine, alone[r.rid]):
+                    moved += 1
+                    moved_logit = max(moved_logit, float((mine - alone[r.rid]).abs().max()))
         allowed = set()
         if run.kind == "decode":
             allowed = {slot[r.rid] for r in run.rows}
@@ -1013,16 +1190,30 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             allowed = {slot[loader.rid]}
         return dict(
             compared=len(run.probes),
-            differing=differing,
-            diffs=diffs,
+            failures=failures,
+            worst=worst(deviations),
+            moved=moved,
+            moved_logit=moved_logit,
             illegal_writes=sorted(changed_slots() - allowed),
         )
 
-    # --- every step ---
+    # --- every step; a probe's verify alone runs first, with every entry's guard on ---
     with torch.inference_mode():
         for step in STEPS:
             for counts, run in expand(step):
-                result = run_and_compare(run, counts, reference, step.name)
+                guards = (
+                    validating(
+                        M.thop_attention,
+                        M.invariant_mm,
+                        M.cublas_mm,
+                        M.gdp_verify,
+                        M.causal_conv1d_verify,
+                    )
+                    if step.group == "eager alone, others idle"
+                    else contextlib.nullcontext()
+                )
+                with guards:
+                    result = run_and_compare(run, counts, reference, step.name)
                 records["runs"].append(
                     dict(
                         step=step.name,
@@ -1041,37 +1232,49 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
     def commit(idle: bool, accepted: list) -> dict:
         """A graph verify of this rank's commit rows (or, `idle`, the attention-DP dummy) padded to
         16, then the commit with the engine's own slots and the accepted counts; each probe's slot
-        must hold the state its decode steps reach over its accepted tokens, and only the step's
-        rows' engine slots may change."""
+        must hold exactly the state the verify stored for its last accepted token -- its decode
+        steps' bits before the first attention layer, within the state bands after it -- and only
+        the step's rows' engine slots may change."""
         rows = [] if idle else (probes + fillers)[:COMMIT_ROWS]
         run = Run(step="commit", group="commit", graph_size=16, kind="idle" if idle else "verify")
         run.rows = rows
         execute(run, [16 * TOKENS] * WORLD_SIZE)
         gmd = graphs[16][0]
         num_rows = 16
-        counts = torch.tensor(
-            accepted[: len(rows)] + [1] * (num_rows - len(rows)), dtype=torch.int32, device="cuda"
-        )
-        manager.update_mamba_states(
-            attn_metadata=gmd,
-            num_accepted_tokens=counts,
-            state_indices=gmd.mamba_metadata.state_indices,
-        )
+        stored = {
+            r.rid: (
+                [manager.get_intermediate_ssm_states(i)[row, n - 1].clone() for i in gdp_layers],
+                [manager.get_intermediate_conv_states(i)[row, n - 1].clone() for i in gdp_layers],
+            )
+            for row, (r, n) in enumerate(zip(probes if not idle else [], accepted))
+        }
+        commit_rows(gmd, accepted[: len(rows)] + [1] * (num_rows - len(rows)))
         torch.cuda.synchronize()
         engine_slots = set(gmd.mamba_metadata.state_indices[:num_rows].tolist())
         written = changed_slots()
-        failures = []
+        failures, ssm_dev, conv_dev = [], 0.0, 0.0
         for r, n in zip(probes if not idle else [], accepted):
             s, ref = slot[r.rid], reference[r.rid][n - 1]
             for k, layer in enumerate(gdp_layers):
-                if not equal(manager.get_ssm_states(layer)[s], ref["ssm"][k]):
+                ssm, conv = manager.get_ssm_states(layer)[s], manager.get_conv_states(layer)[s]
+                if not (equal(ssm, stored[r.rid][0][k]) and equal(conv, stored[r.rid][1][k])):
                     failures.append(
-                        f"rank {rank} {r.name}, {n} accepted: ssm differs, layer {layer}"
+                        f"rank {rank} {r.name}, {n} accepted: the slot is not the stored state, "
+                        f"layer {layer}"
                     )
-                if not equal(manager.get_conv_states(layer)[s], ref["conv"][k]):
-                    failures.append(
-                        f"rank {rank} {r.name}, {n} accepted: conv differs, layer {layer}"
-                    )
+                if layer < upstream:
+                    if not (equal(ssm, ref["ssm"][k]) and equal(conv, ref["conv"][k])):
+                        failures.append(
+                            f"rank {rank} {r.name}, {n} accepted: differs from decode bitwise, "
+                            f"layer {layer}"
+                        )
+                else:
+                    ssm_dev = max(ssm_dev, relative(ssm, ref["ssm"][k]))
+                    conv_dev = max(conv_dev, relative(conv, ref["conv"][k]))
+        if ssm_dev > SSM_BAND or conv_dev > CONV_BAND:
+            failures.append(
+                f"rank {rank}: committed state {ssm_dev:.4g} / {conv_dev:.4g} outside the bands"
+            )
         restore()
         return dict(
             rank=rank,
@@ -1079,6 +1282,8 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             rows=len(rows),
             accepted=accepted[: len(probes)] if not idle else [],
             failures=failures,
+            ssm=ssm_dev,
+            conv=conv_dev,
             outside=sorted(written - engine_slots),
             real_written=sorted(written & {slot[r.rid] for r in rows}),
         )
@@ -1106,27 +1311,24 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
         restore()
         reference[limit.rid] = steps
         calls = []
-        original = M.invariant_gen_attention
+        original = M.thop_attention
 
         def recorded(**kwargs):
             calls.append(dict(kwargs))
             return original(**kwargs)
 
-        M.invariant_gen_attention = recorded
+        M.thop_attention = recorded
         try:
             with validating(original):
                 run = Run(step="limit", group="limit", graph_size=None, kind="verify")
                 run.rows, run.probes = [limit], [0]
-                alone = run_and_compare(run, [TOKENS] * WORLD_SIZE, reference, "alone at the limit")
+                at_limit = run_and_compare(
+                    run, [TOKENS] * WORLD_SIZE, reference, "alone at the limit"
+                )
         finally:
-            M.invariant_gen_attention = original
+            M.thop_attention = original
         longest = int(calls[0]["sequence_length"][0])
-        bound = calls[0]["max_seq_len"]
-        refused = False
-        try:
-            original.is_valid(**dict(calls[0], max_seq_len=MAX_SEQ_LEN))
-        except AssertionError as exc:
-            refused = "exceeds max_seq_len" in str(exc)
+        bound, window = calls[0]["max_seq_len"], calls[0]["attention_window_size"]
         run = Run(step="limit graph", group="limit", graph_size=4, kind="verify")
         run.rows, run.probes = [limit, probes[0], probes[1]], [0, 1, 2]
         in_graph = run_and_compare(
@@ -1138,13 +1340,13 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                 rank=rank,
                 longest=longest,
                 bound=bound,
-                refused_at_bare_limit=refused,
+                window=window,
                 finite=all(bool(torch.isfinite(t["logits"]).all()) for t in steps),
-                diffs=alone["diffs"] + in_graph["diffs"],
-                compared=alone["compared"] + in_graph["compared"],
+                failures=at_limit["failures"] + in_graph["failures"],
+                compared=at_limit["compared"] + in_graph["compared"],
             )
         )
-    say(f"limit: lengths up to {longest}, max_seq_len {bound} (net {MAX_SEQ_LEN})")
+    say(f"limit: lengths up to {longest}, max_seq_len {bound}, window {window} (net {MAX_SEQ_LEN})")
 
     # --- the rival: the verify's invariant_mm GEMMs put back on cublas_mm ---
     def replaced(x, weight, out_dtype=None):
@@ -1154,25 +1356,145 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
     M.invariant_mm = replaced
     try:
         with torch.inference_mode():
-            differ, compared = [], 0
+            # The rival's own decode steps of every rank's probes, each alone on its rank.
+            rival_ref = {}
             for owner in range(WORLD_SIZE):
-                for k in range(RIVAL_PROBES):
+                for k in range(len(probes)):
                     r = probes[k] if rank == owner else None
                     rival_steps, _ = reference_steps(owner, r, extend=False)
-                    run = Run(step="rival", group="rival", graph_size=None)
                     if rank == owner:
-                        run.kind, run.rows, run.probes = "verify", [r], [0]
-                    result = run_and_compare(
-                        run, [TOKENS] * WORLD_SIZE, {r.rid: rival_steps} if r else {}, "rival"
-                    )
-                    compared += result["compared"] * TOKENS
-                    differ += result["diffs"]
+                        rival_ref[r.rid] = rival_steps
+            # Every rank verifies its probes inside one eager batch of RIVAL_ROWS rows.
+            ((rows, positions),) = batches_of(RIVAL_ROWS)
+            run = Run(step="rival", group="rival", graph_size=None, kind="verify")
+            run.rows, run.probes = rows, positions
+            logits = execute(run, [RIVAL_ROWS * TOKENS] * WORLD_SIZE)
+            differ, compared = [], 0
+            for pos in positions:
+                r = rows[pos]
+                for j in range(TOKENS):
+                    compared += 1
+                    exact = deviation(verify_token(r, pos, j, logits), rival_ref[r.rid][j])["exact"]
+                    differ += [f"rank {rank}, {r.name} at row {pos}: token {j}: {e}" for e in exact]
+            restore()
             records["rivals"].append(
                 dict(rival="cublas_mm", rank=rank, compared=compared, differ=differ)
             )
     finally:
         M.invariant_mm = saved_mm
     say("rival cublas_mm done")
+
+    # --- the bands' teeth: a verify from the state one token too far, each probe alone ---
+    with torch.inference_mode():
+        smallest, smallest_gap, lines = float("inf"), float("inf"), []
+        for owner in range(WORLD_SIZE):
+            for k in range(len(probes)):
+                restore()
+                if rank == owner:
+                    r = probes[k]
+                    after_t0 = reference[r.rid][0]
+                    for i, layer in enumerate(gdp_layers):
+                        manager.get_ssm_states(layer)[slot[r.rid]] = after_t0["ssm"][i]
+                        manager.get_conv_states(layer)[slot[r.rid]] = after_t0["conv"][i]
+                    fill(md, [], [r], TOKENS, [TOKENS] * WORLD_SIZE)
+                    logits, _ = trunk(md, verify_ids([r], 0))
+                    moved = [
+                        logit_deviation(logits[j], reference[r.rid][j]["logits"])
+                        for j in range(TOKENS)
+                    ]
+                    worst_logit = max(m[0] for m in moved)
+                    worst_gap = max(m[1] for m in moved)
+                    smallest = min(smallest, worst_logit)
+                    smallest_gap = min(smallest_gap, worst_gap)
+                    lines.append(
+                        f"rank {rank} {r.name}: one token off moves the logits by up to "
+                        f"{worst_logit:.3f}, a top gap by up to {worst_gap:.3f}"
+                    )
+                else:
+                    fill(md, [], [], TOKENS, [TOKENS] * WORLD_SIZE, adp_dummy=True)
+                    trunk(md, verify_ids([], 1))
+        restore()
+        records["teeth"].append(dict(rank=rank, logit=smallest, gap=smallest_gap, lines=lines))
+    say("teeth: one token off, every probe alone")
+
+    # --- the drift: MTP on along MTP off's own greedy tokens, each probe alone on its rank ---
+    with torch.inference_mode():
+        # MTP off: every rank decodes its probes together, one token a step (decode rows depend
+        # neither on the batch nor on the other ranks), each until its own horizon.
+        restore()
+        horizon = comm.allreduce(max(r.drift_steps for r in probes) * TOKENS, op=MPI.MAX)
+        drift_tokens = {r.rid: [r.tokens[0]] for r in probes}
+        decoded = {r.rid: [] for r in probes}
+        for n in range(horizon):
+            rows = [r for r in probes if n < r.drift_steps * TOKENS]
+            counts = comm.allgather(max(len(rows), 1))
+            if rows:
+                fill(md, [], rows, 1, counts, cached=[len(r.prompt) + n for r in rows])
+                logits, _ = trunk(md, as_ids([drift_tokens[r.rid][n] for r in rows]))
+                for r, row in zip(rows, logits):
+                    decoded[r.rid].append(row.clone())
+                    drift_tokens[r.rid].append(int(row.argmax()))
+            else:
+                fill(md, [], [], 1, counts, adp_dummy=True)
+                trunk(md, noise(1))
+        failures = []
+        for r in probes:
+            if tuple(drift_tokens[r.rid][:TOKENS]) != r.tokens:
+                failures.append(f"rank {rank} {r.name}: the decode leg's first tokens differ")
+            for j in range(TOKENS):
+                if not equal(decoded[r.rid][j], reference[r.rid][j]["logits"]):
+                    failures.append(f"rank {rank} {r.name}: the decode leg's token {j} differs")
+        # MTP on: probe k of every rank at once, each alone on its rank in the graph of one (a rank
+        # past its probe's horizon runs the attention-DP dummy), every draft accepted and
+        # committed.
+        restore()
+        worst_logit, worst_gap, flips, lines = 0.0, 0.0, [], []
+        for k in range(len(probes)):
+            r = probes[k]
+            steps_k = comm.allreduce(r.drift_steps, op=MPI.MAX)
+            r_logit, r_gap = 0.0, 0.0
+            for s in range(steps_k):
+                n = s * TOKENS
+                run = Run(step="drift", group="drift", graph_size=1)
+                if s < r.drift_steps:
+                    run.kind, run.rows = "verify", [r]
+                    ids = as_ids(drift_tokens[r.rid][n : n + TOKENS])
+                    logits = run_graph(run, ids, cached=[len(r.prompt) + n], from_snapshot=False)
+                    commit_rows(graphs[1][0], [TOKENS])
+                    for j in range(TOKENS):
+                        ref = decoded[r.rid][n + j]
+                        logit, gap = logit_deviation(logits[j], ref)
+                        r_logit, r_gap = max(r_logit, logit), max(r_gap, gap)
+                        if int(logits[j].argmax()) != int(ref.argmax()):
+                            flips.append((r.name, n + j, margin_of(ref)))
+                else:
+                    run_graph(run, from_snapshot=False)
+            worst_logit, worst_gap = max(worst_logit, r_logit), max(worst_gap, r_gap)
+            lines.append(
+                f"rank {rank} {r.name}: {r.drift_steps * TOKENS} tokens, {r_logit:.4f} / "
+                f"{r_gap:.4f}"
+            )
+        restore()
+        del decoded
+        if worst_logit > DRIFT_LOGIT_BAND or worst_gap > DRIFT_GAP_BAND:
+            failures.append(
+                f"rank {rank}: drift {worst_logit:.4f} / {worst_gap:.4f} outside the drift bands"
+            )
+        wide = [f for f in flips if f[2] > DRIFT_GAP_BAND]
+        if wide:
+            failures.append(f"rank {rank}: top-1 changes off a near-tie: {wide}")
+        records["drift"].append(
+            dict(
+                rank=rank,
+                logit=worst_logit,
+                gap=worst_gap,
+                positions=sum(r.drift_steps for r in probes) * TOKENS,
+                flips=flips,
+                lines=lines,
+                failures=failures,
+            )
+        )
+    say("drift: every probe alone on its rank, MTP on along MTP off's tokens")
 
     # --- the MTP layer's draft step through both targets and MTPLayer ---
     with torch.inference_mode():

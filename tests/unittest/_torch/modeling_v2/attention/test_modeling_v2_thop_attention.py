@@ -170,9 +170,9 @@ exercised:
    paged-context path that an engine with chunked prefill takes for every
    step: an 8192-token prefill, a 2048-token chunk on 6144 cached tokens,
    mixed steps, decode at B = 1, 64 and 1024, and MTP verify steps (3 query
-   tokens per request, linear spec-dec off as sm_103 runs it) at B = 1, 64
-   and 512, alone and beside contexts; and the same cells at a tp4 rank's 4
-   query heads over the replicated KV head (4q/1kv d256). Histories are
+   tokens per request, linear spec-dec off as sm_103 runs it) at B = 1, 16,
+   64, 128 and 512, alone and beside contexts; and the same cells at a tp4
+   rank's 4 query heads over the replicated KV head (4q/1kv d256). Histories are
    written into scattered pages; each call's appends are checked bitwise, its
    kernels must be trtllm-gen's and never MMHA, and its writes must stay inside
    the workspace it sized (a canary past the end). A one-hot readout pins a

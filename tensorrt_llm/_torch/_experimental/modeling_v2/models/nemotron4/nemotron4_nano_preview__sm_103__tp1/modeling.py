@@ -38,14 +38,18 @@ arguments its forward passes.
 Batch invariance. A decode step computes every row from that row alone, in an
 order that does not depend on how many rows share the step, so a request's
 logits and the state it writes are bitwise the same alone, in any eager batch
-and in a padded CUDA-graph batch. An MTP verify is such a step with 1 + D
-tokens a row, and its token j gets the bits that token gets as a decode step's
-one token. cuBLAS picks its kernel by the row count, and on six of the GEMM
-shapes the kernels it picks split K differently: decode and verify run those
-through `invariant_mm`, and generation attention through
-`invariant_gen_attention`, whose KV split is fixed and whose kernels compute a
-verify token with the arithmetic that decodes it. Prefill and mixed steps keep cuBLAS
-and `thop_attention`; CUDA graphs do not change their batches. So do the MTP
+and in a padded CUDA-graph batch. cuBLAS picks its kernel by the row count, and
+on six of the GEMM shapes the kernels it picks split K differently: decode runs
+those through `invariant_mm`, and its attention through
+`invariant_gen_attention`, whose KV split is fixed. An MTP verify, 1 + D tokens
+a row, runs the same GEMMs and the GDP and conv verify entries, which give its
+token j the bits that token gets as a decode step's one token, but attends
+through `thop_attention`'s generation kernels. Those compute with other
+arithmetic than the decode attention and pick their kernel by the batch, so a
+verify token's logits and the state it leaves sit near its decode step's, not
+on them: with MTP on, greedy output can part from MTP off's where MTP off's top
+two tokens are nearly tied. Prefill and mixed steps keep cuBLAS and
+`thop_attention`; CUDA graphs do not change their batches. So do the MTP
 layer's draft steps: a draft's bits change how many drafts the trunk accepts,
 never the tokens it emits.
 """
@@ -652,10 +656,11 @@ class Nemotron4NanoPreviewTp1ModelingV2(DecoderModel):
 
         The engine's TRTLLM-Gen JIT warmup goes to prefill too. It is one eager step of
         generation rows, run with `trtllm_gen_jit_warmup` raised so that thop_attention
-        compiles its generation kernels for every batch size and length up front. Decode
-        runs no thop_attention, but the generation rows of mixed steps do, and without the
-        warmup each kernel would compile at its first mixed step, mid-serve. The engine
-        sets the flag on every step and raises it only there, never under a CUDA graph.
+        compiles its generation kernels for every batch size and length up front. Decode's
+        one-token steps run no thop_attention, but its MTP verify steps, the MTP layer's
+        draft steps and the generation rows of mixed steps do, and without the warmup each
+        kernel would compile at its first such step, mid-serve. The engine sets the flag on
+        every step and raises it only there, never under a CUDA graph.
         """
         if attn_metadata.num_contexts or attn_metadata.trtllm_gen_jit_warmup:
             return self._prefill
@@ -1110,13 +1115,15 @@ class PrefillTarget:
 class DecodeTarget:
     """The specialization: routed to only when there are no context rows.
 
-    Batch-invariant: every entry it calls computes a row from that row alone, in an order
-    the row count does not change, so each request's logits and the state it writes are
-    the same bits whatever batch, padded or not, the step runs in -- and token j of an MTP
-    verify's 1 + D gets the bits that token gets as a decode step's one token. The GEMMs
-    whose cuBLAS kernel changes with the row count run through `invariant_mm`; attention
-    runs through `invariant_gen_attention`, whose KV split is fixed. The MTP layer's draft
-    steps are not part of this (`mtp_forward`).
+    A decode step is batch-invariant: every entry it calls computes a row from that row
+    alone, in an order the row count does not change, so each request's logits and the
+    state it writes are the same bits whatever batch, padded or not, the step runs in. The
+    GEMMs whose cuBLAS kernel changes with the row count run through `invariant_mm`;
+    attention runs through `invariant_gen_attention`, whose KV split is fixed. An MTP
+    verify's 1 + D tokens a row run the same GEMMs and the GDP and conv verify entries,
+    which match the decode entries bit for bit, but attend through `thop_attention`: its
+    tokens sit near their decode steps' bits, not on them, and move with the batch. The
+    MTP layer's draft steps are not part of this (`mtp_forward`).
     """
 
     def __init__(self, core: Nemotron4NanoPreviewTp1ModelingV2) -> None:
@@ -1163,12 +1170,13 @@ class DecodeTarget:
         self._mtp_contract_pending = False
 
     def _attention_args(self, md: TrtllmAttentionMetadata) -> dict:
-        """thop_attention's batch state for the MTP layer's draft steps, off the draft manager
-        the MTP worker swaps in. The trunk's attention runs invariant_gen_attention, whose
-        batch state is `step_args`'.
+        """thop_attention's batch state, off whichever cache manager the metadata carries: the
+        trunk's for an MTP verify, or the draft manager the MTP worker swaps in for the MTP
+        layer's draft steps. The trunk's one-token rows run invariant_gen_attention, whose
+        batch state is `step_args`' `attention`.
 
-        A row may carry 1 + D tokens (the MTP layer's first draft step). thop sizes the XQA
-        workspace as if each of `max_num_sequences` rows carried one token, so
+        A row may carry 1 + D tokens (an MTP verify, or the MTP layer's first draft step). thop
+        sizes the XQA workspace as if each of `max_num_sequences` rows carried one token, so
         `max_num_sequences` counts every token a row may carry.
         """
         return dict(
@@ -1215,8 +1223,8 @@ class DecodeTarget:
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto the explicit batch state of
-        invariant_gen_attention (`attention`) and of the recurrent-state entries, once per
-        forward.
+        invariant_gen_attention (`attention`), of thop_attention under MTP
+        (`verify_attention`) and of the recurrent-state entries, once per forward.
 
         Every row is one request carrying the same number of generation tokens: one, or
         1 + D under MTP, whose states go to the `intermediate_*` buffers. Under a CUDA
@@ -1227,6 +1235,8 @@ class DecodeTarget:
         views = self.core.state_views(md.kv_cache_manager)
         num_rows = md.num_seqs
         return dict(
+            # An MTP verify's 1 + D tokens a row attend through thop_attention.
+            verify_attention=self._attention_args(md) if self._tokens_per_gen_step > 1 else None,
             attention=dict(
                 # Lengths count this step's tokens and are read on the device only, where
                 # the overlap scheduler corrects them.
@@ -1236,8 +1246,7 @@ class DecodeTarget:
                 host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
                 num_contexts=0,
                 tokens_per_block=md.tokens_per_block,
-                # Sizes the entry's grid: the cache manager's bound on every length, the
-                # drafts a verify appends included.
+                # Sizes the entry's grid: the cache manager's bound on every length.
                 max_seq_len=md.max_seq_len,
             ),
             # Recurrent state: one slot per row, padding rows on PAD_SLOT_ID.
@@ -1273,9 +1282,12 @@ class DecodeTarget:
     ) -> torch.Tensor:
         """The final normed hidden state of every token: `norm(residual_readout(streams))`.
 
-        A token of an MTP verify gets the bits it gets as a decode step's one token: every
-        entry here computes a row from that row alone, and the attention computes token j of
-        a row's 1 + D with the program that decodes it alone over the same keys.
+        Every entry here but the verify's attention computes a row from that row alone, so a
+        decode step's rows are the same bits in any batch. An MTP verify's attention runs
+        thop_attention's generation kernels, which compute token j of a row's 1 + D with
+        other arithmetic than invariant_gen_attention decodes it with, and which pick their
+        kernel by the batch: a verify token's logits and the state it leaves are near its
+        decode step's, not equal to them.
         """
         d = self._d
         self._check_step_contract(attn_metadata)
@@ -1296,20 +1308,33 @@ class DecodeTarget:
             if isinstance(L.mixer, _Gdp):
                 update = self._gdp(x, L.mixer, step)
             elif isinstance(L.mixer, _Attention):
-                # Appends the row's K/V to its request's pages, then attends over them, causal
-                # within the row's tokens. NoPE; q_scaling 1 keeps the softmax scale at
+                # Appends the rows' K/V to their requests' pages, then attends over them, causal
+                # within a row's tokens. NoPE; q_scaling 1 keeps the softmax scale at
                 # head_dim**-0.5 = 1/16.
-                attn_out = invariant_gen_attention(
-                    q=cublas_mm(x, L.mixer.qkv),
-                    output=attn_out,
-                    local_layer_idx=step["kv_layer"][L.mixer.layer],
-                    tokens_per_seq=tokens_per_seq,
-                    num_heads=d.heads_q,
-                    num_kv_heads=d.heads_kv,
-                    head_size=d.head_dim,
-                    q_scaling=1.0,
-                    **step["attention"],
-                )
+                qkv = cublas_mm(x, L.mixer.qkv)
+                if tokens_per_seq == 1:
+                    attn_out = invariant_gen_attention(
+                        q=qkv,
+                        output=attn_out,
+                        local_layer_idx=step["kv_layer"][L.mixer.layer],
+                        tokens_per_seq=1,
+                        num_heads=d.heads_q,
+                        num_kv_heads=d.heads_kv,
+                        head_size=d.head_dim,
+                        q_scaling=1.0,
+                        **step["attention"],
+                    )
+                else:
+                    attn_out = thop_attention(
+                        q=qkv,
+                        output=attn_out,
+                        local_layer_idx=step["kv_layer"][L.mixer.layer],
+                        num_heads=d.heads_q,
+                        num_kv_heads=d.heads_kv,
+                        head_size=d.head_dim,
+                        **step["verify_attention"],
+                        **_CALL_CONSTANTS,
+                    )
                 update = invariant_mm(attn_out, L.mixer.o)
             else:
                 update = invariant_mm(

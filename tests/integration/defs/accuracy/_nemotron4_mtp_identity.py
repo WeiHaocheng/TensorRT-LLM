@@ -19,15 +19,26 @@ test_modeling_v2_nemotron4.py, beside the target's other gates; this module
 holds the legs, the gate and the batched report they share.
 
 Greedy one-model MTP-Eagle accepts a draft token only where it equals the
-target's own greedy token, so with MTP on the engine emits the target's greedy
-text -- provided each position of a verify step computes the bits the MTP-off
-decode step computes for the same token, and the recurrent and conv state a
-verify leaves behind is the state after its last accepted token. The targets
-build both: a verify runs the decode step's row-invariant GEMMs and generation
-attention over 1 + D tokens per request, and the engine's commit promotes the
-per-position GDP and conv state of the last accepted token, which rolls back
-the rejected drafts. So the gate is literal: MTP on emits the same tokens as
-MTP off.
+token the verify step itself picks, so with MTP on the engine emits the greedy
+text of its verify steps, and the recurrent and conv state a verify leaves
+behind is the state after its last accepted token: the engine's commit promotes
+the per-position GDP and conv state of that token, which rolls back the
+rejected drafts. A verify runs the decode step's row-invariant GEMMs and GDP and
+conv entries over 1 + D tokens per request, but attends through
+``thop_attention``'s generation kernels where a decode step attends through
+``invariant_gen_attention``. The two sum the softmax in other orders, so a
+verify token's logits sit near the MTP-off decode step's rather than on them,
+and MTP on can part from MTP off where MTP off's choice is nearly tied.
+
+So the gate is the near-tie rule. Each prompt is compared up to its first
+parting. A parting passes when the token MTP on emitted there is within the
+target's band (``NEAR_TIE_BAND``) of MTP off's top-1 -- the runner-up at a
+top-1 / top-2 margin within the band, or a lower rank where several
+candidates are that close. The band is the verify's measured deviation from
+decode, stated in each target's class with its derivation. A parting farther
+off fails: a rollback that keeps a rejected draft's state, or a verify that
+reads the wrong keys, moves a token wherever it lands. Every parting is
+reported with its margin and the tokens on both sides.
 
 Each prompt of the fixed set runs alone (``max_batch_size`` 1). Its prefill is
 then the same steps in both legs, and only the speculative path differs: one
@@ -46,11 +57,12 @@ change which requests share a step (a verify row takes 1 + D tokens of the
 step's budget), so the two legs can part where the MTP-off logits are nearly
 tied. Each parting is classified: it is a near-tie when the token MTP on
 emitted is within the batch-shape noise measured in the same run (each prompt
-alone against the batch) of the MTP-off top-1 there -- the runner-up, or a
-lower rank where several candidates are that close -- or when MTP off itself
-emits that token over the same tokens with another prefill/decode split. The
-MTP-off run then restarts from the MTP output up to the parting, so every
-later parting is classified the same way and the whole output is covered.
+alone against the batch), or within the target's verify band, of the MTP-off
+top-1 there -- the runner-up, or a lower rank where several candidates are that
+close -- or when MTP off itself emits that token over the same tokens with
+another prefill/decode split. The MTP-off run then restarts from the MTP output
+up to the parting, so every later parting is classified the same way and the
+whole output is covered.
 
 Every test here passes ``modeling_v2="require"`` to ``LLM``: TensorRT-LLM has no
 built-in implementation of this architecture, and ``"require"`` makes a
@@ -190,6 +202,9 @@ class _Parting:
     near_tie: bool | None = None
     witness: int | None = None
     reanchor: int = 0
+    # The two tokens as text, MTP off's top-1 and MTP on's, when a tokenizer gave them.
+    off_text: str | None = None
+    mtp_text: str | None = None
 
     def describe(self) -> str:
         where = (
@@ -197,9 +212,14 @@ class _Parting:
             if self.rank is None
             else f"rank {self.rank}, {self.gap:.4f} below the top-1"
         )
+        texts = (
+            ""
+            if self.off_text is None
+            else f"; MTP off {self.off_text!r}, MTP on {self.mtp_text!r}"
+        )
         return (
             f"token {self.token}: MTP on emitted {self.mtp_token} ({where}); MTP off's top "
-            f"{self.off_top[:4]}, top-2 gap {self.margin:.4f}"
+            f"{self.off_top[:4]}, top-2 gap {self.margin:.4f}{texts}"
         )
 
 
@@ -335,6 +355,11 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
     # depths. MTPDecodingConfig defaults to a depth of 1, so it is stated.
     MTP_DRAFT_LEN = 2
 
+    # The near-tie band of the gate, in logits: how far MTP on's token may sit
+    # below MTP off's top-1 at a parting. Each target's class states its own,
+    # the verify's measured deviation from decode on that topology.
+    NEAR_TIE_BAND: float
+
     # Output tokens per fixed prompt (criterion B): the ~8K-token prompts
     # generate 1K tokens, past any end id.
     SHORT_TOKENS = 256
@@ -454,7 +479,8 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         """The fixed prompt set with its output lengths and ranks, checked to fit the context."""
         monkeypatch.setenv("LLM_MODELS_ROOT", llm_models_root())
         module = _prompt_module()
-        prompts = module.prompt_set(module.load_tokenizer(self.MODEL_PATH))
+        self._tokenizer = module.load_tokenizer(self.MODEL_PATH)
+        prompts = module.prompt_set(self._tokenizer)
         ranks = self._ranks(prompts)
         requests = [
             _Request(
@@ -581,20 +607,29 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
             json.dump(report, f, indent=1)
         print(f"[modeling_v2] mtp identity report: {path}")
 
+    def _texts(self, parting: _Parting) -> _Parting:
+        """The parting with MTP off's top-1 and MTP on's token as text."""
+        parting.off_text = self._tokenizer.decode([parting.off_top[0][0]])
+        parting.mtp_text = self._tokenizer.decode([parting.mtp_token])
+        return parting
+
     @skip_not_sm103
     def test_mtp_identity(self, monkeypatch):
-        """Greedy tokens with MTP on (max_draft_len 2) equal those with MTP off.
+        """Greedy tokens with MTP on (max_draft_len 2) follow those with MTP off.
 
         Each prompt of the fixed set alone: 6 short prompts with 256 tokens and
         4 of ~8K tokens with 1K tokens. Both legs run under modeling_v2
         "require" with the overlap scheduler and CUDA graphs on.
 
-        A parting names the prompt, the token, the MTP-off top logprobs there
-        and where MTP on's token ranks among them. Both legs compute the same
-        function of the same inputs, so any parting is a bug, however small the
-        gap: a verify row that rounds differently from decode tips a near-tie,
-        a rollback that keeps a rejected draft's state moves a later token
-        wherever it lands.
+        Each prompt is compared up to its first parting. A parting passes when
+        MTP on's token there is within NEAR_TIE_BAND of MTP off's top-1 (its
+        gap below the top-1, which is the top-1 / top-2 margin when it is the
+        runner-up): the verify's attention rounds otherwise than decode's, by
+        up to that much. A parting farther off, or at a token outside MTP
+        off's top logprobs, fails: a rollback that keeps a rejected draft's
+        state, or a verify that reads the wrong keys, moves a token wherever
+        it lands. Every parting is printed with its margin and the tokens on
+        both sides.
         """
         requests = self._requests(monkeypatch)
         off = self._alone_leg(requests, mtp=False)
@@ -618,7 +653,8 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
                 )
             parting = _parting(out_on.token_ids, out_off)
             if parting is not None:
-                partings[r.name] = parting
+                parting.near_tie = parting.gap is not None and parting.gap <= self.NEAR_TIE_BAND
+                partings[r.name] = self._texts(parting)
             print(
                 f"[modeling_v2] mtp identity {r.name}{_on_rank(r)}: {r.max_tokens} tokens, "
                 f"{'identical' if parting is None else f'parts at token {parting.token}'}; "
@@ -626,6 +662,12 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
                 f"{out_on.verify_steps} verify steps; iterations with generation rows "
                 f"{_generation_iterations(call_on)} (MTP off: {_generation_iterations(call_off)})"
             )
+            if parting is not None:
+                verdict = "a near-tie" if parting.near_tie else "NOT a near-tie"
+                print(
+                    f"[modeling_v2]   {r.name} at {parting.describe()}: {verdict} "
+                    f"(band {self.NEAR_TIE_BAND})"
+                )
 
         self._write_report(
             "test_mtp_identity",
@@ -647,10 +689,18 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
                     for leg, calls in (("off", off), ("mtp", on))
                 },
                 "partings": {name: asdict(p) for name, p in partings.items()},
+                "near_tie_band": self.NEAR_TIE_BAND,
             },
         )
-        assert not partings, "greedy tokens differ with MTP on and off:\n" + "\n".join(
-            f"{name} at {p.describe()}" for name, p in partings.items()
+        print(
+            f"[modeling_v2] mtp identity: {len(requests) - len(partings)} of {len(requests)} "
+            f"prompts identical, {sum(p.near_tie for p in partings.values())} part at a near-tie "
+            f"within {self.NEAR_TIE_BAND}"
+        )
+        wide = {name: p for name, p in partings.items() if not p.near_tie}
+        assert not wide, (
+            f"MTP on parts from MTP off off a near-tie (band {self.NEAR_TIE_BAND}):\n"
+            + "\n".join(f"{name} at {p.describe()}" for name, p in wide.items())
         )
 
     @skip_not_sm103
@@ -660,9 +710,10 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         The batch-shape noise is the largest change of an emitted token's
         logprob, MTP off, between each prompt alone and in the batch, over the
         tokens before they part. Each parting of MTP on from MTP off is a
-        near-tie when the token MTP on emitted is within that noise of the
-        MTP-off top-1 there: the runner-up, or a lower rank where three or more
-        candidates are that close. A parting farther off is a near-tie still
+        near-tie when the token MTP on emitted is within that noise, or within
+        the verify's band (NEAR_TIE_BAND), of the MTP-off top-1 there: the
+        runner-up, or a lower rank where three or more candidates are that
+        close. A parting farther off is a near-tie still
         when MTP off itself emits that token over the same tokens with another
         prefill/decode split (a witness): where several candidates sit within a
         few tenths, one batch's noise does not bound how far rounding moves
@@ -709,8 +760,9 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
             witnessed = sum(p.witness is not None for p in partings[r.name])
             print(
                 f"[modeling_v2] mtp batched {r.name}{_on_rank(r)}: {len(partings[r.name])} "
-                f"partings, {within} within the noise, {witnessed} witnessed; MTP off alone vs "
-                f"batch: {'identical' if alone_parts is None else f'parts at {alone_parts.token}'}"
+                f"partings, {within} within the noise or the band, {witnessed} witnessed; MTP off "
+                f"alone vs batch: "
+                f"{'identical' if alone_parts is None else f'parts at {alone_parts.token}'}"
             )
             for p in partings[r.name]:
                 if p.near_tie:
@@ -806,12 +858,13 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
     ) -> tuple[dict[str, list[_Parting]], list[str]]:
         """Every parting of the MTP-on outputs from MTP off, each classified.
 
-        A parting within the noise of the MTP-off top-1 is a near-tie; one
-        farther off gets a witness search (``_witness``). After a parting at
-        token t, the MTP-off engine runs the prompt followed by MTP on's tokens
-        up to and including t, greedy, for the rest of the output, and the next
-        parting is looked for in that run. The restarts of all prompts run as
-        one call per round, each on its prompt's rank.
+        A parting within the noise, or within the verify's band, of the MTP-off
+        top-1 is a near-tie; one farther off gets a witness search
+        (``_witness``). After a parting at token t, the MTP-off engine runs the
+        prompt followed by MTP on's tokens up to and including t, greedy, for
+        the rest of the output, and the next parting is looked for in that run.
+        The restarts of all prompts run as one call per round, each on its
+        prompt's rank.
         """
         partings = {r.name: [] for r in requests}
         # name -> (offset into the MTP-on output, the MTP-off run from there).
@@ -828,7 +881,9 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
                 if parting is None:
                     continue
                 parting.reanchor = reanchor
-                parting.near_tie = parting.gap is not None and parting.gap <= noise
+                parting.near_tie = parting.gap is not None and parting.gap <= max(
+                    noise, self.NEAR_TIE_BAND
+                )
                 if not parting.near_tie:
                     parting.witness = self._witness(engine, r, mtp_tokens, parting.token)
                 partings[r.name].append(parting)

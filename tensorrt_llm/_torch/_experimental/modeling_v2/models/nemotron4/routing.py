@@ -190,7 +190,7 @@ def _speculation_declined(spec_config: Optional[Any], topology: Optional[str]) -
         )
         if topology == "tp4":
             why += (
-                "; on a tp4 rank it is also the one certified length whose verify gives "
+                "; on a tp4 rank it is also the one certified length whose GDP verify gives "
                 "decode's bits (gdp_verify: a request's stride, (1 + max_draft_len) x 4632, "
                 "must not be a multiple of 16, as decode's 4632 is not)"
             )

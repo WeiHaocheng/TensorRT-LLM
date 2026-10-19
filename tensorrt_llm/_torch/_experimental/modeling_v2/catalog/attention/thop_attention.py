@@ -80,8 +80,14 @@ class ThopAttention(OpWrapper):
     # GQA, decoded at batches of 1 to 1024 and verified at 1 to 512, where the
     # kernel the op picks changes with batch size and history length -- and
     # with the query heads per KV head, so tp4's 4 have cells of their own. Its
-    # steps reach 16384 tokens per rank: a fresh 8192-token prompt beside the
-    # largest decode or verify batch, or two fresh prompts in one step.
+    # verify steps (3 query tokens a request, at the CUDA-graph batch sizes 1,
+    # 2, 4, 8 to 128 by 8, then 192 to 512 by 64) reach five generation kernel
+    # families, measured at both head counts: a multi-CTA KV split up to 8
+    # requests, the same without a CTA cluster around 16 to 48 and with one
+    # around 32 to 72, one CTA per KV range from 80 to 128, and a persistent
+    # kernel from 192. The verify cells sit in each: B = 1, 16, 64, 128 and 512.
+    # Its steps reach 16384 tokens per rank: a fresh 8192-token prompt beside
+    # the largest decode or verify batch, or two fresh prompts in one step.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="gpt-oss sliding layer: GQA 64q/8kv d64, sinks, window 128",
@@ -166,8 +172,16 @@ class ThopAttention(OpWrapper):
             spec=dict(contexts=(), generations=1, gen_tokens=3, **_NEMOTRON4),
         ),
         Cell(
+            why="nemotron4 verify B=16: 3 query tokens per request",
+            spec=dict(contexts=(), generations=16, gen_tokens=3, **_NEMOTRON4),
+        ),
+        Cell(
             why="nemotron4 verify B=64: 3 query tokens per request",
             spec=dict(contexts=(), generations=64, gen_tokens=3, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 verify B=128: 3 query tokens per request",
+            spec=dict(contexts=(), generations=128, gen_tokens=3, **_NEMOTRON4),
         ),
         Cell(
             why="nemotron4 verify B=512: 3 query tokens per request",
@@ -222,8 +236,16 @@ class ThopAttention(OpWrapper):
             spec=dict(contexts=(), generations=1, gen_tokens=3, **_NEMOTRON4_TP4),
         ),
         Cell(
+            why="nemotron4 tp4 verify B=16: 3 query tokens per request",
+            spec=dict(contexts=(), generations=16, gen_tokens=3, **_NEMOTRON4_TP4),
+        ),
+        Cell(
             why="nemotron4 tp4 verify B=64: 3 query tokens per request",
             spec=dict(contexts=(), generations=64, gen_tokens=3, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 verify B=128: 3 query tokens per request",
+            spec=dict(contexts=(), generations=128, gen_tokens=3, **_NEMOTRON4_TP4),
         ),
         Cell(
             why="nemotron4 tp4 verify B=512: 3 query tokens per request",

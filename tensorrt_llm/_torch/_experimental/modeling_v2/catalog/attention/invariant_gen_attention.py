@@ -624,6 +624,11 @@ class InvariantGenAttention(OpWrapper):
     Uncertified: more than one KV head, more than 16 query heads, an fp8 or
     fp4 pool, sliding windows, attention sinks, any positional encoding, tree
     masks, T above 3.
+
+    Callers: the nemotron4 targets' decode steps (T = 1). Their MTP verify
+    steps attend through `thop_attention`, so the verify path here -- T = 2
+    and 3, `_verify_split_kernel` -- is on no target's path. Its cells and
+    tests stay, for a target that wants a verify with decode's bits.
     """
 
     def __call__(
