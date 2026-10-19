@@ -31,7 +31,8 @@ _ROWS = (
     (48, "MTP verify at C = 16"),
     (64, "the largest decode graph"),
     (1024, "a 1024-token prefill chunk"),
-    (8192, "a full 8192-token prefill chunk, tp4's max_num_tokens"),
+    (8192, "a full 8192-token prefill chunk"),
+    (16384, "a 16384-token step: an 8192-token prompt beside its step's verify rows and more"),
 )
 
 # The two calls a mixer's all-reduce feeds (`_streams_step` right after it).

@@ -461,8 +461,8 @@ CHECKS = (
 )
 
 #: The workspace is sized for this many rows at the widest width the forward sends (tp4's
-#: max_num_tokens); `TOO_MANY_ROWS` is set from it in the rank body.
-WORKSPACE_ROWS = 8192
+#: max_num_tokens, up to the largest cell); `TOO_MANY_ROWS` is set from it in the rank body.
+WORKSPACE_ROWS = 16384
 TOO_MANY_ROWS = 0
 
 

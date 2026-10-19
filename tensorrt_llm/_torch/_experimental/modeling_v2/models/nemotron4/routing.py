@@ -134,8 +134,8 @@ _DRAFT_LEN = 2
 #: The draft lengths a target runs beyond `_DRAFT_LEN`. tp1 also runs three to
 #: five: the repeated layer drafts a third, fourth and fifth depth, and a verify
 #: step carries 4, 5 or 6 tokens per request, lengths its own MTP identity and
-#: acceptance gates run.
-_MORE_DRAFT_LENS = {"tp1": (3, 4, 5)}
+#: acceptance gates run. tp4 also runs five, 6 tokens a request, gated alike.
+_MORE_DRAFT_LENS = {"tp1": (3, 4, 5), "tp4": (5,)}
 
 
 def _draft_lens(topology: Optional[str]) -> tuple[int, ...]:
@@ -307,6 +307,6 @@ def route(
         "divided) and tp4 (4 ranks, no attention DP, the mixers' heads and every MLP's and "
         "routed expert's intermediate width split four ways), each with one-model MTP-Eagle "
         f"on the checkpoint's MTP layer at max_draft_len={_DRAFT_LEN} (tp1 also "
-        f"{_drafts(_MORE_DRAFT_LENS['tp1'])}) without a draft_len_schedule, or without "
-        "speculative decoding"
+        f"{_drafts(_MORE_DRAFT_LENS['tp1'])}, tp4 also {_drafts(_MORE_DRAFT_LENS['tp4'])}) "
+        "without a draft_len_schedule, or without speculative decoding"
     )

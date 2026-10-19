@@ -260,30 +260,46 @@ def _bind() -> None:
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_update import (
         causal_conv1d_update,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_varlen import (
-        causal_conv1d_varlen,
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.triton_causal_conv1d_varlen import (  # noqa: E501
+        triton_causal_conv1d_varlen,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.flashinfer_gdp_chunk import (
+        flashinfer_gdp_chunk,
+    )
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_gates import gdp_gates
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import (
-        gdp_recurrent,
-    )
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_replay import gdp_replay
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.dsv3_router_gemm import (
+        dsv3_router_gemm,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.lowm_direct_mm import (
+        lowm_direct_mm,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.lowm_splitk_mm import (
+        lowm_splitk_mm,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.torch_mm import torch_mm
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
         latent_moe_experts,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts_fused_act import (  # noqa: E501
+        latent_moe_experts_fused_act,
     )
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
         flashinfer_rmsnorm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm import (
-        gated_rmsnorm,
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.gated_rmsnorm_multirow import (
+        gated_rmsnorm_multirow,
     )
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.wide_residual import (
         wide_residual,
     )
     from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp4 import (  # noqa: E501
         modeling as M,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp4.ops.comm.allreduce_wide_residual import (  # noqa: E501
+        allreduce_wide_residual,
     )
 
     X.__dict__.update(
@@ -296,6 +312,7 @@ def _bind() -> None:
         allgather=allgather,
         allreduce=allreduce,
         cublas_mm=cublas_mm,
+        torch_mm=torch_mm,
         latent_moe_experts=latent_moe_experts,
         noaux_tc_op=noaux_tc_op,
         flashinfer_rmsnorm=flashinfer_rmsnorm,
@@ -304,19 +321,24 @@ def _bind() -> None:
         # Every entry tp4's forward calls, each guarded by its is_valid during the forward.
         entries=(
             wide_residual,
+            allreduce_wide_residual,
             cublas_mm,
+            torch_mm,
+            lowm_direct_mm,
+            lowm_splitk_mm,
+            dsv3_router_gemm,
             allgather,
             thop_attention,
             allreduce,
             gdp_gates,
-            causal_conv1d_varlen,
+            triton_causal_conv1d_varlen,
             causal_conv1d_update,
-            gdp_chunk,
-            gdp_recurrent,
-            gated_rmsnorm,
+            flashinfer_gdp_chunk,
+            gdp_replay,
+            gated_rmsnorm_multirow,
             softclamp_relu2,
             noaux_tc_op,
-            latent_moe_experts,
+            latent_moe_experts_fused_act,
             flashinfer_rmsnorm,
         ),
     )
@@ -583,12 +605,19 @@ class Observer:
     call: `wide_residual` writes the streams in place, and the decode conv overwrites in_proj's
     output).
 
-    Attribution: a GEMM by the target parameter it multiplies (`cublas_mm`'s `mat_b`, a `.t()`
-    view of it); an all-reduce by the tagged GEMM that produced its input -- the last GEMM call
-    before it, so an untagged GEMM clears the tag; `noaux_tc_op` and `latent_moe_experts` by the
-    router and `fc1_latent_proj` GEMMs that feed them; `flashinfer_rmsnorm` by its weight; a
-    `wide_residual` call by the retention it writes with and the read factors it reads with; an
-    attention call (`thop_attention`) by its KV layer.
+    Attribution: a GEMM by the target parameter it multiplies (`mat_b`, a `.t()` view of it, of
+    `cublas_mm`, of the low-M entry `lowm_entry` hands a decode step, or of `dsv3_router_gemm`); an
+    all-reduce by the tagged GEMM that produced its input -- the last GEMM call before it, so an
+    untagged GEMM clears the tag; `noaux_tc_op` and `latent_moe_experts_fused_act` by the router
+    and `fc1_latent_proj` GEMMs that feed them; `flashinfer_rmsnorm` by its weight; a
+    `wide_residual` or `allreduce_wide_residual` call by the retention it writes with and the read
+    factors it reads with; an attention call (`thop_attention`) by its KV layer.
+
+    A mixer's all-reduce is fused with its write (`allreduce_wide_residual`), which never stores
+    the sum. The observer forms it with `allreduce` on the same partials -- the fused op's sum,
+    bit for bit, on the same workspace, issued by every rank in the same order -- and records it
+    as the all-reduce's output and the write's update; it also checks the fused op's streams
+    against `wide_residual`'s write of that sum (`fused_write_bitwise`).
     """
 
     def __init__(self, module, model, manager, layers: dict, config):
@@ -597,11 +626,15 @@ class Observer:
             name: getattr(module, name)
             for name in (
                 "wide_residual",
+                "allreduce_wide_residual",
                 "cublas_mm",
+                "torch_mm",
+                "lowm_entry",
+                "dsv3_router_gemm",
                 "thop_attention",
                 "allreduce",
                 "noaux_tc_op",
-                "latent_moe_experts",
+                "latent_moe_experts_fused_act",
                 "flashinfer_rmsnorm",
             )
         }
@@ -675,6 +708,66 @@ class Observer:
                 self.record[i][role] = normed.clone()
         return out
 
+    def allreduce_wide_residual(
+        self,
+        input,
+        streams,
+        retention,
+        write,
+        f1,
+        g1,
+        eps,
+        f2,
+        g2,
+        comm_buffer,
+        buffer_flags,
+    ):
+        owner = self.writes.get(retention.data_ptr())
+        partial = input.clone()
+        before = streams.clone()
+        out = self.orig["allreduce_wide_residual"](
+            input, streams, retention, write, f1, g1, eps, f2, g2, comm_buffer, buffer_flags
+        )
+        total = self.orig["allreduce"](partial.clone(), comm_buffer, buffer_flags)
+        if self.last is not None:
+            i, role = self.last
+            self.record[i][f"ar_{role}"] = dict(input=partial, out=total.clone())
+        self.last = None
+        if owner is not None:
+            i, which = owner
+            unfused = before.clone()
+            self.orig["wide_residual"](unfused, total, retention, write, f1, g1, eps, f2, g2)
+            self.record[i][which] = dict(
+                s_in=before,
+                update=total.clone(),
+                s_out=streams.clone(),
+                reads=[out[1].clone()] + ([] if f2 is None else [out[2].clone()]),
+                args=(retention, write, f1, g1, eps, f2, g2),
+                fused_write_bitwise=bool(X.torch.equal(unfused, streams)),
+            )
+        for factors, normed in ((f1, out[1]), (f2, out[2])):
+            if factors is not None and factors.data_ptr() in self.reads:
+                i, role = self.reads[factors.data_ptr()]
+                self.record[i][role] = normed.clone()
+        return out
+
+    def lowm_entry(self, m, k, n):
+        entry = self.orig["lowm_entry"](m, k, n)
+        if entry is None:
+            return None
+
+        def call(mat_a, mat_b, *args, **kwargs):
+            out = entry(mat_a, mat_b, *args, **kwargs)
+            self._gemm(mat_a, mat_b, out)
+            return out
+
+        return call
+
+    def dsv3_router_gemm(self, mat_a, mat_b, *args, **kwargs):
+        out = self.orig["dsv3_router_gemm"](mat_a, mat_b, *args, **kwargs)
+        self._gemm(mat_a, mat_b, out)
+        return out
+
     def _gemm(self, a, weight, out) -> None:
         tag = self.gemm.get(weight.data_ptr())
         self.last = tag
@@ -684,6 +777,11 @@ class Observer:
 
     def cublas_mm(self, mat_a, mat_b, *args, **kwargs):
         out = self.orig["cublas_mm"](mat_a, mat_b, *args, **kwargs)
+        self._gemm(mat_a, mat_b, out)
+        return out
+
+    def torch_mm(self, mat_a, mat_b, *args, **kwargs):
+        out = self.orig["torch_mm"](mat_a, mat_b, *args, **kwargs)
         self._gemm(mat_a, mat_b, out)
         return out
 
@@ -710,8 +808,10 @@ class Observer:
             )
         return weights, ids
 
-    def latent_moe_experts(self, x, topk_ids, topk_weights, up_proj, down_proj, *args):
-        out = self.orig["latent_moe_experts"](x, topk_ids, topk_weights, up_proj, down_proj, *args)
+    def latent_moe_experts_fused_act(self, x, topk_ids, topk_weights, up_proj, down_proj, *args):
+        out = self.orig["latent_moe_experts_fused_act"](
+            x, topk_ids, topk_weights, up_proj, down_proj, *args
+        )
         if self.last is not None and self.last[1] == "fc1_latent":
             self.record[self.last[0]]["experts"] = dict(out=out.clone(), args=args)
         return out
@@ -1129,6 +1229,7 @@ class _Campaign:
         call = rec["plain_call" if plain else "mixer_call"]
         missing = {"x", "in_proj", "out_proj", "ar_out_proj"} - rec.keys()
         assert not missing, f"layer {i}: the observer saw no {sorted(missing)}"
+        self.flag(phase, "gdp", i, "fused_write_bitwise", call["fused_write_bitwise"])
         mixer = {k[len("mixer.") :]: v for k, v in w.items() if k.startswith("mixer.")}
         conn = "residual_connection" if plain else "mixer_residual_connection"
         read_logit, norm = w[f"{conn}.read_logit"], w["input_layernorm.weight"]
@@ -1266,6 +1367,7 @@ class _Campaign:
         missing = {"x", "qkv", "attention", "o", "ar_o", "mixer_call"} - rec.keys()
         assert not missing, f"layer {i}: the observer saw no {sorted(missing)}"
         call = rec["mixer_call"]
+        self.flag(phase, "attention", i, "fused_write_bitwise", call["fused_write_bitwise"])
         s_in, u, s_mid, read = call["s_in"], call["update"], call["s_out"], call["reads"][0]
         x, qkv, attn = rec["x"], rec["qkv"]["out"], rec["attention"]
         o_in, partial = rec["o"]["a"], rec["o"]["out"]
@@ -1392,6 +1494,7 @@ class _Campaign:
         missing = {"x", "mlp_up", "mlp_down", "ar_mlp_down", "plain_call"} - rec.keys()
         assert not missing, f"layer {i}: the observer saw no {sorted(missing)}"
         call = rec["plain_call"]
+        self.flag(phase, "mlp", i, "fused_write_bitwise", call["fused_write_bitwise"])
         s_in, u, s_out, reads = call["s_in"], call["update"], call["s_out"], call["reads"]
         x, up = rec["x"], rec["mlp_up"]["out"]
         act, partial = rec["mlp_down"]["a"], rec["mlp_down"]["out"]
@@ -1632,6 +1735,9 @@ class _Campaign:
         def mm(mat_a, mat_b, *args, **kwargs):
             return X.cublas_mm(mat_a, full.get(mat_b.data_ptr(), mat_b), *args, **kwargs)
 
+        def torch_mm(mat_a, mat_b, *args, **kwargs):
+            return X.torch_mm(mat_a, full.get(mat_b.data_ptr(), mat_b), *args, **kwargs)
+
         def experts(x_, ids_, w_, up_, down_, clamp_, offset_, count_, out_dtype=None):
             return X.latent_moe_experts(
                 x_,
@@ -1649,7 +1755,11 @@ class _Campaign:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(X.M, "cublas_mm", mm)
-            mp.setattr(X.M, "latent_moe_experts", experts)
+            mp.setattr(X.M, "torch_mm", torch_mm)
+            # Every GEMM through `mm`, which swaps in the shared expert's whole weights: a low-M
+            # entry would multiply by the rank's slice.
+            mp.setattr(X.M, "lowm_entry", lambda m, k, n: None)
+            mp.setattr(X.M, "latent_moe_experts_fused_act", experts)
             mp.setattr(X.M, "allreduce", lambda input, comm_buffer, buffer_flags: input)
             mp.setattr(X.M, "noaux_tc_op", X.noaux_tc_op)
             mp.setattr(X.M, "flashinfer_rmsnorm", X.flashinfer_rmsnorm)

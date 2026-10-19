@@ -12,8 +12,8 @@ state that MTP-off decode reaches over the accepted tokens alone.
 Checked here on layer 0's real weights, through the target's own mixer code (`DecodeTarget._gdp`
 for a decode step, `PrefillTarget._gdp` for a mixed one) and the engine's own hybrid managers
 built with an MTP-Eagle config (`MambaHybridCacheManagerV2`, the default, and
-`CppMambaHybridCacheManager`), committing with the manager's `update_mamba_states`, at every draft
-length tp1 runs (D = 2, the checkpoint's trained depth, and 3 to 5):
+`CppMambaHybridCacheManager`), committing with the manager's `update_mamba_states`, at every
+draft length tp1 runs (D = 2, the checkpoint's trained depth, and 3 to 5):
 
 - every real row's committed recurrent and conv state is the slot after `accepted` decode steps
   (T = 1 calls of the same mixer) over the same tokens, for every accepted count, within
