@@ -583,16 +583,21 @@ public:
                 base_activation_type = ActivationType::SwigluBias;
             }
         }
+        // Relu2 with a limit and no alpha / beta is the tanh soft-capped Relu2, relu(limit * tanh(x / limit))^2:
+        // it stays Relu2, and the limit reaches its activation (SoftcapRelu2Adaptor).
+        bool const softcap_relu2 = base_activation_type == ActivationType::Relu2 && swiglu_limit.has_value()
+            && !swiglu_alpha.has_value() && !swiglu_beta.has_value();
         if (swiglu_limit.has_value())
         {
             CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_limit must have num_experts_on_rank elements.");
-            if (base_activation_type != ActivationType::SiTu)
+            if (base_activation_type != ActivationType::SiTu && !softcap_relu2)
             {
                 base_activation_type = ActivationType::SwigluBias;
             }
         }
+        TORCH_CHECK(!softcap_relu2 || !swiglu_clamp_after_silu, "The soft-capped Relu2 takes no clamp_after_silu.");
         TORCH_CHECK(
             base_activation_type != ActivationType::SiTu || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
             "SiTu requires both swiglu_alpha and swiglu_beta.");
