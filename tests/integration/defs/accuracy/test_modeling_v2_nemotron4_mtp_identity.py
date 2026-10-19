@@ -18,12 +18,12 @@ Greedy one-model MTP-Eagle accepts a draft token only where it equals the
 target's own greedy token, so with MTP on the engine emits the target's greedy
 text -- provided each position of a verify step computes the bits the MTP-off
 decode step computes for the same token, and the recurrent and conv state a
-verify leaves behind is the state after its last accepted token. The tp1
-target builds both: its verify runs the decode step's row-invariant GEMMs and
-generation attention over 1 + D tokens per request, and the engine's commit
-promotes the per-position GDP and conv state of the last accepted token, which
-rolls back the rejected drafts. So the gate is literal: MTP on emits the same
-tokens as MTP off.
+verify leaves behind is the state after its last accepted token. The targets
+build both: a verify runs the decode step's row-invariant GEMMs and generation
+attention over 1 + D tokens per request, and the engine's commit promotes the
+per-position GDP and conv state of the last accepted token, which rolls back
+the rejected drafts. So the gate is literal: MTP on emits the same tokens as
+MTP off.
 
 Each prompt of the fixed set runs alone (``max_batch_size`` 1). Its prefill is
 then the same step in both legs, and only the speculative path differs: one
@@ -274,7 +274,7 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         # Built fresh for each leg; the legs of a test differ in
         # speculative_config only.
         #
-        # env_overrides is applied on the rank before the model is built:
+        # env_overrides is applied on every rank before the model is built:
         # - the target checks its step contract on its first forward;
         # - Triton autotune results go through the on-disk cache. The prefill's
         #   GDP chunk kernel (the vendored FLA `chunk_fwd_kernel_o`) is
@@ -283,8 +283,8 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
         #   processes could pick configs whose prefill outputs differ in the
         #   last bit. With the cache, the second engine reads the first one's
         #   choice. (When the suite's session reuse hands both legs the same
-        #   worker process, they share the in-memory choice as well.) Printing
-        #   shows which leg benchmarked and which read the cache.
+        #   worker processes, they share the in-memory choice as well.)
+        #   Printing shows which leg benchmarked and which read the cache.
         #
         # trust_remote_code: the checkpoint's config class is its own
         # configuration_nemotron4.py. The overlap scheduler is on by default;
@@ -674,3 +674,26 @@ class _MtpIdentity(LlmapiAccuracyTestHarness):
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpIdentity(_MtpIdentity):
     """nemotron4-nano-preview (text model) / sm_103 / tp1: MTP-Eagle on against off."""
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpIdentity(_MtpIdentity):
+    """nemotron4-nano-preview (text model) / sm_103 / tp4: MTP-Eagle on against off, on 4 ranks.
+
+    Tensor parallel over the 4 GPUs of one node, without attention DP: every
+    rank runs every request, in the steps rank 0's executor schedules, on its
+    quarter of the mixers' heads and of every MLP's and routed expert's
+    intermediate width, the MTP layer's included, and the ranks meet in every
+    block's all-reduce. A verify token gets its decode step's bits on every
+    rank: the all-reduce sums a token's four partials by one formula whatever
+    the step's row count, and the GDP verify reads a request's tokens 3 x 4632
+    elements apart at the draft length here, which like the decode step's 4632
+    is not a multiple of 16, so its kernel rounds as the decode kernel does. So
+    tp1's legs, checks and reports carry over unchanged.
+    """
+
+    pytestmark = pytest.mark.skip_less_device(4)
+
+    # The parallel topology the tp4 target implements: tensor parallel over the
+    # 4 GPUs of one node, the mixers' heads and every MLP's and routed expert's
+    # intermediate width split four ways.
+    PARALLEL = dict(tensor_parallel_size=4, moe_tensor_parallel_size=4)
