@@ -113,6 +113,18 @@ class NoauxTcOp(OpWrapper):
     `topk_group` is never read. Any other configuration raises
     ("invokeNoAuxTc: unsupported configuration"), so neither limit needs a
     guard here.
+
+    The single-group kernel runs one warp per token and finds the top-k
+    without a warp reduction per pick: a threshold taken from the lanes'
+    maxima admits the candidates, and a candidate's rank among them is its
+    output slot. When more than 32 experts reach the threshold -- heavy ties,
+    which continuous router logits never produce (measured: at most 22 on
+    random logits with this checkpoint's biases) -- it sorts and picks one at
+    a time instead; `test_heavy_ties_route_exactly` drives that path. Its fp32
+    weights come from an fp32 evaluation of the fp64 scale-and-divide that
+    rounds the same way except within 2^-40 of a rounding midpoint, where it
+    evaluates the fp64 expression itself. Both paths compute `reference`'s
+    arithmetic bit for bit, so the band stays zero.
     """
 
     def __call__(
