@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 # Every MoE block of the checkpoint (`Nemotron4Experts`, 28 shortcut layers plus the MTP layer)
@@ -177,6 +178,11 @@ def _clamped_relu2_weighted_kernel(
         tl.store(ptrs, _clamped_relu2_weighted(h, w, CLAMP, INV_CLAMP), mask=mask)
 
 
+#: Every launch of a call, through its compiled kernel once compiled (`Launch`): an eager
+#: prefill step makes one call per MoE layer, so each launch's host time counts.
+_ACTIVATE = Launch(_clamped_relu2_weighted_kernel)
+
+
 def _activate_rows(
     h: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -191,7 +197,7 @@ def _activate_rows(
     on the target's own prefill inputs."""
     n = h.shape[1]
     block_n = min(4096, triton.next_power_of_2(n))
-    _clamped_relu2_weighted_kernel[(h.shape[0], triton.cdiv(n, block_n))](
+    _ACTIVATE[(h.shape[0], triton.cdiv(n, block_n))](
         h,
         topk_weights,
         order,
@@ -213,6 +219,15 @@ def _sort_key(ids_ptr, slot, n_slots, local_offset, num_local):
     local = tl.load(ids_ptr + slot, mask=valid, other=0).to(tl.int32) - local_offset
     key = tl.where((local >= 0) & (local < num_local), local, num_local)
     return tl.where(valid, key, num_local + 1)
+
+
+@triton.jit
+def _slot_keys_kernel(ids_ptr, key_ptr, n_slots, local_offset, num_local, BLOCK: tl.constexpr):
+    """BLOCK slots' sort keys (`_sort_key`), in the key tensor's dtype: `_sort_keys`' elementwise
+    torch ops in one pass."""
+    slot = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    key = _sort_key(ids_ptr, slot, n_slots, local_offset, num_local)
+    tl.store(key_ptr + slot, key.to(key_ptr.dtype.element_ty), mask=slot < n_slots)
 
 
 @triton.jit
@@ -430,7 +445,12 @@ def _gather_rows_kernel(
     order_ptr,
     inv_ptr,
     xg_ptr,
+    sorted_key_ptr,
+    offs_ptr,
     n_rows,
+    n_row_blocks,
+    num_local,
+    n_steps,
     stride_xt,
     stride_xk,
     stride_g,
@@ -438,21 +458,48 @@ def _gather_rows_kernel(
     TOPK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_L: tl.constexpr,
+    BLOCK_E: tl.constexpr,
 ):
-    """BLOCK_R rows of the grouped GEMMs' input, after the sort: row r holds slot `order[r]`, so
-    it takes the row of x of that slot's token, and `inv[order[r]] = r`. The row gather and the
-    inverse permutation in one pass."""
-    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
-    rmask = rows < n_rows
-    slot = tl.load(order_ptr + rows, mask=rmask, other=0)
-    tl.store(inv_ptr + slot, rows.to(tl.int32), mask=rmask)
-    src = x_ptr + (slot // TOPK).to(tl.int64)[:, None] * stride_xt
-    dst = xg_ptr + rows.to(tl.int64)[:, None] * stride_g
-    for l0 in tl.static_range(0, L, BLOCK_L):
-        cols = l0 + tl.arange(0, BLOCK_L)
-        mask = rmask[:, None] & (cols < L)[None, :]
-        row = tl.load(src + cols[None, :] * stride_xk, mask=mask)
-        tl.store(dst + cols[None, :], row, mask=mask)
+    """The grouped GEMMs' input after the sort, in one launch.
+
+    The first `n_row_blocks` programs take BLOCK_R rows each: row r holds slot `order[r]`, so it
+    takes the row of x of that slot's token, and `inv[order[r]] = r` -- the row gather and the
+    inverse permutation in one pass. The programs after them take BLOCK_E local experts each and
+    find each one's end row in the sorted keys, the number of keys at or below it:
+    `searchsorted(sorted_key, e, right=True)`, a binary search of `n_steps` halvings."""
+    pid = tl.program_id(0)
+    if pid < n_row_blocks:
+        rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)
+        rmask = rows < n_rows
+        slot = tl.load(order_ptr + rows, mask=rmask, other=0)
+        tl.store(inv_ptr + slot, rows.to(tl.int32), mask=rmask)
+        src = x_ptr + (slot // TOPK).to(tl.int64)[:, None] * stride_xt
+        dst = xg_ptr + rows.to(tl.int64)[:, None] * stride_g
+        for l0 in tl.static_range(0, L, BLOCK_L):
+            cols = l0 + tl.arange(0, BLOCK_L)
+            mask = rmask[:, None] & (cols < L)[None, :]
+            row = tl.load(src + cols[None, :] * stride_xk, mask=mask)
+            tl.store(dst + cols[None, :], row, mask=mask)
+    else:
+        e = (pid - n_row_blocks) * BLOCK_E + tl.arange(0, BLOCK_E)
+        lo = tl.zeros([BLOCK_E], dtype=tl.int32)
+        hi = tl.zeros([BLOCK_E], dtype=tl.int32) + n_rows
+        for _ in range(n_steps):
+            active = lo < hi
+            mid = (lo + hi) // 2
+            key = tl.load(sorted_key_ptr + mid, mask=active, other=0).to(tl.int32)
+            lo = tl.where(active & (key <= e), mid + 1, lo)
+            hi = tl.where(active & (key > e), mid, hi)
+        tl.store(offs_ptr + e, lo, mask=e < num_local)
+
+
+_SLOT_KEYS = Launch(_slot_keys_kernel)
+_COUNT_SORT = Launch(_count_sort_kernel)
+_TILE_MAP = Launch(_tile_map_kernel)
+_UP_ACT = Launch(_up_act_kernel)
+_DOWN = Launch(_down_kernel)
+_SUM_SLOTS = Launch(_sum_slots_kernel)
+_GATHER_ROWS = Launch(_gather_rows_kernel)
 
 
 def _sort_keys(
@@ -493,19 +540,38 @@ def _sort_and_gather(
     x: torch.Tensor, topk_ids: torch.Tensor, local_expert_offset: int, num_local_experts: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The grouped-GEMM path's layout: `_sort_slots`' `order`, `inv` and `offs`, the same
-    values, plus each row's x (`xg` [T*K, latent], x's dtype) -- the sort, then one pass
-    (`_gather_rows_kernel`) for the inverse permutation and the gather."""
-    order, offs = _sort_keys(topk_ids, local_expert_offset, num_local_experts)
-    rows = order.numel()
+    values, plus each row's x (`xg` [T*K, latent], x's dtype) -- the keys in one pass
+    (`_slot_keys_kernel`), the stable sort, then one launch (`_gather_rows_kernel`) for the
+    inverse permutation, the gather and each expert's end row."""
+    ids = topk_ids.reshape(-1)
+    rows = ids.numel()
+    key = torch.empty(
+        rows,
+        dtype=torch.int16 if num_local_experts < torch.iinfo(torch.int16).max else torch.int32,
+        device=x.device,
+    )
+    block = 1024
+    if rows:
+        _SLOT_KEYS[(triton.cdiv(rows, block),)](
+            ids, key, rows, local_expert_offset, num_local_experts, BLOCK=block, num_warps=4
+        )
+    sorted_key, order = torch.sort(key, stable=True)
     inv = torch.empty(rows, dtype=torch.int32, device=x.device)
     xg = torch.empty(rows, x.shape[1], dtype=x.dtype, device=x.device)
-    block_r = 8
-    _gather_rows_kernel[(triton.cdiv(rows, block_r),)](
+    offs = torch.empty(num_local_experts, dtype=torch.int32, device=x.device)
+    block_r, block_e = 8, 128
+    row_blocks = triton.cdiv(rows, block_r)
+    _GATHER_ROWS[(row_blocks + triton.cdiv(num_local_experts, block_e),)](
         x,
         order,
         inv,
         xg,
+        sorted_key,
+        offs,
         rows,
+        row_blocks,
+        num_local_experts,
+        rows.bit_length(),
         x.stride(0),
         x.stride(1),
         xg.stride(0),
@@ -513,6 +579,7 @@ def _sort_and_gather(
         TOPK=topk_ids.shape[1],
         BLOCK_R=block_r,
         BLOCK_L=min(256, triton.next_power_of_2(x.shape[1])),
+        BLOCK_E=block_e,
         num_warps=4,
     )
     return order, inv, offs, xg
@@ -529,7 +596,7 @@ def _count_sort(
     inv = torch.empty(n, dtype=torch.int32, device=ids.device)
     offs = torch.empty(num_local_experts, dtype=torch.int32, device=ids.device)
     block = min(max(16, triton.next_power_of_2(n)), 2048)
-    _count_sort_kernel[(num_local_experts + 1,)](
+    _COUNT_SORT[(num_local_experts + 1,)](
         ids,
         order,
         inv,
@@ -587,7 +654,7 @@ def _experts(
         rows = order.numel()
         max_tiles = triton.cdiv(rows, block_m) + min(num_local_experts, rows)
         work = torch.empty(1 + 3 * max_tiles, dtype=torch.int32, device=x.device)
-        _tile_map_kernel[(1,)](
+        _TILE_MAP[(1,)](
             offs,
             work,
             num_local_experts,
@@ -596,7 +663,7 @@ def _experts(
             num_warps=4,
         )
         h = torch.empty(rows, intermediate, dtype=x.dtype, device=x.device)
-        _up_act_kernel[(max_tiles * (intermediate // up_n),)](
+        _UP_ACT[(max_tiles * (intermediate // up_n),)](
             x,
             up_proj,
             w,
@@ -621,7 +688,7 @@ def _experts(
             num_stages=up_stages,
         )
         o = torch.empty(rows, latent, dtype=x.dtype, device=x.device)
-        _down_kernel[(max_tiles * (latent // dn_n),)](
+        _DOWN[(max_tiles * (latent // dn_n),)](
             h,
             down_proj,
             work,
@@ -646,7 +713,7 @@ def _experts(
         device=x.device,
     )
     block_l = min(1024, triton.next_power_of_2(latent))
-    _sum_slots_kernel[(num_tokens, triton.cdiv(latent, block_l))](
+    _SUM_SLOTS[(num_tokens, triton.cdiv(latent, block_l))](
         o,
         inv,
         offs[-1:],
@@ -692,10 +759,11 @@ class LatentMoeExperts(OpWrapper):
     expert, a one-program kernel lists the GEMMs' work (up to BLOCK_M rows of one expert per
     entry), a Triton grouped GEMM computes the up projection straight from each slot's token row
     and applies the activation and routing weight as the tile leaves the accumulator, and a
-    Triton grouped GEMM computes the down projection. Larger batches: a stable torch sort of the
-    slots, one Triton pass gathering each row's x and writing the inverse permutation,
-    `torch._grouped_mm` for up_proj, a Triton pass applying the activation and the routing
-    weight in place, and `torch._grouped_mm` for down_proj. Either way a Triton pass then sums
+    Triton grouped GEMM computes the down projection. Larger batches: a Triton pass computing the
+    slots' sort keys, a stable torch sort of them, one Triton launch gathering each row's x,
+    writing the inverse permutation and finding each expert's end row, `torch._grouped_mm` for
+    up_proj, a Triton pass applying the activation and the routing weight in place, and
+    `torch._grouped_mm` for down_proj. Either way a Triton pass then sums
     each token's rows in fp32. The paths round at the same points and accumulate every GEMM
     output over K in fp32.
     """
@@ -774,6 +842,12 @@ class LatentMoeExperts(OpWrapper):
     bit-exact against the checkpoint's torch ops on every finite bf16 input, and a captured CUDA
     graph replays the eager call bitwise. Every row of `_FUSED_TILES` is held to the band at
     batch sizes the cells do not sample.
+
+    Host time: an eager prefill step makes one call per MoE layer, so its launches are few and
+    each goes through `Launch`, straight to the compiled kernel once the call's specialization
+    is compiled. The grouped path computes the sort keys in one Triton pass and finds each
+    expert's end row in extra programs of the gather's launch: integer results, the values
+    `_sort_keys`' torch ops give (tested).
 
     Memory per call, at T tokens: the down-projection output [T*10, 768] bf16 and the
     intermediate [T*10, 4096] bf16, plus the gathered x [T*10, 768] on the grouped-GEMM path --

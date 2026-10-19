@@ -19,6 +19,7 @@ from tensorrt_llm._torch.modules.fla.solve_tril import (
 )
 from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd_kernel
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 #: The vendored chunk kernels' block length, counted in Householder sub-steps.
@@ -54,81 +55,189 @@ _CONFIG = dict(
 
 
 @triton.jit
-def _chunk_list_kernel(
+def _chunk_list_of(
+    o_c, o_n, m_n, bos, eos, carry, seq, first, offsets, WRITE_OFFSETS, BT: tl.constexpr
+):
+    """One block of sequences' contribution to the BT-sub-step chunk list's ids `o_c`: their
+    chunk counts, and (WRITE_OFFSETS) their first and end chunks into `offsets`."""
+    count = tl.cdiv(eos - bos, BT)
+    end = carry + tl.cumsum(count, axis=0)
+    start = end - count
+    if WRITE_OFFSETS:
+        tl.store(offsets + o_n, start, mask=m_n)
+        tl.store(offsets + o_n + 1, end, mask=m_n)
+    ended = m_n[None, :] & (end[None, :] <= o_c[:, None])
+    seq += tl.sum(ended.to(tl.int32), axis=1)
+    started = m_n[None, :] & (start[None, :] <= o_c[:, None])
+    first = tl.maximum(first, tl.max(tl.where(started, start[None, :], 0), axis=1))
+    carry += tl.sum(count, axis=0)
+    return carry, seq, first
+
+
+@triton.jit
+def _chunk_lists_kernel(
+    cu_seqlens,
     cu_steps,
-    chunk_indices,
-    chunk_offsets,
+    indices_a,
+    offsets_a,
+    indices_b,
+    offsets_b,
     num_seqs,
-    num_chunks,
-    BT: tl.constexpr,
+    chunks_a,
+    chunks_b,
+    NH: tl.constexpr,
+    BT_A: tl.constexpr,
+    BT_B: tl.constexpr,
     BC: tl.constexpr,
     BN: tl.constexpr,
 ):
-    """`prepare_chunk_indices` and `prepare_chunk_offsets` on the device.
+    """`prepare_chunk_indices` and `prepare_chunk_offsets` on the device, for two chunk sizes in
+    one launch, from the token offsets: `cu_steps` = NH x `cu_seqlens`, the sequences' sub-step
+    offsets, then each list.
 
-    Entry `c` of `chunk_indices` is `(sequence, chunk within it)` for the batch's
-    `c`-th BT-sub-step chunk, sequences in order; `chunk_offsets[n]` is sequence
-    n's first chunk. Each program covers BC chunk ids and walks the sequences BN
-    at a time: a chunk's sequence is the number of sequences that end at or
-    before it, its first chunk the last sequence start at or before it.
+    Entry `c` of a list's indices is `(sequence, chunk within it)` for the batch's `c`-th
+    BT-sub-step chunk, sequences in order; its `offsets[n]` is sequence n's first chunk. Each
+    program covers BC chunk ids of both lists and walks the sequences BN at a time: a chunk's
+    sequence is the number of sequences that end at or before it, its first chunk the last
+    sequence start at or before it.
 
-    `num_chunks` is a bound, not the count. The ids past the real chunks get the
+    `chunks_a` and `chunks_b` are bounds, not the counts. The ids past the real chunks get the
     last sequence and a chunk past its end, which every stage masks out.
     """
     i_c = tl.program_id(0)
     o_c = i_c * BC + tl.arange(0, BC)
-    seq = tl.zeros([BC], dtype=tl.int32)
-    first = tl.zeros([BC], dtype=tl.int32)
-    carry = tl.sum(tl.zeros([BN], dtype=tl.int32), axis=0)
+    seq_a = tl.zeros([BC], dtype=tl.int32)
+    first_a = tl.zeros([BC], dtype=tl.int32)
+    carry_a = tl.sum(tl.zeros([BN], dtype=tl.int32), axis=0)
+    seq_b = tl.zeros([BC], dtype=tl.int32)
+    first_b = tl.zeros([BC], dtype=tl.int32)
+    carry_b = tl.sum(tl.zeros([BN], dtype=tl.int32), axis=0)
     for n0 in range(0, num_seqs, BN):
         o_n = n0 + tl.arange(0, BN)
         m_n = o_n < num_seqs
-        bos = tl.load(cu_steps + o_n, mask=m_n, other=0).to(tl.int32)
-        eos = tl.load(cu_steps + o_n + 1, mask=m_n, other=0).to(tl.int32)
-        count = tl.cdiv(eos - bos, BT)
-        end = carry + tl.cumsum(count, axis=0)
-        start = end - count
+        bos = tl.load(cu_seqlens + o_n, mask=m_n, other=0).to(tl.int32) * NH
+        eos = tl.load(cu_seqlens + o_n + 1, mask=m_n, other=0).to(tl.int32) * NH
         if i_c == 0:
-            tl.store(chunk_offsets + o_n, start, mask=m_n)
-            tl.store(chunk_offsets + o_n + 1, end, mask=m_n)
-        ended = m_n[None, :] & (end[None, :] <= o_c[:, None])
-        seq += tl.sum(ended.to(tl.int32), axis=1)
-        started = m_n[None, :] & (start[None, :] <= o_c[:, None])
-        first = tl.maximum(first, tl.max(tl.where(started, start[None, :], 0), axis=1))
-        carry += tl.sum(count, axis=0)
-    seq = tl.minimum(seq, num_seqs - 1)
-    m_c = o_c < num_chunks
-    tl.store(chunk_indices + o_c * 2, seq, mask=m_c)
-    tl.store(chunk_indices + o_c * 2 + 1, o_c - first, mask=m_c)
+            tl.store(cu_steps + o_n, bos.to(tl.int64), mask=m_n)
+            tl.store(cu_steps + o_n + 1, eos.to(tl.int64), mask=m_n)
+        carry_a, seq_a, first_a = _chunk_list_of(
+            o_c, o_n, m_n, bos, eos, carry_a, seq_a, first_a, offsets_a, i_c == 0, BT_A
+        )
+        carry_b, seq_b, first_b = _chunk_list_of(
+            o_c, o_n, m_n, bos, eos, carry_b, seq_b, first_b, offsets_b, i_c == 0, BT_B
+        )
+    seq_a = tl.minimum(seq_a, num_seqs - 1)
+    m_a = o_c < chunks_a
+    tl.store(indices_a + o_c * 2, seq_a, mask=m_a)
+    tl.store(indices_a + o_c * 2 + 1, o_c - first_a, mask=m_a)
+    seq_b = tl.minimum(seq_b, num_seqs - 1)
+    m_b = o_c < chunks_b
+    tl.store(indices_b + o_c * 2, seq_b, mask=m_b)
+    tl.store(indices_b + o_c * 2 + 1, o_c - first_b, mask=m_b)
 
 
-def _chunk_list(
-    cu_steps: torch.Tensor, steps: int, chunk_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """`(chunk_indices, chunk_offsets)` for `chunk_size`-sub-step chunks, built on the device.
+_CHUNK_LISTS = Launch(_chunk_lists_kernel)
 
-    The list has `cdiv(steps, chunk_size) + num_seqs - 1` entries, a bound the
-    shapes give: rounding up, each sequence after the first adds at most one chunk
-    to `cdiv(steps, chunk_size)`. So no batch has more chunks, and one sequence has
-    exactly that many.
+
+def _chunk_lists(
+    cu_seqlens: torch.Tensor, num_householder: int, steps: int, sizes: tuple[int, int]
+) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+    """`cu_steps` (int64, NH x `cu_seqlens`) and, for each of the two chunk sizes,
+    `(chunk_indices, chunk_offsets)` built on the device, in one launch.
+
+    A list has `cdiv(steps, chunk_size) + num_seqs - 1` entries, a bound the shapes give:
+    rounding up, each sequence after the first adds at most one chunk to `cdiv(steps,
+    chunk_size)`. So no batch has more chunks, and one sequence has exactly that many.
     """
-    num_seqs = cu_steps.shape[0] - 1
-    num_chunks = triton.cdiv(steps, chunk_size) + num_seqs - 1
-    chunk_indices = cu_steps.new_empty((num_chunks, 2))
-    chunk_offsets = cu_steps.new_empty((num_seqs + 1,))
+    num_seqs = cu_seqlens.shape[0] - 1
+    cu_steps = torch.empty(num_seqs + 1, dtype=torch.long, device=cu_seqlens.device)
+    lists = []
+    for size in sizes:
+        num_chunks = triton.cdiv(steps, size) + num_seqs - 1
+        lists.append((cu_steps.new_empty((num_chunks, 2)), cu_steps.new_empty((num_seqs + 1,))))
+    (indices_a, offsets_a), (indices_b, offsets_b) = lists
     block = 64
-    _chunk_list_kernel[(triton.cdiv(num_chunks, block),)](
+    longest = max(indices_a.shape[0], indices_b.shape[0])
+    _CHUNK_LISTS[(triton.cdiv(longest, block),)](
+        cu_seqlens,
         cu_steps,
-        chunk_indices,
-        chunk_offsets,
+        indices_a,
+        offsets_a,
+        indices_b,
+        offsets_b,
         num_seqs,
-        num_chunks,
-        BT=chunk_size,
+        indices_a.shape[0],
+        indices_b.shape[0],
+        NH=num_householder,
+        BT_A=sizes[0],
+        BT_B=sizes[1],
         BC=block,
         BN=block,
         num_warps=4,
     )
-    return chunk_indices, chunk_offsets
+    return cu_steps, lists
+
+
+@triton.jit
+def _gather_states_kernel(
+    state_pool,
+    slots,
+    has_initial_state,
+    initial,
+    stride_p_n,
+    stride_p_h,
+    stride_p_v,
+    stride_p_k,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    K: tl.constexpr,
+    BV: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Program (sequence, head): the head's `[V, K]` block of the sequence's slot, into its
+    dense row of `initial` -- or zeros, without reading the slot, for a sequence without an
+    initial state. `torch.where(has_initial_state, state_pool[slots], 0.0)`, element for
+    element."""
+    i_n, i_h = tl.program_id(0), tl.program_id(1)
+    slot = tl.load(slots + i_n).to(tl.int64)
+    resume = tl.load(has_initial_state + i_n) != 0
+    o_v = tl.arange(0, BV)
+    o_k = tl.arange(0, BK)
+    mask = (o_v < V)[:, None] & (o_k < K)[None, :]
+    src = state_pool + slot * stride_p_n + i_h * stride_p_h
+    b_s = tl.load(
+        src + o_v[:, None] * stride_p_v + o_k[None, :] * stride_p_k, mask=mask & resume, other=0.0
+    )
+    dst = initial + (i_n * H + i_h).to(tl.int64) * V * K
+    tl.store(dst + o_v[:, None] * K + o_k[None, :], b_s, mask=mask)
+
+
+@triton.jit
+def _scatter_states_kernel(
+    final,
+    slots,
+    state_pool,
+    stride_p_n,
+    stride_p_h,
+    stride_p_v,
+    stride_p_k,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    K: tl.constexpr,
+    BV: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Program (sequence, head): the dense final state's `[V, K]` block into the sequence's
+    slot. `state_pool[slots] = final`, element for element."""
+    i_n, i_h = tl.program_id(0), tl.program_id(1)
+    slot = tl.load(slots + i_n).to(tl.int64)
+    o_v = tl.arange(0, BV)
+    o_k = tl.arange(0, BK)
+    mask = (o_v < V)[:, None] & (o_k < K)[None, :]
+    src = final + (i_n * H + i_h).to(tl.int64) * V * K
+    b_s = tl.load(src + o_v[:, None] * K + o_k[None, :], mask=mask)
+    dst = state_pool + slot * stride_p_n + i_h * stride_p_h
+    tl.store(dst + o_v[:, None] * stride_p_v + o_k[None, :] * stride_p_k, b_s, mask=mask)
 
 
 @triton.jit
@@ -350,6 +459,22 @@ def _last_step_o_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+#: Every launch of the call, through its compiled kernel once compiled (`Launch`). The
+#: vendored stages are launched through their bare `triton.jit` functions with the values
+#: their `triton.heuristics` would add -- the call always has `cu_seqlens` and a decay -- which
+#: is the specialization, and so the compiled kernel, their wrappers launch.
+_EXPAND = Launch(_expand_kernel)
+_DECAY_CUMSUM = Launch(_decay_cumsum_kernel)
+_KKT = Launch(_jit(chunk_scaled_dot_kkt_fwd_kernel))
+_SOLVE = Launch(_jit(solve_tril_16x16_kernel))
+_MERGE = Launch(_jit(merge_16x16_to_64x64_inverse_kernel))
+_W_U = Launch(_jit(recompute_w_u_fwd_kernel))
+_GATHER_STATES = Launch(_gather_states_kernel)
+_FWD_H_LAUNCH = Launch(_FWD_H)
+_LAST_STEP_O = Launch(_last_step_o_kernel)
+_SCATTER_STATES = Launch(_scatter_states_kernel)
+
+
 def _gdp_chunk_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -373,10 +498,14 @@ def _gdp_chunk_fwd(
     stage's wrapper builds its chunk list on the host, two device round trips
     per list; and its output stage computes every sub-step's output where only a
     token's last is kept. Here the states are gathered into a buffer the kernel
-    only reads and the final states scattered back after it, the chunk lists come
-    from `_chunk_list`, and `_last_step_o_kernel` computes the kept rows straight
-    into `out`. Every stage is launched over a grid sized from a bound instead of
-    the count, with its config from `_CONFIG`, none of them autotuned.
+    only reads and the final states scattered back after it, both chunk lists come
+    from one `_chunk_lists` launch, and `_last_step_o_kernel` computes the kept rows
+    straight into `out`. Every stage is launched over a grid sized from a bound
+    instead of the count, with its config from `_CONFIG`, none of them autotuned.
+
+    Eleven Triton launches and no torch kernel: the prefill step issues this call
+    once per GDP layer eagerly, so each launch's host time counts, and every one
+    goes through `Launch`.
     """
     num_tokens, num_householder, num_heads, value_dim = v.shape
     key_dim = k.shape[-1]
@@ -385,16 +514,16 @@ def _gdp_chunk_fwd(
         return out
     steps = num_tokens * num_householder
     num_seqs = cu_seqlens.shape[0] - 1
-    cu_steps = cu_seqlens.to(torch.long) * num_householder
-    chunks, chunk_offsets = _chunk_list(cu_steps, steps, _BT)
-    diag_blocks, _ = _chunk_list(cu_steps, steps, _BT_DIAG)
+    cu_steps, ((chunks, chunk_offsets), (diag_blocks, _)) = _chunk_lists(
+        cu_seqlens, num_householder, steps, (_BT, _BT_DIAG)
+    )
     num_chunks = chunks.shape[0]
 
     q_norm = torch.empty((num_tokens, num_heads, key_dim), dtype=q.dtype, device=q.device)
     k_steps = torch.empty((1, steps, num_heads, key_dim), dtype=k.dtype, device=q.device)
     v_steps = torch.empty((1, steps, num_heads, value_dim), dtype=v.dtype, device=q.device)
     beta_steps = torch.empty((1, steps, num_heads), dtype=beta.dtype, device=q.device)
-    _expand_kernel[(num_tokens,)](
+    _EXPAND[(num_tokens,)](
         q,
         k,
         v,
@@ -418,7 +547,7 @@ def _gdp_chunk_fwd(
     )
 
     g_cumsum = torch.empty((1, steps, num_heads), dtype=torch.float32, device=q.device)
-    _decay_cumsum_kernel[(num_chunks,)](
+    _DECAY_CUMSUM[(num_chunks,)](
         g,
         g_cumsum,
         cu_steps,
@@ -433,7 +562,7 @@ def _gdp_chunk_fwd(
 
     # chunk_scaled_dot_kkt_fwd: beta * K K^T within each chunk, strictly lower.
     a = torch.empty((1, steps, num_heads, _BT), dtype=torch.float32, device=q.device)
-    chunk_scaled_dot_kkt_fwd_kernel[(num_chunks, num_heads)](
+    _KKT[(num_chunks, num_heads)](
         k=k_steps,
         beta=beta_steps,
         g_cumsum=g_cumsum,
@@ -445,11 +574,13 @@ def _gdp_chunk_fwd(
         Hg=num_heads,
         K=key_dim,
         BT=_BT,
+        IS_VARLEN=True,
+        USE_G=True,
         **_CONFIG["kkt"],
     )
     # solve_tril: (I + A)^-1, the 16-sub-step diagonal blocks first, then merged.
     a_diag = torch.empty((1, steps, num_heads, _BT_DIAG), dtype=torch.float32, device=q.device)
-    solve_tril_16x16_kernel[(diag_blocks.shape[0], num_heads)](
+    _SOLVE[(diag_blocks.shape[0], num_heads)](
         A=a,
         Ad=a_diag,
         cu_seqlens=cu_steps,
@@ -457,10 +588,11 @@ def _gdp_chunk_fwd(
         T=steps,
         H=num_heads,
         BT=_BT,
+        IS_VARLEN=True,
         **_CONFIG["solve"],
     )
     a_inv = torch.empty((1, steps, num_heads, _BT), dtype=k_steps.dtype, device=q.device)
-    merge_16x16_to_64x64_inverse_kernel[(num_chunks, num_heads)](
+    _MERGE[(num_chunks, num_heads)](
         A=a,
         Ad=a_diag,
         Ai=a_inv,
@@ -469,12 +601,13 @@ def _gdp_chunk_fwd(
         T=steps,
         H=num_heads,
         BT=_BT,
+        IS_VARLEN=True,
         **_CONFIG["merge"],
     )
     # recompute_w_u_fwd: the WY factors.
     u = torch.empty_like(v_steps)
     w = k_steps.new_empty(1, steps, num_heads, key_dim)
-    recompute_w_u_fwd_kernel[(num_chunks, num_heads)](
+    _W_U[(num_chunks, num_heads)](
         k=k_steps,
         v=v_steps,
         beta=beta_steps,
@@ -490,11 +623,24 @@ def _gdp_chunk_fwd(
         K=key_dim,
         V=value_dim,
         BT=_BT,
+        IS_VARLEN=True,
         **_CONFIG["w_u"],
     )
-    rows = slots.to(torch.long)
     # A fresh sequence's slot holds whatever its previous owner left there.
-    initial = torch.where(has_initial_state[:, None, None, None], state_pool[rows], 0.0)
+    initial = torch.empty(
+        (num_seqs, num_heads, value_dim, key_dim), dtype=state_pool.dtype, device=q.device
+    )
+    state_blocks = dict(
+        H=num_heads,
+        V=value_dim,
+        K=key_dim,
+        BV=triton.next_power_of_2(value_dim),
+        BK=triton.next_power_of_2(key_dim),
+        num_warps=4,
+    )
+    _GATHER_STATES[(num_seqs, num_heads)](
+        state_pool, slots, has_initial_state, initial, *state_pool.stride(), **state_blocks
+    )
     # chunk_gated_delta_rule_fwd_h: the state entering each chunk, one program per
     # sequence and head, so its grid needs only the sequence count.
     h = k_steps.new_empty(1, num_chunks, num_heads, key_dim, value_dim)
@@ -502,7 +648,7 @@ def _gdp_chunk_fwd(
     final = torch.empty(
         (num_seqs, num_heads, value_dim, key_dim), dtype=torch.float32, device=q.device
     )
-    _FWD_H[(triton.cdiv(value_dim, _CONFIG["fwd_h"]["BV"]), num_seqs * num_heads)](
+    _FWD_H_LAUNCH[(triton.cdiv(value_dim, _CONFIG["fwd_h"]["BV"]), num_seqs * num_heads)](
         k=k_steps,
         v=u,
         w=w,
@@ -530,7 +676,7 @@ def _gdp_chunk_fwd(
         **_CONFIG["fwd_h"],
     )
     # The output of each token's last sub-step, the only one the mixer keeps.
-    _last_step_o_kernel[(triton.cdiv(value_dim, _CONFIG["o"]["BV"]), num_chunks, num_heads)](
+    _LAST_STEP_O[(triton.cdiv(value_dim, _CONFIG["o"]["BV"]), num_chunks, num_heads)](
         q_norm,
         k_steps,
         v_new,
@@ -548,7 +694,9 @@ def _gdp_chunk_fwd(
         BR=triton.next_power_of_2(triton.cdiv(_BT, num_householder)),
         **_CONFIG["o"],
     )
-    state_pool[rows] = final.to(state_pool.dtype)
+    _SCATTER_STATES[(num_seqs, num_heads)](
+        final, slots, state_pool, *state_pool.stride(), **state_blocks
+    )
     return out
 
 
@@ -772,12 +920,19 @@ class GdpChunk(OpWrapper):
     the pool on every benchmark run.
 
     No host syncs: the chunk lists the vendored stages index are built on the
-    device (`_chunk_list`) and every grid is sized from the token and sequence
+    device (`_chunk_lists`) and every grid is sized from the token and sequence
     counts, never from the lengths, where each stage's wrapper reads the lengths
     on the host with `prepare_chunk_indices` (every call, every layer). So the
     call can be captured in a CUDA graph once its kernels are compiled, and one
     capture serves any split of the same token count into the same number of
     sequences; the test replays one. Prefill only.
+
+    Host time: eleven Triton launches, no torch kernel, each launch through
+    `Launch`, which goes straight to the compiled kernel once the call's
+    specialization is compiled -- the same kernel and arguments as the JIT's own
+    dispatch, without its per-launch bookkeeping. The prefill step runs this
+    eagerly once per GDP layer; measured at a tp4 rank's 8192-token prefill, the
+    call issues in ~255 us of host against ~555 us of GPU work.
 
     One config per stage, no autotuning: every launch config is fixed, chosen by
     timing at this op's shapes, so two processes compute the same bits (the test
