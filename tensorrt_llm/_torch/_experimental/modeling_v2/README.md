@@ -210,10 +210,11 @@ Perf is measured, never gated.
 
 **Every entry is certified on sm_103, and all five targets are gated there.**
 
-The 34 entries -- 24 shared, 7 owned by deepseek, 3 by gpt-oss; the three
-nemotron4 targets own none, every entry they call being shared, and three shared
-entries, `cutlass_fused_moe`, `flashinfer_gdp_chunk` and `gdp_replay`, are
-surveys' picks that no target calls yet -- each drive
+The 38 entries -- 28 shared, 7 owned by deepseek, 3 by gpt-oss; the three
+nemotron4 targets own none, every entry they call being shared, and seven shared
+entries, `cutlass_fused_moe`, `dsv3_router_gemm`, `flashinfer_gdp_chunk`,
+`gdp_replay`, `lowm_direct_mm`, `lowm_splitk_mm` and `torch_mm`, are surveys'
+picks that no target calls yet -- each drive
 their cells through `__call__` and `reference` in pre-merge CI, plus the three
 4-rank collective matrices (all-gather, reduce-scatter, all-reduce).
 Certification is per architecture: `ARCHS` says

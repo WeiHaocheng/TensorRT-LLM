@@ -80,6 +80,10 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     constexpr int kHiddenDim7168 = 7168; // DeepSeek-V3 / DeepSeek-V3.2
     constexpr int kHiddenDim6144 = 6144; // GLM-5
     constexpr int kHiddenDim4096 = 4096; // DeepSeek-V4
+    // Nemotron-4 nano preview: 512 experts over hidden 3072, instantiated for 1 to 8 tokens only.
+    constexpr int kNumExperts512 = 512;
+    constexpr int kHiddenDim3072 = 3072;
+    constexpr int kMaxTokens512x3072 = 8;
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
     th::Tensor out = th::empty(output_size, mat_a.options().dtype(out_dtype_));
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
@@ -89,8 +93,17 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     bool const shape_ok
         = (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts && mat_b.sizes()[0] == hidden_dim
             && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32 && !bias.has_value());
+    bool const shape_512x3072_ok = (num_tokens >= 1 && num_tokens <= kMaxTokens512x3072 && num_experts == kNumExperts512
+        && hidden_dim == kHiddenDim3072 && mat_b.sizes()[0] == hidden_dim && data_type == torch::kBFloat16
+        && out_dtype_ == torch::kFloat32 && !bias.has_value());
 
-    if (shape_ok && hidden_dim == kHiddenDim7168)
+    if (shape_512x3072_ok)
+    {
+        LoopUnroller<1, kMaxTokens512x3072, kNumExperts512, kHiddenDim3072>::unroll(num_tokens,
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+    }
+    else if (shape_ok && hidden_dim == kHiddenDim7168)
     {
         LoopUnroller<1, 16, kNumExperts, kHiddenDim7168>::unroll(num_tokens,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
