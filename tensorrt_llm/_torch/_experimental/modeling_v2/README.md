@@ -238,12 +238,11 @@ gsm8k; deepseek-r1-0528-nvfp4 / sm_103 / dep4 runs gsm8k for the identity
 forward and the `mtp3` variant **paired in one session**, and the acceptance
 gate against stock modeling under the same `speculative_config`.
 nemotron4-nano-preview's text model / sm_103 has three targets, tp1, dep4 and
-tp4, gated in `tests/integration/defs/accuracy/test_modeling_v2_nemotron4.py`:
-routing on the shipped config for all three; gsm8k for all three, tp1's
-paired in one session with its MTP variant (one-model MTP-Eagle, draft length
-2); token identity with CUDA graphs on and off for all three; and, for tp1,
-token identity with MTP on and off, and the acceptance gate (also for tp4).
-TensorRT-LLM has no built-in implementation of this architecture, so there is
+tp4, each gated in `tests/integration/defs/accuracy/test_modeling_v2_nemotron4.py`
+the same five ways: routing on the shipped config; gsm8k paired in one session
+with its MTP variant (one-model MTP-Eagle, draft length 2); token identity with
+CUDA graphs on and off; token identity with MTP on and off; and the acceptance
+gate. TensorRT-LLM has no built-in implementation of this architecture, so there is
 no stock leg: the gsm8k anchor is the checkpoint's own HuggingFace code under
 the same protocol, and the acceptance anchor is a plain-torch transcription of
 its MTP layer. The MTP layer's module accuracy, and the decode and verify
