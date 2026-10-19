@@ -207,7 +207,7 @@ Perf is measured, never gated.
 
 **Every entry is certified on sm_103, and all five targets are gated there.**
 
-The 33 entries -- 23 shared, 7 owned by deepseek, 3 by gpt-oss; the three
+The 37 entries -- 27 shared, 7 owned by deepseek, 3 by gpt-oss; the three
 nemotron4 targets own none, every entry they call being shared -- each drive
 their cells through `__call__` and `reference` in pre-merge CI, plus the three
 4-rank collective matrices (all-gather, reduce-scatter, all-reduce).
