@@ -47,7 +47,7 @@ measured under the protocol these tests run.
 """
 
 import dataclasses
-from collections import Counter
+from collections import Counter, defaultdict
 
 import pytest
 
@@ -846,6 +846,106 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance(_MtpAcceptance):
 
         The ~8K prompts' prefills run beside the short prompts' verify steps,
         and AL_trt comes from the iteration statistics.
+        """
+        self._check_acceptance(monkeypatch)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_MtpAcceptance):
+    """nemotron4-nano-preview (text model) / sm_103 / dep4, MTP-Eagle draft 2.
+
+    The acceptance length against the checkpoint's own MTP layer, on 4 ranks
+    with attention DP. Each rank drafts and verifies its own requests, and the
+    ranks meet in every routed MoE block, the MTP layer's included; a rank with
+    no request left runs the attention-DP dummy. Every prompt is pinned to a
+    rank, and MAX_BATCH_SIZE and the CUDA graphs are per rank.
+    """
+
+    # Attention DP over the 4 GPUs of one node with the routed experts split
+    # four ways: the topology the dep4 target implements. Every rank-step
+    # carries at most 2048 tokens, inside the routed MoE's certified all-gather
+    # and reduce-scatter cells, so the ~8K prompts prefill in 2048-token chunks.
+    ENGINE_ARGS = dict(
+        tensor_parallel_size=4,
+        moe_expert_parallel_size=4,
+        enable_attention_dp=True,
+        max_num_tokens=2048,
+        enable_chunked_prefill=True,
+    )
+    RANKS = 4
+
+    # How far the target's MTP logits can move a margin of the reference's
+    # drafts, per draft depth: the larger of the MTP module gate's worst |logit
+    # difference| against the reference's own drafting chain on the same trunk
+    # hidden states and its largest gain of any token on that chain's top-1,
+    # over the 4 ranks, each running the prompt set in its own rotation
+    # (test_modeling_v2_dep4_mtp_layer.py; depth 1: 2.6806 and 2.619, depth 2:
+    # 2.8998 and 4.5655, the gain rank 3's), plus the band on the target trunk's
+    # logits against the reference's: dep4's trunk passes check_goldens_dep4.py
+    # with tp1's bands, whose free-running logits band is 2.0.
+    MTP_LOGIT_ERROR = (2.6806, 4.5655)
+    TRUNK_LOGIT_BAND = 2.0
+
+    def _ranks(self, prompts) -> dict[str, int]:
+        """One long prompt per rank, the short ones dealt round-robin.
+
+        Submitted in the prompt set's order, the short prompts first, so a
+        rank's long prompt prefills in chunks while the rank's short requests
+        verify.
+        """
+        longs = [p.name for p in prompts if p.long]
+        shorts = [p.name for p in prompts if not p.long]
+        assert len(longs) == self.RANKS, f"{len(longs)} long prompts for {self.RANKS} ranks"
+        ranks = {name: rank for rank, name in enumerate(longs)}
+        ranks.update({name: i % self.RANKS for i, name in enumerate(shorts)})
+        return ranks
+
+    def _engine_al(
+        self, stats: list[dict], walks: dict[str, list[tuple[int, int]]], ranks: dict[str, int]
+    ) -> tuple[float, int, dict]:
+        """AL_trt from the requests' own walks, which are exact on every rank.
+
+        Under attention DP the iteration statistics hold one row per rank and
+        iteration, and every row carries rank 0's speculative-decoding counts
+        (``ADPIterStatsBuffer._make_rank_iter_stats``): they count rank 0's
+        requests once per rank and the other ranks' requests never. They are
+        reported, not used: the suite's estimator over them, how many
+        iterations' rows agree, and rank 0's rows against rank 0's requests.
+        """
+        rows = [s for s in stats if (s.get("specDecodingStats") or {}).get("numDraftTokens", 0) > 0]
+        by_iteration = defaultdict(list)
+        for s in rows:
+            by_iteration[s["iter"]].append(s["specDecodingStats"])
+        rank0_rows = [s["specDecodingStats"] for s in rows if s["attentionDpRank"] == 0]
+        rank0_walks = [walks[name] for name, rank in ranks.items() if rank == 0]
+        return (
+            _al([a for walk in walks.values() for _, a in walk]),
+            0,
+            dict(
+                iteration_stats_al=round(acceptance_length_from_iteration_stats(stats), 4),
+                iteration_stats_rows_by_rank=dict(
+                    sorted(Counter(s["attentionDpRank"] for s in rows).items())
+                ),
+                iterations_with_drafts=len(by_iteration),
+                iterations_whose_rows_agree=sum(
+                    all(row == group[0] for row in group) for group in by_iteration.values()
+                ),
+                iteration_stats_rank0_steps=sum(
+                    s["numRequestsWithDraftTokens"] for s in rank0_rows
+                ),
+                iteration_stats_rank0_accepted=sum(s["numAcceptedTokens"] for s in rank0_rows),
+                rank0_request_steps=sum(len(walk) for walk in rank0_walks),
+                rank0_request_accepted=sum(a for walk in rank0_walks for _, a in walk),
+            ),
+        )
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_mtp2_acceptance_matches_reference(self, monkeypatch):
+        """The acceptance length the target measures matches the reference's (``_check_acceptance``).
+
+        Each rank verifies its requests beside its long prompt's prefill chunks
+        and beside ranks that verify, prefill or idle, and AL_trt comes from the
+        requests' own walks.
         """
         self._check_acceptance(monkeypatch)
 
