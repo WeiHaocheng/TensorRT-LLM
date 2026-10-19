@@ -12,6 +12,33 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 
 from .._op import Arch, Cell, OpWrapper
 
+#: nemotron4-nano-preview's MoE dispatch row: one routed token's 768 bf16 latent values, then
+#: its 10 int32 expert ids, then its 10 fp32 routing weights, gathered as raw bytes.
+_NEMOTRON4_DISPATCH_ROW_BYTES = 768 * 2 + 10 * 4 + 10 * 4
+
+#: The per-rank token counts its dep4 step gathers, as (busiest rank's rows, every rank's rows in
+#: rank order or None when they are equal, what the height covers).
+_NEMOTRON4_DISPATCH_SPLITS = (
+    (1, None, "decode, one token per rank"),
+    (32, None, "32 tokens per rank, ~52 KB each"),
+    (256, None, "256 tokens per rank, ~0.4 MB each"),
+    (1024, None, "1024 tokens per rank, ~1.7 MB each"),
+    (2048, None, "prefill chunk, 2048 tokens per rank"),
+    (32, [32, 17, 1, 5], "ragged decode, busiest rank 0"),
+    (256, [1, 256, 129, 33], "ragged at 256 tokens, busiest rank 1"),
+    (1024, [513, 65, 1024, 1], "ragged at 1024 tokens, busiest rank 2"),
+    (2048, [1, 3, 1, 2048], "mixed step, rank 3 prefills 2048 tokens"),
+)
+
+
+def _nemotron4_dispatch(why: str, rows: int, sizes: Optional[List[int]] = None) -> Cell:
+    return Cell(
+        why=why,
+        spec=dict(
+            rows=rows, trailing=(_NEMOTRON4_DISPATCH_ROW_BYTES,), dtype=torch.uint8, sizes=sizes
+        ),
+    )
+
 
 class Allgather(OpWrapper):
     """Gather `input` from every rank in `group`, concatenated along dim 0.
@@ -23,11 +50,23 @@ class Allgather(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # deepseek-r1 at dep4 is the only caller and always passes `sizes=None`:
-    # it pads every rank to a common height first, so the ragged form the op
-    # also supports is not something a shipped target reaches. Row counts span
-    # what an attention-DP rank feeds its expert-parallel MoE call, from one
-    # decode token to a full prefill chunk.
+    # A cell's `rows` is its busiest rank's height. `sizes` is None when every
+    # rank holds `rows` rows (the padded form) or lists every rank's height in
+    # rank order (the ragged form, which the op serves by a different path).
+    #
+    # deepseek-r1 at dep4 pads every rank to a common height first and always
+    # passes `sizes=None`. Its row counts span what an attention-DP rank feeds
+    # its expert-parallel MoE call, from one decode token to a full prefill chunk.
+    #
+    # nemotron4-nano-preview at dep4 packs each routed token into one
+    # `_NEMOTRON4_DISPATCH_ROW_BYTES` row, so a MoE block makes one gather
+    # rather than three. Attention DP gives ranks different token counts, so its
+    # ragged form is certified beside the padded one. Every rank holds at least
+    # one row, because an idle attention-DP rank runs a dummy request
+    # (`_pad_attention_dp_dummy_request`). That is also why one token per rank
+    # has no ragged cell. The ragged cells move the busiest rank through every
+    # position. The reduce-scatter entry certifies the same per-rank counts,
+    # because one step's gather and reduce-scatter carry them both.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one row per rank, hidden 7168",
@@ -41,12 +80,20 @@ class Allgather(OpWrapper):
             why="prefill chunk height",
             spec=dict(rows=2048, trailing=(7168,), dtype=torch.bfloat16, sizes=None),
         ),
+        *(
+            _nemotron4_dispatch(f"nemotron4 dep4 {what}, packed dispatch rows", rows, sizes)
+            for rows, sizes, what in _NEMOTRON4_DISPATCH_SPLITS
+        ),
     )
 
     note = """
-    The ragged form (`sizes` as an explicit per-rank vector) and dtypes other
-    than bf16 work and are exercised by the op matrix, but no shipped target
-    reaches them, so they are not cells.
+    Certified dtypes: bf16 rows, and the uint8 bytes of nemotron4's packed
+    dispatch row. fp16, fp32, int32 and fp8 move bitwise in the op matrix, but
+    no target passes them, so they are not cells. A packed row is only bytes to
+    this op. The caller takes the fields back as views of the gathered rows:
+    `[:, :1536].view(torch.bfloat16)`, `[:, 1536:1576].view(torch.int32)` and
+    `[:, 1576:].view(torch.float32)`. Those views are strided, with one row
+    every 1616 bytes, not contiguous.
 
     CUDA graph behaviour -- capture at every engine batch size, replays
     surviving eager calls of other shapes, the captured sizes vector being held
