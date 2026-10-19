@@ -47,6 +47,19 @@ rows in the same order, each on its own slots. `Nemotron4StateMetadata` turns
 the engine's per-step slot list into the slots the state entries read; each
 target's `step_args` projects the prepared metadata onto the explicit
 arguments its forward passes.
+
+Batch invariance. A decode step computes every row from that row alone, in an
+order that does not depend on how many rows share the step, so a request's
+logits and the state it writes are bitwise the same alone, in any eager batch
+and in a padded CUDA-graph batch, on every rank. cuBLAS picks its kernel by the
+row count, and at three of a rank's GEMM shapes -- its slice of the GDP
+`in_proj`, the router and `fc1_latent_proj` -- the kernels it picks sum
+differently: decode runs those through `invariant_mm`, and generation attention
+through `invariant_gen_attention`, whose KV split is fixed. The all-reduce
+moves nothing: it forms every element's sum by one formula -- fp32, rank order,
+one rounding -- whatever the row count or the row's place in the message.
+Prefill and mixed steps keep cuBLAS and `thop_attention`; CUDA graphs do not
+change their batches.
 """
 
 import weakref
@@ -59,6 +72,9 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.softclamp_relu2 import (
     softclamp_relu2,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.invariant_gen_attention import (
+    invariant_gen_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
@@ -74,6 +90,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_gates import gdp_gates
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_recurrent import gdp_recurrent
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.invariant_mm import invariant_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
     latent_moe_experts,
 )
@@ -367,7 +384,8 @@ def _allreduce_workspace(model_config: ModelConfig, widths: tuple[int, ...]) -> 
 #
 # Built once per target off the loaded weights: each GEMM operand as the `.t()` view cublas_mm
 # reads, each wide-residual coefficient as the bf16 [3] vector wide_residual reads. Shapes are a
-# rank's.
+# rank's. The decode target runs the operands marked "invariant_mm" through that entry instead,
+# which reads the stored [out, in] weight; its views keep that layout for them.
 
 
 class _Read(NamedTuple):
@@ -388,7 +406,7 @@ class _Gdp(NamedTuple):
     """A GDP mixer (`Nemotron4GDPMixer`) on this rank's 6 heads."""
 
     layer: int  # global layer index: its state pools are step["ssm_states"/"conv_states"][layer]
-    in_proj: torch.Tensor  # [hidden, 4632]
+    in_proj: torch.Tensor  # [hidden, 4632]; invariant_mm: [4632, hidden]
     conv: torch.Tensor  # [4224, 4]
     neg_a: torch.Tensor  # -exp(A_log) [6] fp32
     dt_bias: torch.Tensor  # [6]
@@ -416,9 +434,9 @@ class _Moe(NamedTuple):
     """A latent MoE (`Nemotron4MoE`): router, routed latent experts at this rank's quarter
     of every expert's intermediate width, shared expert at a quarter of its width."""
 
-    router: torch.Tensor  # [hidden, 512]
+    router: torch.Tensor  # [hidden, 512]; invariant_mm: [512, hidden]
     router_bias: torch.Tensor  # [512] fp32
-    fc1_latent: torch.Tensor  # [hidden, 768]
+    fc1_latent: torch.Tensor  # [hidden, 768]; invariant_mm: [768, hidden]
     experts_up: torch.Tensor  # [512, 1024, 768]
     experts_down: torch.Tensor  # [512, 768, 1024]
     fc2_norm: torch.Tensor  # [768]
@@ -458,13 +476,21 @@ def _block_reads(w, layer_types: tuple[str, ...], i: int) -> tuple[_Read, ...]:
     return (_Read(w[f"l{i}_res_read"], w[f"l{i}_input_norm"]),)
 
 
-def _layer_views(w, layer_types: tuple[str, ...]) -> tuple[_Layer, ...]:
+def _layer_views(w, layer_types: tuple[str, ...], row_invariant: bool) -> tuple[_Layer, ...]:
+    """Every block's operands. With `row_invariant`, the GEMMs whose cuBLAS kernel changes with
+    the row count at a rank's shapes (its slice of the GDP `in_proj`, the router and
+    `fc1_latent_proj`) keep the stored [out, in] weight `invariant_mm` reads; every other GEMM
+    operand is the `.t()` view `cublas_mm` reads."""
+
+    def mm(name: str) -> torch.Tensor:
+        return w[name] if row_invariant else w[name].t()
+
     layers = []
     for i, kind in enumerate(layer_types):
         if kind in _GDP_BLOCKS:
             mixer = _Gdp(
                 layer=i,
-                in_proj=w[f"l{i}_gdp_in"].t(),
+                in_proj=mm(f"l{i}_gdp_in"),
                 conv=w[f"l{i}_gdp_conv"],
                 neg_a=w[f"l{i}_gdp_neg_a"],
                 dt_bias=w[f"l{i}_gdp_dt_bias"],
@@ -478,9 +504,9 @@ def _layer_views(w, layer_types: tuple[str, ...]) -> tuple[_Layer, ...]:
         if kind in _SHORTCUT_BLOCKS:
             write = _Write(w[f"l{i}_mix_retain"], w[f"l{i}_mix_write"])
             moe = _Moe(
-                router=w[f"l{i}_router"].t(),
+                router=mm(f"l{i}_router"),
                 router_bias=w[f"l{i}_router_bias"],
-                fc1_latent=w[f"l{i}_fc1_latent"].t(),
+                fc1_latent=mm(f"l{i}_fc1_latent"),
                 experts_up=w[f"l{i}_experts_up"],
                 experts_down=w[f"l{i}_experts_down"],
                 fc2_norm=w[f"l{i}_fc2_norm"],
@@ -663,15 +689,23 @@ class Nemotron4NanoPreviewTp4ModelingV2(DecoderModel):
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
         """Which target runs this step.
 
-        One host-side integer read and nothing else: a decode-only CUDA graph is a
-        per-capture constant environment, and a predicate that reached for a second field
-        would be reading one this call is not guaranteed to carry. A mixed batch -- context
-        and generation rows in one step -- goes to prefill, so prefill is the general case
-        and decode the specialization that may assume it has no context rows. Every rank
-        runs the same rows, so every rank picks the same target and issues the same
-        all-reduces.
+        Host-side reads only: a decode-only CUDA graph is a per-capture constant
+        environment. A mixed batch -- context and generation rows in one step -- goes to
+        prefill, so prefill is the general case and decode the specialization that may
+        assume it has no context rows. Every rank runs the same rows, so every rank picks
+        the same target and issues the same all-reduces.
+
+        The engine's TRTLLM-Gen JIT warmup goes to prefill too. It is one eager step of
+        generation rows, run with `trtllm_gen_jit_warmup` raised so that thop_attention
+        compiles its generation kernels for every batch size and length up front. Decode
+        runs no thop_attention, but the generation rows of mixed steps do, and without the
+        warmup each kernel would compile at its first mixed step, mid-serve. The engine
+        sets the flag on every step and raises it only there, never under a CUDA graph,
+        and on every rank alike.
         """
-        return self._decode if attn_metadata.num_contexts == 0 else self._prefill
+        if attn_metadata.num_contexts or attn_metadata.trtllm_gen_jit_warmup:
+            return self._prefill
+        return self._decode
 
     def forward(
         self,
@@ -694,6 +728,24 @@ def _state_metadata(md: AttentionMetadata) -> Nemotron4StateMetadata:
             "(config_utils.is_nemotron4)"
         )
     return state
+
+
+def _heads(x: torch.Tensor, cols: slice, *inner: int) -> torch.Tensor:
+    """`x[:, cols]` as `[rows, *inner]`, keeping `x`'s own row stride at every row count.
+
+    `x[:, cols].view(rows, *inner)` gives a one-row batch the inner block's size as its row
+    stride -- 768, 2304 or 1152 for the GDP q, k and v -- where every larger batch keeps the
+    in_proj output's 4632. gdp_recurrent's kernel is specialized on its strides' divisibility by
+    16, on which those disagree, so a request alone would run another compiled variant of it,
+    whose reductions round otherwise, than the same request inside any batch.
+    """
+    strides, size = [], 1
+    for n in reversed(inner):
+        strides.insert(0, size)
+        size *= n
+    return x.as_strided(
+        (x.shape[0], *inner), (x.stride(0), *strides), x.storage_offset() + cols.start
+    )
 
 
 def _check_rows(num_tokens: int, workspace: _AllreduceWorkspace) -> None:
@@ -719,7 +771,7 @@ class PrefillTarget:
         self._d = _dims(core.model_config.pretrained_config.text_config, core.tp_size)
         self._embed = core.w["embed"]
         self._first_reads = _block_reads(core.w, core.layer_types, 0)
-        self._layers = _layer_views(core.w, core.layer_types)
+        self._layers = _layer_views(core.w, core.layer_types, row_invariant=False)
         self._ar = core.allreduce_workspace
 
     def _check_step_contract(self, md) -> None:
@@ -1022,7 +1074,15 @@ class PrefillTarget:
 
 
 class DecodeTarget:
-    """The specialization: routed to only when there are no context rows."""
+    """The specialization: routed to only when there are no context rows.
+
+    Batch-invariant: every entry it calls computes a row from that row alone, in an order
+    the row count does not change, so each request's logits and the state it writes are
+    the same bits whatever batch, padded or not, the step runs in. The GEMMs whose cuBLAS
+    kernel changes with the row count at a rank's shapes run through `invariant_mm`;
+    attention runs through `invariant_gen_attention`, whose KV split is fixed; the
+    all-reduce sums every element by one formula at any row count.
+    """
 
     def __init__(self, core: Nemotron4NanoPreviewTp4ModelingV2) -> None:
         """Take the views and constants this target's forward reads, once, off the real weights."""
@@ -1034,7 +1094,7 @@ class DecodeTarget:
         self._d = _dims(core.model_config.pretrained_config.text_config, core.tp_size)
         self._embed = core.w["embed"]
         self._first_reads = _block_reads(core.w, core.layer_types, 0)
-        self._layers = _layer_views(core.w, core.layer_types)
+        self._layers = _layer_views(core.w, core.layer_types, row_invariant=True)
         self._ar = core.allreduce_workspace
 
     def _check_step_contract(self, md) -> None:
@@ -1053,57 +1113,29 @@ class DecodeTarget:
         self._contract_pending = False
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        """Project the prepared metadata onto the explicit batch state of thop_attention
-        (`attention`) and of the recurrent-state entries, once per forward.
+        """Project the prepared metadata onto the explicit batch state of
+        invariant_gen_attention (`attention`) and of the recurrent-state entries, once per
+        forward.
 
         Every row is one generation token, the same rows in the same order on every rank.
-        Under a CUDA graph the rows include the padding up to the graph's batch, whose
-        `state_slots` entry is `PAD_SLOT_ID`.
+        Under a CUDA graph the rows include the trailing padding rows, whose `state_slots`
+        entry is `PAD_SLOT_ID`; their attention reads the padding dummy's own pages.
         """
         state = _state_metadata(md)
         views = self.core.state_views(md.kv_cache_manager)
         num_rows = md.num_seqs
         return dict(
             attention=dict(
+                # Lengths count this step's token and are read on the device only, where the
+                # overlap scheduler corrects them.
                 sequence_length=md.kv_lens_cuda_runtime,
-                host_past_key_value_lengths=md.kv_lens_runtime,
-                host_total_kv_lens=md.host_total_kv_lens,
-                context_lengths=md.prompt_lens_cuda_runtime,
-                host_context_lengths=md.prompt_lens_cpu_runtime,
-                host_request_types=md.host_request_types_runtime,
                 kv_cache_block_offsets=md.kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-                workspace_=md.effective_workspace,
-                tokens_per_block=md.tokens_per_block,
-                max_num_requests=md.max_num_requests,
-                max_context_length=md.max_context_length,
-                max_seq_len=md.max_seq_len,
-                attention_window_size=md.max_seq_len,
                 num_contexts=0,
-                num_ctx_tokens=0,
-                trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-                use_paged_context_fmha=md.use_paged_context_fmha,
-                beam_width=md.effective_beam_width,
-                cache_indirection=md.cache_indirection,
-                block_ids_per_seq=md.block_ids_per_seq,
-                max_context_q_len_override=md.max_context_q_len_override,
-                is_cross=md.is_cross,
-                is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-                use_spec_decoding=md.use_spec_decoding,
-                is_spec_dec_tree=md.is_spec_dec_tree,
-                spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-                spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
-                spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-                spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-                spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-                spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-                spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
-                num_sparse_topk=md.num_sparse_topk,
-                flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-                flash_mla_num_splits=md.flash_mla_num_splits,
-                max_num_sequences=md.max_num_sequences,
-                force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+                tokens_per_block=md.tokens_per_block,
+                # Sizes the entry's grid: the cache manager's bound on every length.
+                max_seq_len=md.max_seq_len,
             ),
             # Recurrent state: one row per token, padding rows on PAD_SLOT_ID.
             num_rows=num_rows,
@@ -1141,16 +1173,18 @@ class DecodeTarget:
             if isinstance(L.mixer, _Gdp):
                 update = self._gdp(x, L.mixer, step)
             elif isinstance(L.mixer, _Attention):
-                qkv = cublas_mm(x, L.mixer.qkv)
-                attn_out = thop_attention(
-                    q=qkv,
+                # Appends the row's K/V to its request's pages, then attends over them. NoPE;
+                # q_scaling 1 keeps the softmax scale at head_dim**-0.5 = 1/16.
+                attn_out = invariant_gen_attention(
+                    q=cublas_mm(x, L.mixer.qkv),
                     output=attn_out,
                     local_layer_idx=step["kv_layer"][L.mixer.layer],
+                    tokens_per_seq=1,
                     num_heads=d.heads_q,
                     num_kv_heads=d.heads_kv,
                     head_size=d.head_dim,
+                    q_scaling=1.0,
                     **step["attention"],
-                    **_CALL_CONSTANTS,
                 )
                 update = allreduce(cublas_mm(attn_out, L.mixer.o), self._ar.buffer, self._ar.flags)
             else:
@@ -1197,7 +1231,7 @@ class DecodeTarget:
         `out_proj` partials are all-reduced."""
         d = self._d
         slots = step["state_slots"]
-        proj = cublas_mm(x, g.in_proj)  # [B, 4632] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
+        proj = invariant_mm(x, g.in_proj)  # [B, 4632] = [z | V0..V2 K0..K2 Q | b0..b2 | a]
         num_rows = proj.shape[0]
         # In place: the conv columns of the in_proj output become the conv output.
         causal_conv1d_update(
@@ -1213,9 +1247,9 @@ class DecodeTarget:
         vkq = proj[:, d.conv]
         beta, decay = gdp_gates(proj[:, d.beta], proj[:, d.decay], g.neg_a, g.dt_bias)
         out = gdp_recurrent(
-            vkq[:, d.conv_q].view(num_rows, d.gdp_heads, d.gdp_key),
-            vkq[:, d.conv_k].view(num_rows, d.gdp_householder, d.gdp_heads, d.gdp_key),
-            vkq[:, d.conv_v].view(num_rows, d.gdp_householder, d.gdp_heads, d.gdp_value),
+            _heads(vkq, d.conv_q, d.gdp_heads, d.gdp_key),
+            _heads(vkq, d.conv_k, d.gdp_householder, d.gdp_heads, d.gdp_key),
+            _heads(vkq, d.conv_v, d.gdp_householder, d.gdp_heads, d.gdp_value),
             decay,
             beta,
             step["ssm_states"][g.layer],
@@ -1246,7 +1280,7 @@ class DecodeTarget:
         """
         d = self._d
         weights, ids = noaux_tc_op(
-            cublas_mm(routed, m.router, None, torch.float32),
+            invariant_mm(routed, m.router, torch.float32),
             m.router_bias,
             1,
             1,
@@ -1254,7 +1288,7 @@ class DecodeTarget:
             d.routed_scale,
         )
         experts = latent_moe_experts(
-            cublas_mm(routed, m.fc1_latent),
+            invariant_mm(routed, m.fc1_latent),
             ids,
             weights,
             m.experts_up,
