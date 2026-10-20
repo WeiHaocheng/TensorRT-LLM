@@ -225,9 +225,11 @@ class GdpVerify(OpWrapper):
 
     # tokens is 1 + max_draft_len: 3 for the checkpoint's trained depth (draft
     # length 2), 2 for draft length 1, 4 to 6 for draft lengths 3 to 5, which
-    # tp1 also runs (up to its max_batch_size). The batch sizes are the decode
-    # CUDA graphs the target captures plus the eager size 3; a graph batch ends
-    # in one PAD_SLOT_ID padding row.
+    # tp1 also runs (up to its max_batch_size; a dep4 rank, at tp1's geometry,
+    # runs 4), and 6 at a tp4 rank, which also runs five drafts (up to its MTP
+    # max_batch_size 512). The batch sizes are the decode CUDA graphs the target
+    # captures plus the eager size 3; a graph batch ends in one PAD_SLOT_ID
+    # padding row.
     # The pool is a GDP layer's view in one of the two hybrid managers: "v1"
     # (`CppMambaHybridCacheManager`) follows each slot's ssm state with its conv
     # state, a slot stride of 221952 floats; "v2" (`MambaHybridCacheManagerV2`,
@@ -525,6 +527,50 @@ class GdpVerify(OpWrapper):
             spec=dict(tokens=3, batch=1024, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
         ),
         Cell(
+            why="tp4 rank, draft 5, concurrency 1: one request, v2 pool",
+            spec=dict(tokens=6, batch=1, pad_rows=0, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, graph batch 2 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=2, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, eager batch 3, v2 pool",
+            spec=dict(tokens=6, batch=3, pad_rows=0, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, graph batch 4 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=4, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, graph batch 8 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=8, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, graph batch 16 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=16, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, graph batch 32 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=32, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, graph batch 64 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=64, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, graph batch 128 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=128, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, graph batch 256 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=256, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 5, graph batch 512 (tp4's MTP max_batch_size) with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=512, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
             why="tp4 rank, draft 1, concurrency 1: one request, v1 pool",
             spec=dict(tokens=2, batch=1, pad_rows=0, pool="v1", **_NEMOTRON4_TP4),
         ),
@@ -582,11 +628,11 @@ class GdpVerify(OpWrapper):
     may round apart, and Triton specializes each on its strides' divisibility
     by 16, which a request's stride and a decode row's need not share.
 
-    Uncertified: T other than 2 and 3 (and 4 to 6 at tp1's geometry only, which
-    a dep4 rank shares), an intermediate whose token dim exceeds T, a pool other
-    than the two managers' layouts, and the shapes `gdp_recurrent` leaves
-    uncertified. CUDA-graph capturable: no host sync and no allocation besides
-    `out`.
+    Uncertified: T other than 2 and 3 (and 4 to 6 at tp1's geometry, which a
+    dep4 rank shares, and 6 at a tp4 rank's), an intermediate whose token dim
+    exceeds T, a pool other than the two managers' layouts, and the shapes
+    `gdp_recurrent` leaves uncertified. CUDA-graph capturable: no host sync and
+    no allocation besides `out`.
     """
 
     def __call__(

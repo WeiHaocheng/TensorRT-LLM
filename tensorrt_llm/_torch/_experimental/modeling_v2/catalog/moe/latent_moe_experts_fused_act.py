@@ -9,15 +9,16 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 from .latent_moe_experts import (
     _FUSED_TILES,
+    _SUM_SLOTS,
+    _TILE_MAP,
     _clamped_relu2_weighted,
     _experts,
     _fp32_reciprocal,
     _sort_and_gather,
-    _sum_slots_kernel,
-    _tile_map_kernel,
     _tiles_for,
     latent_moe_experts,
 )
@@ -129,6 +130,11 @@ def _up_act_kernel(
         )
 
 
+#: The up GEMM launched straight to its compiled form once compiled (`Launch`), as the entry's
+#: other kernels are: a tp4 prompt step makes one call per MoE block, and its host time counts.
+_UP_ACT = Launch(_up_act_kernel)
+
+
 def _takes_fused_act(
     x: torch.Tensor, topk_ids: torch.Tensor, up_proj: torch.Tensor, down_proj: torch.Tensor
 ) -> bool:
@@ -163,7 +169,7 @@ def _experts_fused_act(
     rows = order.numel()
     max_tiles = triton.cdiv(rows, _BLOCK_M) + min(num_local_experts, rows)
     work = torch.empty(1 + 3 * max_tiles, dtype=torch.int32, device=x.device)
-    _tile_map_kernel[(1,)](
+    _TILE_MAP[(1,)](
         offs,
         work,
         num_local_experts,
@@ -173,7 +179,7 @@ def _experts_fused_act(
     )
     h = torch.empty(rows, intermediate, dtype=x.dtype, device=x.device)
     programs = torch.cuda.get_device_properties(x.device).multi_processor_count
-    _up_act_kernel[(programs,)](
+    _UP_ACT[(programs,)](
         TensorDescriptor.from_tensor(xg, [_BLOCK_M, _BLOCK_K]),
         TensorDescriptor.from_tensor(up_proj.view(-1, latent), [_BLOCK_N, _BLOCK_K]),
         h,
@@ -201,7 +207,7 @@ def _experts_fused_act(
         device=x.device,
     )
     block_l = min(1024, triton.next_power_of_2(latent))
-    _sum_slots_kernel[(num_tokens, triton.cdiv(latent, block_l))](
+    _SUM_SLOTS[(num_tokens, triton.cdiv(latent, block_l))](
         o,
         inv,
         offs[-1:],

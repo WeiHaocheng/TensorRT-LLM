@@ -34,7 +34,8 @@ def _use_cp(max_seqlen: int, num_tokens: int, num_seqs: int, num_heads: int) -> 
     (8192, 8192) 0.619 / 0.675; 4 x 2048 0.471 / 0.183; 8 x 1024 0.512 / 0.200; 6 heads:
     (4096, 4096) 0.152 / 0.343, 8 x 1024 0.219 / 0.099. So CP when the longest sequence is
     long and either holds most of the tokens or the batch leaves the GPU mostly idle. The
-    choice moves only time: both paths compute the same recurrence and are certified alike.
+    choice moves time and rounding, not accuracy: both paths compute the same recurrence and
+    are certified alike.
     """
     if max_seqlen < _CP_MIN_LEN:
         return False
@@ -410,9 +411,9 @@ class FlashinferGdpChunk(OpWrapper):
     Inputs and state pool are `gdp_chunk`'s, argument for argument, so a target swaps one call
     for the other; `max_seqlen` is added: the longest sequence's token count as a host int,
     which the caller knows without a device round trip (the attention metadata's host
-    `seq_lens`). It chooses between FlashInfer's two kernels (`_use_cp`) and moves only time:
-    a wrong value costs speed, never a result, and a device tensor in its place would make
-    the choice sync.
+    `seq_lens`). It chooses between FlashInfer's two kernels (`_use_cp`) and moves only time
+    and rounding: a wrong value costs speed, never accuracy, and a device tensor in its place
+    would make the choice sync.
 
     Numerics: the l2-normalized q and k, the padded v and the output are bf16, the gates and
     the state fp32; FlashInfer keeps the state fp32 between chunks. Both paths sit within the
@@ -420,6 +421,22 @@ class FlashinferGdpChunk(OpWrapper):
     element 13.1 against 13.8 ulp over the cells at six seeds; relative RMS and the states
     lower), and on real layer 0 and 6 inputs of four ~8K prompts their worst output element
     equals `gdp_chunk`'s (both round the normalized keys to bf16) with smaller state errors.
+
+    Chunked prefill moves the CP kernel's bits. FlashInfer sizes CP's segments from each call's
+    length and head count (one wave of CTAs: ~6 segments for a long call at 24 heads, up to ~24
+    at 6) and composes the state across them through TF32 products. Measured on the real inputs
+    above at 24 heads, a prompt in 2048- or 4096-token calls is computed bit for bit as one call
+    whose segment length is forced to theirs: the handoff through the slot is exact, and only
+    the segmentation moves the bits. The per-sequence kernel gives a prompt in 2048-token calls
+    the bits of one call, since a cut at a multiple of 64 tokens falls on its 64-sub-step chunk
+    grid. Accuracy moves with the segmentation at 24 heads: layer 6's final state sits 0.47-0.61
+    ulp RMS from an fp64 recurrence at one call's 4096-sub-step segments, 0.94-1.01 at a
+    2048-token call's 1024, and 1.65-1.77 at 512, all inside the state band; layer 0 stays at
+    0.49-0.71. 6-head calls (a tp4 rank's quarters) stay at 0.41-0.66 whether the prompt runs
+    in one call (1024-sub-step segments), in 2048-token calls or split once, and at a forced
+    common segment length they round 11 to 15 of the 24 heads differently from the 24-head
+    call. The synthetic cells show none of this: chained calls of 8192 down to 1024 tokens
+    score alike on them.
 
     Cost beyond FlashInfer's kernel: the expansion writes the query, keys and padded values
     of every sub-step, 3x the tokens at 128 wide (~0.11 ms at 8192 tokens and 24 heads), and

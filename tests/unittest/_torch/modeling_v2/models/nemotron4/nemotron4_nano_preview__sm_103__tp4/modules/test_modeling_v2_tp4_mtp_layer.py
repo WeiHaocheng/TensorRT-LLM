@@ -45,6 +45,14 @@ its twin with every all-reduce replaced by the single full-K call. Twice the wor
 every cell, depth and rank: 12.73 / 2.66 (the element in output column 2953, where the MoE's and
 the shared expert's outputs nearly cancel the residual; see `OUTPUT_BAND`)."""
 
+TP_TERM_MOE = (49.0, 5.0)
+"""The TP term at the MTP layer's MoE output (`moe|W`), element / relative RMS in bf16 ulps: the
+target's `_moe` against its twin's on the same call. Twice the worst measured over every cell, depth
+and rank: 24.09 / 2.50 (the element in a prompt-pack cell, the RMS in a decode walk's second
+depth). The latent and shared partials are each rounded to bf16 on a rank before the fp32 sum, and
+the latent ranks' partials cancel, so this is the largest TP term of the layer; the MoE stage gate
+in `test_mtp_layer` adds it to tp1's band."""
+
 TP_TERM_LOGITS = 1.82
 """The TP term in the fp32 MTP logits (max |difference|, target against its twin). Twice the
 worst measured: 0.908 (decode at batch 512, depth 1; 0.82-0.91 in three cells, at most 0.42 in the
@@ -134,7 +142,11 @@ def test_mtp_layer(measured, kind, depth):
     each of its ops (at the rank's slices) within the tp1 target's bands
     (`_nemotron4_mtp_layer.failures`); its fp32 logits against `R_t` within the tp1 target's
     `LOGIT_BAND` plus this cell's TP term (`test_the_tp_term`). The output's and the MoE stage's
-    references run whole, so the TP term is inside them; only the logits need it added."""
+    references run whole, so the TP term is inside them. The output's band has room for it; the
+    MoE stage's, tp1's (25, 2.3), does not: the latent and shared partials, rounded to bf16 on
+    each rank before the fp32 sum, put the MoE alone up to ~2.5 ulps RMS from its twin. So the MoE
+    stage is held to tp1's band plus this cell's MoE TP term (`moe|W`), which `test_the_tp_term`
+    bounds by `TP_TERM_MOE`, as the logits are."""
     key = f"{kind}|{depth}"
     for r in measured["ranks"]:
         cell = r["cells"][key]
@@ -145,8 +157,14 @@ def test_mtp_layer(measured, kind, depth):
             f"T-R_t {cell['output']['T|R_t']:.2f} / {cell['output_rms']['T|R_t']:.3f} ulps, "
             f"logits T-R_t {cell['logits']['T|R_t']:.4f} (TP term {tp_term:.4f})"
         )
-        failures = [f for f in cell["failures"] if not f.startswith("logits: T|R_t")]
+        failures = [f for f in cell["failures"] if not f.startswith(("logits: T|R_t", "moe:"))]
         assert not failures, (r["rank"], failures)
+        moe, moe_tp, band = cell["stages"]["moe"], r["tp"][key]["moe|W"], H.STAGE_BANDS["moe"]
+        assert moe[0] <= band[0] + moe_tp["element"] and moe[1] <= band[1] + moe_tp["rms"], (
+            r["rank"],
+            moe,
+            moe_tp,
+        )
         assert cell["logits"]["T|R_t"] <= H.LOGIT_BAND + tp_term, (
             r["rank"],
             cell["logits"]["T|R_t"],
@@ -193,8 +211,9 @@ def test_the_tp_term(measured):
     logits against its twin with each all-reduce replaced by the single full-K call (tp1's
     composition on the call's own inputs), within `TP_TERM_BAND` / `TP_TERM_LOGITS`; the twin
     itself against `R_t` within the tp1 target's `OUTPUT_BAND` / `LOGIT_BAND`, which holds the
-    composition the TP term is measured against to what the tp1 target is held to. The `o_proj`
-    and MoE sums against the twin's are printed beside them."""
+    composition the TP term is measured against to what the tp1 target is held to; and the MoE
+    output against the twin's within `TP_TERM_MOE`. The `o_proj` sum against the twin's is printed
+    beside them."""
     # The records are in bf16 ulps.
     worst = dict(element=0.0, rms=0.0, logits=0.0)
     for r in measured["ranks"]:
@@ -210,6 +229,8 @@ def test_the_tp_term(measured):
             assert out["element"] <= TP_TERM_BAND[0], (r["rank"], key, out)
             assert out["rms"] <= TP_TERM_BAND[1], (r["rank"], key, out)
             assert t["logits"] <= TP_TERM_LOGITS, (r["rank"], key, t["logits"])
+            assert t["moe|W"]["element"] <= TP_TERM_MOE[0], (r["rank"], key, t["moe|W"])
+            assert t["moe|W"]["rms"] <= TP_TERM_MOE[1], (r["rank"], key, t["moe|W"])
             assert twin["element"] <= H.OUTPUT_BAND[0] and twin["rms"] <= H.OUTPUT_BAND[1], (
                 r["rank"],
                 key,

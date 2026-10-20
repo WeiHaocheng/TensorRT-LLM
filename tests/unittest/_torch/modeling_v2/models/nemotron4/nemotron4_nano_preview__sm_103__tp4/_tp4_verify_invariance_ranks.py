@@ -117,33 +117,36 @@ TOP = 8
 # The bands, derived from measurement as tp1's verify test derives its own (its comment says why a
 # verify token differs from its decode step at all). A tp4 rank attends with 4 of the 16 query
 # heads, so thop_attention runs its 4-heads-per-KV-head kernels here, and the rank's GEMMs run at a
-# quarter of their width: the bands are tp4's own. Measured on every rank over every probe's three
-# tokens alone, in eager batches of 2 to 1024 and in padded graphs of 1 to 1024: the logits alike
-# on every rank (each forms them whole), the states over the rank's own heads. The kernels are
-# deterministic, so the worst cases repeat run to run. The worst cases over the four ranks:
-# |logit diff| 0.1667 alone and 0.6767 in batches and graphs; top-gap shift 0.1561 alone, 0.2577 in
-# batches; recurrent state, conv state and K/V 0.068 / 0.0827 / 0.0723 of max |decode| (the commit's
-# slots 0.0234 / 0.0382); no top-1 changed. Each band is its worst case plus a quarter, rounded up:
-# room for a batch, history or graph size the runs did not take, where cuBLAS or thop may pick yet
-# another variant.
+# quarter of their width: the bands are tp4's own. A step's GEMMs of a few rows run the low-M
+# kernel certified for their row count (`_mm`), so a verify's 3 rows a request and a decode step's
+# one round in different orders, and decode runs `gdp_replay` where the verify runs `gdp_verify`.
+# Measured on every rank over every probe's three tokens alone, in eager batches of 2 to 1024, in
+# padded graphs of 1 to 1024 and at the length limit: the logits alike on every rank (each forms
+# them whole), the states over the rank's own heads. The kernels are deterministic, so the worst
+# cases repeat run to run. The worst cases over the four ranks: |logit diff| 0.6840 alone, 0.8014
+# in batches and graphs and 1.45 at the length limit; top-gap shift 0.1984 alone, 0.2655 in
+# batches; recurrent state 0.0688 in batches and 0.147 at the length limit, conv state 0.0693 and
+# K/V 0.0853 of max |decode|; no top-1 changed. Each band is its worst case plus a quarter, rounded
+# up: room for a batch, history or graph size the runs did not take, where cuBLAS, a low-M kernel or
+# thop may pick yet another variant. The conv band stays at 0.11, above its worst case plus a
+# quarter, since the length-limit case was measured only against it.
 #: max |verify logit - decode logit| over the vocabulary, fp32.
-LOGIT_BAND = 0.85
+LOGIT_BAND = 1.82
 #: The largest change, verify against decode, of the gap between the decode step's top-1 and any
 #: of its top `TOP` tokens: how close to a tie the verify can tip the decode step's choice.
-GAP_BAND = 0.33
+GAP_BAND = 0.34
 #: max |verify - decode| / max |decode| per tensor, over every GDP layer (the rank's heads of the
 #: recurrent state, fp32, and of the conv state, bf16) and every attention layer (K/V).
-SSM_BAND = 0.085
+SSM_BAND = 0.19
 CONV_BAND = 0.11
-KV_BAND = 0.091
+KV_BAND = 0.11
 # The drift: the same two quantities over the 6132 matched positions of the drift check, where the
-# verify's state and K/V carry each earlier verify's deviation. Worst cases 1.6811 (|logit diff|, on
-# `gsm8k_fewshot`) and 1.6112 (top-gap shift, on `news_digest`), plus a quarter, rounded up; the
-# short prompts verify to their decode bits all the way, and three top-1 changes sit at decode
-# margins of at most 0.0421. tp4's MTP identity gate's near-tie band is built on the measured
-# top-gap shift; its MTP acceptance gate's verify term is the measured |logit diff|.
-DRIFT_LOGIT_BAND = 2.11
-DRIFT_GAP_BAND = 2.02
+# verify's state and K/V carry each earlier verify's deviation. Worst cases 3.8199 (|logit diff|, on
+# `clips`) and 1.0672 (top-gap shift, on `gpqa_explain`), plus a quarter, rounded up; nine top-1
+# changes sit at decode margins of at most 0.0877. tp4's MTP identity gate's near-tie band is built
+# on the measured top-gap shift; its MTP acceptance gate's verify term is the measured |logit diff|.
+DRIFT_LOGIT_BAND = 4.78
+DRIFT_GAP_BAND = 1.34
 
 # Bound inside the rank body, never in the launcher: tensorrt_llm calls MPI_Init at import.
 COMM = None

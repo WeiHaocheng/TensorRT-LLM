@@ -210,13 +210,15 @@ Perf is measured, never gated.
 
 **Every entry is certified on sm_103, and all five targets are gated there.**
 
-The 43 entries -- 33 shared, 7 owned by deepseek, 3 by gpt-oss; the three
-nemotron4 targets own none, every entry they call being shared, and five
-shared entries are surveys' picks that no target calls yet (`cutlass_fused_moe`,
-`gdp_replay`, `moe_a2a_combine`, `moe_a2a_dispatch` and `torch_mm`) -- each
-drive their cells through `__call__` and `reference` in pre-merge CI, plus the
-four 4-rank collective matrices (all-gather, reduce-scatter, all-reduce, and
-the MoE all-to-all's dispatch and combine).
+The 44 entries -- 33 shared, 7 owned by deepseek, 3 by gpt-oss, 1 by
+nemotron4's tp4 target (`allreduce_wide_residual`); the other two nemotron4
+targets own none, every entry they call being shared; one shared entry is a
+survey's pick that no target calls (`cutlass_fused_moe`), and three are paths
+the surveys' picks replaced in all three nemotron4 targets
+(`causal_conv1d_varlen`, `gated_rmsnorm` and `gdp_chunk`) -- each drive their
+cells through `__call__` and `reference` in pre-merge CI, plus the five 4-rank
+collective matrices (all-gather, reduce-scatter, all-reduce, tp4's all-reduce
+fused with the wide residual, and the MoE all-to-all's dispatch and combine).
 Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,
 which is the honest state.
@@ -248,10 +250,12 @@ tp4, each gated in `tests/integration/defs/accuracy/test_modeling_v2_nemotron4.p
 the same five ways: routing on the shipped config; gsm8k paired in one session
 with its MTP variant (one-model MTP-Eagle, draft length 2); token identity with
 CUDA graphs on and off; MTP on against MTP off, each prompt alone; and the
-acceptance gate. Both identity gates follow the near-tie rule. Every step runs
-its GEMMs through `cublas_mm` and its attention through `thop_attention`, whose
-kernels change with the batch, so a decode row's bits move with the batch it
-runs in and a verify token's sit near its decode step's rather than on them.
+acceptance gate. Both identity gates follow the near-tie rule. The steps run
+their GEMMs through `cublas_mm`, `torch_mm` (tp4's prompt steps) and, at the
+decode-sized shapes they certify, the low-M kernels and `dsv3_router_gemm`, and
+their attention through `thop_attention`; these kernels change with the batch,
+so a decode row's bits move with the batch it runs in and a verify token's sit
+near its decode step's rather than on them.
 TensorRT-LLM has no built-in implementation of this architecture, so there is
 no stock leg: the gsm8k anchor is the checkpoint's own HuggingFace code under
 the same protocol, and the acceptance anchor is a plain-torch transcription of
@@ -267,9 +271,9 @@ boot and accuracy are blind to it and only the acceptance rate against a
 reference can see it. deepseek's draft lengths 1 and 2 remain ungated -- they
 are the dominated end of the measured draft-length axis. The nemotron4 targets
 run draft length 2, the checkpoint's trained depth; tp1 also runs 3, 4 and 5,
-the repeated MTP layer's next three depths, each gated the same ways as 2
-(paired gsm8k, MTP identity, acceptance). Routing declines every other length
-and any per-step draft-length schedule.
+the repeated MTP layer's next three depths, dep4 also runs 3, and tp4 also runs
+5, each gated the same ways as 2 (paired gsm8k, MTP identity, acceptance).
+Routing declines every other length and any per-step draft-length schedule.
 
 ### What replaced the version pin
 

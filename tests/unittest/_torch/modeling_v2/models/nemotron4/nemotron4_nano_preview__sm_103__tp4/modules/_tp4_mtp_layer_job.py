@@ -318,18 +318,49 @@ def _rank_body(out_path: str, checkpoint_path: str, trunk_cache: str) -> None:
 
     class Observer(H.MtpLayerObserver):
         """The harness's observer, plus the outputs of the MTP layer's two all-reduces: the
-        `o_proj` partials' sum (``o_sum``) and the MoE's latent and shared partials' (``moe_sum``)."""
+        `o_proj` partials' sum (``o_sum``) and the MoE's latent and shared partials' (``moe_sum``).
+
+        A decode step's GEMMs of a few rows run the low-M entry `lowm_entry` names rather than
+        `cublas_mm`, and a prompt step's run `torch_mm`; each is recorded by its weight operand
+        as the harness records a `cublas_mm` call."""
 
         def install(self, mp) -> None:
             super().install(mp)
             allreduce, stage = self.M.allreduce, self._stage
+            lowm_entry, torch_mm = self.M.lowm_entry, self.M.torch_mm
+
+            def record(mat_a, mat_b, out) -> None:
+                role = self.gemms.get(mat_b.data_ptr())
+                if role is not None:
+                    stage[role] = out.clone()
+                elif mat_b.data_ptr() == self.o_proj:
+                    stage["attn"], stage["o"] = mat_a.clone(), out.clone()
+
+            def observed_torch_mm(mat_a, mat_b, *args, **kwargs):
+                out = torch_mm(mat_a, mat_b, *args, **kwargs)
+                record(mat_a, mat_b, out)
+                return out
 
             def observed_allreduce(input, comm_buffer, buffer_flags):
                 out = allreduce(input, comm_buffer, buffer_flags)
                 stage["o_sum" if "o_sum" not in stage else "moe_sum"] = out.clone()
                 return out
 
+            def observed_lowm_entry(m, k, n):
+                entry = lowm_entry(m, k, n)
+                if entry is None:
+                    return None
+
+                def call(mat_a, mat_b, *args, **kwargs):
+                    out = entry(mat_a, mat_b, *args, **kwargs)
+                    record(mat_a, mat_b, out)
+                    return out
+
+                return call
+
             mp.setattr(self.M, "allreduce", observed_allreduce)
+            mp.setattr(self.M, "lowm_entry", observed_lowm_entry)
+            mp.setattr(self.M, "torch_mm", observed_torch_mm)
 
     def twin(call) -> dict:
         """This call's MTP layer with each all-reduce replaced by the single full-K call: the four
@@ -342,7 +373,7 @@ def _rank_body(out_path: str, checkpoint_path: str, trunk_cache: str) -> None:
             o.clone(), call["x"].clone(), block_w["pre_moe_layernorm.weight"], eps
         )
         latent = M.cublas_mm(call["routed"], moe_w["fc1_latent_proj.weight"].t())
-        experts = M.latent_moe_experts(
+        experts = M.latent_moe_experts_fused_act(
             latent,
             call["ids"],
             call["weights"],

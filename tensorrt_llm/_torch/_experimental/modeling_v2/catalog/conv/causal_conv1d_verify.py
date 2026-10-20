@@ -123,6 +123,9 @@ _GDP_TP4 = dict(_GDP, dim=4224, proj_width=4632, proj_offset=384, pool_ssm_bytes
 _GDP_DRAFT3 = dict(_GDP, window_positions=4)
 _GDP_DRAFT4 = dict(_GDP, window_positions=5)
 _GDP_DRAFT5 = dict(_GDP, window_positions=6)
+# A tp4 rank's conv under max_draft_len 5, which tp4 also runs: six positions a row in the window
+# buffer.
+_GDP_TP4_DRAFT5 = dict(_GDP_TP4, window_positions=6)
 
 
 def _cell(
@@ -171,7 +174,8 @@ class CausalConv1dVerify(OpWrapper):
 
     # The verify shapes of the targets' CUDA-graph batches: T = 1 + max_draft_len tokens per row
     # (3 for the checkpoint's trained depth, 2 for one draft token, 4 to 6 for the three to five
-    # drafts tp1 also runs), at every decode batch size the targets capture -- tp1 up to its
+    # drafts tp1 also runs, 6 for the five drafts tp4 also runs), at every decode batch size the
+    # targets capture -- tp1 up to its
     # max_batch_size, 1024 for a DP rank's batch -- each with its padding rows at the end, plus 3,
     # a size no graph is captured at, which runs eagerly without padding. Each batch size meets
     # both pool forms, one per T.
@@ -422,6 +426,49 @@ class CausalConv1dVerify(OpWrapper):
             "v2",
             geometry=_GDP_TP4,
         ),
+        _cell("tp4 rank, T=6, graph batch 1: one request", 6, 1, 0, "v2", geometry=_GDP_TP4_DRAFT5),
+        _cell(
+            "tp4 rank, T=6, graph batch 2 with a padding row",
+            6,
+            2,
+            1,
+            "v1",
+            geometry=_GDP_TP4_DRAFT5,
+        ),
+        _cell("tp4 rank, T=6, eager batch 3", 6, 3, 0, "v1", geometry=_GDP_TP4_DRAFT5),
+        _cell(
+            "tp4 rank, T=6, graph batch 8 holding 5 requests",
+            6,
+            8,
+            3,
+            "v2",
+            geometry=_GDP_TP4_DRAFT5,
+        ),
+        _cell(
+            "tp4 rank, T=6, graph batch 64, also captured and replayed",
+            6,
+            64,
+            1,
+            "v1",
+            graph=True,
+            geometry=_GDP_TP4_DRAFT5,
+        ),
+        _cell(
+            "tp4 rank, T=6, graph batch 256 with a padding row",
+            6,
+            256,
+            1,
+            "v2",
+            geometry=_GDP_TP4_DRAFT5,
+        ),
+        _cell(
+            "tp4 rank, T=6, graph batch 512 with a padding row",
+            6,
+            512,
+            1,
+            "v1",
+            geometry=_GDP_TP4_DRAFT5,
+        ),
         _cell("tp4 rank, T=2, graph batch 1: one request", 2, 1, 0, "v1", geometry=_GDP_TP4),
         _cell("tp4 rank, T=2, eager batch 3", 2, 3, 0, "v2", geometry=_GDP_TP4),
         _cell(
@@ -461,12 +508,13 @@ class CausalConv1dVerify(OpWrapper):
     this rounds the conv output once; the checkpoint's `Nemotron4GDPMixer` rounds it to bf16
     before SiLU too (see that entry's note).
 
-    Certified: T = 2 and 3, and T = 4 to 6 (tp1's three to five drafts) at tp1's width; x as the
-    in_proj output's conv columns, `[batch, 16896, T]` with channel stride 1 and token stride
-    18528 (tp1), or `[batch, 4224, T]` with token stride 4632 (a tp4 rank's 6 heads); both pool
-    forms; the window buffer as one layer's view of the manager's dense `intermediate_conv_states`;
-    padding rows at the end; one call captured in a CUDA graph and replayed on new inputs, slots
-    and states. Not certified: T > 6, T = 4 to 6 at a tp4 rank's width, T = 1 (a decode step, which
+    Certified: T = 2 and 3, T = 4 to 6 (tp1's three to five drafts, dep4's three) at tp1's width,
+    which a dep4 rank shares, and T = 6 (tp4's five drafts) at a tp4 rank's; x as the in_proj
+    output's conv columns, `[batch, 16896, T]` with channel stride 1 and token stride 18528 (tp1),
+    or `[batch, 4224, T]` with token stride 4632 (a tp4 rank's 6 heads); both pool forms; the
+    window buffer as one layer's view of the manager's dense `intermediate_conv_states`; padding
+    rows at the end; one call captured in a CUDA graph and replayed on new inputs, slots and
+    states. Not certified: T > 6, T = 4 and 5 at a tp4 rank's width, T = 1 (a decode step, which
     `causal_conv1d_update` covers), other widths, a bias, SiLU off, fp16 and fp32.
 
     Time: one launch, 6 * (1 + T) + 4 * T bytes of traffic per channel and row. GPU time per
