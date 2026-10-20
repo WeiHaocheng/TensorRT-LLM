@@ -132,19 +132,20 @@ l0_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=fp8-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True] # Cover nvbugs 6084445
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
-  # TIMEOUT measured: 1557 cases (and 250 skipped, the 4-GPU ones) in 11m08s on one GB300 without
-  # the whole-model nemotron4 files below, so 60 is 5x headroom.
-  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/test_modeling_v2_decode_invariance.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/test_modeling_v2_verify_invariance.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_attn_mlp_blocks.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_gdp_block.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_moe_block.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_mtp_layer.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/test_modeling_v2_nemotron4_reference.py TIMEOUT (60)
+  # TIMEOUT measured: 1899 cases (and 262 skipped: 261 that need 4 GPUs, one MLA cell another test
+  # covers) in 16m54s on one GB300 without the whole-model nemotron4 files below, so 90 is 5x headroom.
+  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/test_modeling_v2_decode_invariance.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/test_modeling_v2_verify_invariance.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_attn_mlp_blocks.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_gdp_block.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_moe_block.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_mtp_layer.py --ignore=unittest/_torch/modeling_v2/models/nemotron4/test_modeling_v2_nemotron4_reference.py TIMEOUT (90)
   # The whole-model nemotron4 files: each loads the checkpoint under
   # $LLM_MODELS_ROOT/nemotron4-nano-preview and skips without it or below its free-memory floor
-  # (up to 245 GiB of one GPU). They took 18m46s on one GB300, one pytest process each: with the
-  # rest of the tree, a 30-minute stage. So each runs as its own case.
+  # (up to 245 GiB of one GPU). They took 28m54s on one GB300, one pytest process each and with no
+  # trunk-hidden cache: with the rest of the tree, a 46-minute stage. So each runs as its own case,
+  # with at least 5x its measured time (the MTP-layer test 14m14s, the verify invariance 5m46s).
   - unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/test_modeling_v2_decode_invariance.py TIMEOUT (15)
-  - unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/test_modeling_v2_verify_invariance.py TIMEOUT (10)
+  - unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/test_modeling_v2_verify_invariance.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_attn_mlp_blocks.py TIMEOUT (20)
   - unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_gdp_block.py TIMEOUT (10)
   - unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_moe_block.py TIMEOUT (10)
-  - unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_mtp_layer.py TIMEOUT (35)
+  - unittest/_torch/modeling_v2/models/nemotron4/nemotron4_nano_preview__sm_103__tp1/modules/test_modeling_v2_mtp_layer.py TIMEOUT (75)
   - unittest/_torch/modeling_v2/models/nemotron4/test_modeling_v2_nemotron4_reference.py TIMEOUT (15)
   - accuracy/test_modeling_v2_gpt_oss.py::TestModelingV2GptOss120bSm103Tp1::test_gsm8k
 - condition:
