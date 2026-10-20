@@ -35,7 +35,10 @@ The two sides draft from the same tokens, so their drafts can disagree only
 where the reference's draft is a near-tie: where some token's logit could gain
 on the reference's top-1 by as much as the two implementations' logits differ.
 The gate measures where the reference's drafts are near-ties and derives its
-tolerance from them.
+tolerance from them. A deep draft can also part where the trunk's ordinary
+drift meets an ill-conditioned MTP chain; on one GPU the harness records the
+trunk hidden states the engine computed (``_TrunkCapture``) and re-checks such
+a step from them (``_MtpAcceptance._check_acceptance``).
 
 Every engine here passes ``modeling_v2="require"``: there is nothing to fall
 back to, and ``"require"`` makes a routing decline raise with its reason.
@@ -43,6 +46,7 @@ back to, and ``"require"`` makes a routing decline raise with its reason.
 
 import gc
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -157,6 +161,133 @@ def _al(accepted: list[int]) -> float:
     return (sum(accepted) + len(accepted)) / len(accepted)
 
 
+class _TrunkCapture:
+    """The target trunk's final normed hidden state at every position of every request, as the
+    engine computed it.
+
+    The trunk hands that state, one row per token of the step, to the MTP-Eagle worker
+    (``Eagle3OneModelWorker._forward_impl``), whose first draft step reads it: the draft at a
+    verify step's last accepted position, and the MTP layer's depth-1 keys and values at every
+    position. Three wrappers record it without changing what the engine computes:
+
+    - ``_forward_impl`` copies the step's hidden states and positions into fixed device buffers.
+      The copies are captured into the CUDA graphs with the rest of the step, so every replay
+      refreshes them;
+    - ``TrtllmAttentionMetadata.prepare`` notes the step's row layout: the request of each row
+      group and its token count, padding rows included;
+    - ``PyTorchModelEngine.forward`` clones the buffers' used rows after each step, on the stream
+      the next step runs on, so no later step overwrites them first, and notes which client
+      request (``GenerationResult.request_id``) each engine request serves.
+
+    The executor must run in this process for the wrappers to reach it
+    (``TLLM_WORKER_USE_SINGLE_PROCESS``), which TensorRT-LLM offers for one GPU only.
+    """
+
+    SINGLE_PROCESS_ENV = "TLLM_WORKER_USE_SINGLE_PROCESS"
+
+    def __init__(self, hidden_size: int, max_rows: int):
+        self.hidden_size = hidden_size
+        self.max_rows = max_rows
+        # Per step: (request id per row group, tokens per group, positions, hidden rows).
+        self.steps: list[tuple[list[int], list[int], torch.Tensor, torch.Tensor]] = []
+        # Steps recorded, and steps with more rows than the buffers hold, whose rows are not kept.
+        self.captured_steps = 0
+        self.overflow_steps = 0
+        # Engine request id -> client request id.
+        self.client_ids: dict[int, int] = {}
+        self._layout: tuple[list[int], list[int]] | None = None
+
+    def install(self, monkeypatch) -> None:
+        from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+        from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+        from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
+
+        monkeypatch.setenv(self.SINGLE_PROCESS_ENV, "1")
+        # Allocated before the engine captures its graphs, which then copy into them. The engine
+        # runs under inference mode, so they are inference tensors.
+        with torch.inference_mode():
+            hidden = torch.zeros(
+                self.max_rows, self.hidden_size, dtype=torch.bfloat16, device="cuda"
+            )
+            positions = torch.zeros(self.max_rows, dtype=torch.int64, device="cuda")
+        capture = self
+
+        forward_impl = Eagle3OneModelWorker._forward_impl
+        signature = inspect.signature(forward_impl)
+
+        def record_trunk(worker, *args, **kwargs):
+            bound = signature.bind(worker, *args, **kwargs).arguments
+            rows = min(bound["hidden_states"].shape[0], capture.max_rows)
+            hidden[:rows].copy_(bound["hidden_states"][:rows])
+            positions[:rows].copy_(bound["position_ids"].reshape(-1)[:rows])
+            return forward_impl(worker, *args, **kwargs)
+
+        prepare = TrtllmAttentionMetadata.prepare
+
+        def record_layout(metadata, *args, **kwargs):
+            result = prepare(metadata, *args, **kwargs)
+            capture._layout = (
+                list(metadata.request_ids),
+                metadata.seq_lens[: metadata.num_seqs].tolist(),
+            )
+            return result
+
+        engine_forward = PyTorchModelEngine.forward
+
+        def record_step(engine, batch, *args, **kwargs):
+            capture._layout = None
+            outputs = engine_forward(engine, batch, *args, **kwargs)
+            if not engine.is_warmup and capture._layout is not None:
+                for request in batch.all_requests():
+                    capture.client_ids[request.py_request_id] = request.py_client_id
+                request_ids, lengths = capture._layout
+                rows = sum(lengths)
+                if rows > capture.max_rows:
+                    capture.overflow_steps += 1
+                else:
+                    capture.captured_steps += 1
+                    with torch.inference_mode():
+                        capture.steps.append(
+                            (request_ids, lengths, positions[:rows].clone(), hidden[:rows].clone())
+                        )
+            return outputs
+
+        monkeypatch.setattr(Eagle3OneModelWorker, "_forward_impl", record_trunk)
+        monkeypatch.setattr(TrtllmAttentionMetadata, "prepare", record_layout)
+        monkeypatch.setattr(PyTorchModelEngine, "forward", record_step)
+
+    def traces(self, lengths: dict[int, int]) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Per client request id: its ``[length, hidden]`` trace on the CPU and which positions it
+        holds.
+
+        A position keeps the last step that ran it. A verify step runs the token after the last
+        accepted one and the drafts behind it; the positions of the drafts it rejects run again,
+        from the token it chose, in the steps after it, and no step runs a position before its
+        own first one. So every position up to a verify step's last accepted one holds the hidden
+        state of the step that accepted it, which is the one the MTP layer read.
+        """
+        out = {}
+        for request_id, length in lengths.items():
+            out[request_id] = (
+                torch.zeros(length, self.hidden_size, dtype=torch.bfloat16, device="cuda"),
+                torch.zeros(length, dtype=torch.bool, device="cuda"),
+            )
+        with torch.inference_mode():
+            for request_ids, group_lengths, positions, hidden in self.steps:
+                start = 0
+                for request_id, count in zip(request_ids, group_lengths):
+                    client_id = self.client_ids.get(request_id)
+                    if client_id in out:
+                        trace, held = out[client_id]
+                        where = positions[start : start + count]
+                        keep = where < trace.shape[0]
+                        where = where[keep]
+                        trace.index_copy_(0, where, hidden[start : start + count][keep])
+                        held.index_fill_(0, where, True)
+                    start += count
+        return {request_id: (trace.cpu(), held.cpu()) for request_id, (trace, held) in out.items()}
+
+
 class _MtpAcceptance(LlmapiAccuracyTestHarness):
     """The legs and checks every nemotron4 target's MTP acceptance gate shares.
 
@@ -239,10 +370,22 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
             ),
         )
 
+    def _trunk_capture(self) -> _TrunkCapture | None:
+        """The recorder of the engine's trunk hidden states (``_TrunkCapture``), where the
+        executor can run in this process: on one GPU. None on more."""
+        if self.ENGINE_ARGS.get("tensor_parallel_size", 1) != 1:
+            return None
+        config = _unittest_module("_nemotron4_reference").TextConfig.from_checkpoint(
+            self.MODEL_PATH
+        )
+        # A step carries at most max_num_tokens tokens: the engine's 8192 unless stated.
+        return _TrunkCapture(config.hidden_size, self.ENGINE_ARGS.get("max_num_tokens", 8192))
+
     def _engine_leg(
-        self, prompts, ranks: dict[str, int]
-    ) -> tuple[dict[str, _EngineRun], list[dict]]:
-        """All prompts in one batch through the target, streamed; and the run's iteration stats.
+        self, prompts, ranks: dict[str, int], capture: _TrunkCapture | None = None
+    ) -> tuple[dict[str, _EngineRun], list[dict], dict | None]:
+        """All prompts in one batch through the target, streamed; the run's iteration stats; and,
+        with a ``capture`` installed, each prompt's trunk trace (``_TrunkCapture.traces``).
 
         The executor answers a streaming request once per iteration, so the
         sizes of the responses are the request's verify steps. A prompt with a
@@ -285,7 +428,7 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
                 )
                 for p in prompts
             ]
-            runs = {}
+            runs, request_ids = {}, {}
             # Each request's responses wait in its own queue, so reading the
             # requests one after the other still sees every response apart.
             for p, future in zip(prompts, futures):
@@ -299,17 +442,29 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
                     per_pos_drafted=list(future.per_pos_drafted),
                     decoding_iter=future.decoding_iter,
                 )
+                request_ids[p.name] = future.request_id
             # A statistic can reach the queue after the last response.
             time.sleep(1.0)
-            stats = llm.get_stats(timeout=2)
-        return runs, stats
+            if capture is None:
+                stats = llm.get_stats(timeout=2)
+            else:
+                # An executor in this process answers get_stats from a queue nothing feeds, so
+                # the statistics are read as the out-of-process proxy reads them for its RPC.
+                executor = llm._executor
+                stats = [json.loads(executor._stats_serializer(s)) for s in executor.fetch_stats()]
+        traces = None
+        if capture is not None:
+            by_request = capture.traces(
+                {request_ids[p.name]: len(p.token_ids) + len(runs[p.name].output) for p in prompts}
+            )
+            traces = {p.name: by_request[request_ids[p.name]] for p in prompts}
+            capture.steps.clear()
+        return runs, stats, traces
 
-    def _reference_leg(self, reference, prompts, runs: dict[str, _EngineRun]) -> dict:
-        """The reference teacher-forced over each prompt and the target's output.
-
-        Both MTP-Eagle (the semantics the engine runs) and HF's per-depth MTP.
-        """
-        # The engine's processes give their memory back as they exit.
+    def _load_reference(self, reference):
+        """The plain-torch reference on the GPU, once the engine has given it back."""
+        # An engine in other processes gives its memory back as they exit; one in
+        # this process as soon as it is collected.
         deadline = time.monotonic() + self.RELEASE_SECONDS
         free, _ = torch.cuda.mem_get_info()
         while free < 200 * 2**30 and time.monotonic() < deadline:
@@ -319,7 +474,17 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
             f"the reference needs ~190 GiB of the GPU after the engine exits; "
             f"{free / 2**30:.1f} GiB is free"
         )
-        model = reference.Nemotron4Reference(self.MODEL_PATH)
+        return reference.Nemotron4Reference(self.MODEL_PATH)
+
+    def _reference_leg(self, model, prompts, runs: dict[str, _EngineRun], traces) -> dict:
+        """The reference teacher-forced over each prompt and the target's output.
+
+        Both MTP-Eagle (the semantics the engine runs) and HF's per-depth MTP. With the engine's
+        trunk ``traces``, MTP-Eagle once more over the engine's own trunk hidden states
+        (``engine_trunk``; the reference's own stand in at positions the capture missed), and the
+        trunk's drift at every position: the relative RMS of the engine's hidden state against
+        the reference's (NaN where missed).
+        """
         out = {}
         for p in prompts:
             seq = list(p.token_ids) + runs[p.name].output
@@ -328,7 +493,7 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
                 hidden = model.forward(ids, logits=None).hidden
                 # The reference's own greedy token at every output position, for the report.
                 greedy = model.greedy_ids(hidden[len(p.token_ids) - 1 : -1]).tolist()
-            out[p.name] = dict(
+            entry = dict(
                 greedy_agreement=sum(g == t for g, t in zip(greedy, runs[p.name].output))
                 / len(greedy),
                 **{
@@ -342,11 +507,156 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
                     for mode in ("eagle", "hf")
                 },
             )
+            if traces is not None:
+                trace, held = (t.cuda() for t in traces[p.name])
+                with torch.inference_mode():
+                    exact = hidden.float()
+                    drift = (trace.float() - exact).norm(dim=-1) / exact.norm(dim=-1)
+                    engine_trunk = torch.where(held[:, None], trace, hidden)
+                    entry.update(
+                        engine_trunk=model.teacher_forced_mtp_acceptance(
+                            seq,
+                            len(p.token_ids),
+                            hidden=engine_trunk,
+                            mode="eagle",
+                            num_depths=self.MTP_DRAFT_LEN,
+                        ),
+                        drift=torch.where(held, drift, torch.nan).cpu(),
+                        held=held.cpu(),
+                        hidden=hidden.cpu(),
+                    )
+                del trace, held, exact, drift, engine_trunk
+            out[p.name] = entry
             del ids, hidden
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
         return out
+
+    # Random perturbations per flagged step, and how many flagged steps get them
+    # (``_perturbation_flips``).
+    PERTURBATION_SEEDS = 16
+    PERTURBATION_STEPS = 32
+
+    def _drafts_at(self, model, reference, ids, hidden_before, hidden_at, kv1, q) -> list[int]:
+        """The reference's MTP-Eagle drafts at q from the given trunk hidden states at q - 1 and q.
+
+        Depth 1 runs over positions q - 1 and q only, attending over the depth-1 keys and values
+        ``kv1`` of the positions before them; depths 2 .. D run at q. Teacher-forced as
+        ``mtp_draft_hidden`` is, so it reproduces that function's drafts at q from the same states.
+        """
+        config, weights, embed = model.config, model.mtp, model.embed
+        out, base_kv = reference.mtp_layer(
+            torch.stack([hidden_before, hidden_at]),
+            embed[ids[q : q + 2]],
+            weights,
+            config,
+            (kv1[0][: q - 1], kv1[1][: q - 1]),
+        )
+        hidden, drafts, extra_kv = out[1:], [], []
+        for depth in range(self.MTP_DRAFT_LEN):
+            if depth:
+                hidden, kv = reference._mtp_eagle_depth(
+                    hidden,
+                    embed[ids[q + 1 + depth : q + 2 + depth]],
+                    weights,
+                    config,
+                    base_kv,
+                    extra_kv,
+                )
+                extra_kv.append(kv)
+            drafts.append(int(model.logits(hidden).argmax()))
+        return drafts
+
+    def _perturbation_flips(
+        self, model, reference, seq: list[int], ref: dict, q: int, depth: int, r: float
+    ):
+        """How many of ``PERTURBATION_SEEDS`` random perturbations of the reference's trunk hidden
+        state at q - 1 and q, each of relative RMS ``r``, change its MTP-Eagle draft at depth
+        index ``depth`` at q; and whether the windowed chain (``_drafts_at``) reproduces the
+        reference's own draft there. Information on how well conditioned that decision is.
+        """
+        ids = torch.tensor(seq, dtype=torch.long, device="cuda")
+        with torch.inference_mode():
+            hidden = ref["hidden"].cuda()
+            if "kv1" not in ref:
+                # Depth 1 at every position reads the next token's embedding.
+                shifted = torch.cat([ids[1:], ids.new_zeros(1)])
+                ref["kv1"] = reference.mtp_layer(
+                    hidden, model.embed[shifted], model.mtp, model.config
+                )[1]
+            kv1 = ref["kv1"]
+            unperturbed = self._drafts_at(model, reference, ids, hidden[q - 1], hidden[q], kv1, q)
+            generator = torch.Generator(device="cuda").manual_seed(q)
+            flips = 0
+            for _ in range(self.PERTURBATION_SEEDS):
+                perturbed = []
+                for position in (q - 1, q):
+                    row = hidden[position].float()
+                    noise = torch.randn(row.shape, generator=generator, device="cuda")
+                    noise *= r * row.norm() / noise.norm()
+                    perturbed.append((row + noise).to(hidden.dtype))
+                drafts = self._drafts_at(model, reference, ids, *perturbed, kv1, q)
+                flips += drafts[depth] != unperturbed[depth]
+        return flips, unperturbed[depth] == ref["eagle"]["drafts"][depth][q]
+
+    def _recheck(
+        self, model, reference, flip: dict, seq: list[int], ref: dict, epsilon, measure_perturbation
+    ) -> None:
+        """Re-check a flagged step from the engine's own trunk hidden states and record the
+        verdict in ``flip`` (``_check_acceptance``, *Flagged steps*); with
+        ``measure_perturbation``, also the step's perturbation count."""
+        q, accepted, depth = flip["q"], flip["accepted_trt"], flip["depth"] - 1
+        if "engine_trunk" not in ref:
+            flip.update(
+                explained=False,
+                reason="not re-checked: the executor ran in other processes, so no trunk "
+                "hidden state was captured",
+            )
+            return
+        missing = (~ref["held"][: q + 1]).nonzero().flatten().tolist()
+        if missing:
+            flip.update(
+                explained=False,
+                reason=f"not re-checked: the capture missed positions {missing[:4]} "
+                f"({len(missing)} up to q)",
+            )
+            return
+        sub = ref["engine_trunk"]
+        accepted_sub = _reference_accepted(q, seq, sub["drafts"])
+        drift = float(ref["drift"][q])
+        verdict = dict(
+            accepted_sub=accepted_sub,
+            margin_sub_at_depth=round(sub["margins"][depth][q], 4),
+            drift=round(drift, 4),
+            drift_before=round(float(ref["drift"][q - 1]), 4),
+        )
+        if measure_perturbation:
+            flips, reproduced = self._perturbation_flips(
+                model, reference, seq, ref, q, depth, drift
+            )
+            verdict.update(
+                perturbation_flips=f"{flips}/{self.PERTURBATION_SEEDS}",
+                perturbation_reproduces_draft=reproduced,
+            )
+        if accepted_sub == accepted:
+            verdict.update(
+                explained=True,
+                reason=f"explained: on the engine's trunk hidden states the reference accepts "
+                f"{accepted_sub}, as the engine does",
+            )
+        else:
+            # The depth where the re-run reference and the engine part decides the step now.
+            depth_sub = min(accepted, accepted_sub)
+            margin_sub = sub["margins"][depth_sub][q]
+            explained = margin_sub < epsilon[depth_sub]
+            verdict.update(
+                depth_sub=depth_sub + 1,
+                margin_sub=round(margin_sub, 4),
+                explained=explained,
+                reason=f"{'explained' if explained else 'unexplained'}: on the engine's trunk "
+                f"hidden states the reference accepts {accepted_sub} against the engine's "
+                f"{accepted}, decided at depth {depth_sub + 1} by {margin_sub:.4f} "
+                f"{'<' if explained else '>='} epsilon {epsilon[depth_sub]:.4f}",
+            )
+        flip.update(verdict)
 
     def _check_acceptance(self, monkeypatch) -> None:
         """The acceptance length the target measures matches the reference's.
@@ -359,31 +669,72 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
         prompt and the target's own output, D depths deep: AL_ref, its greedy
         walk pooled with the same estimator.
 
-        **Tolerance.** At a verify step the two sides' accepted counts differ
-        only if the deciding draft's outcome flips, which needs some token to
-        gain at least the reference's margin there (``draft_scores``) against
-        the logit error ``epsilon`` between the implementations. A flip at depth
-        d of D moves the step's count by at most D - d + 1: at D = 2, by 2 at
-        depth 1 and 1 at depth 2. So over the reference's n steps:
+        **At the engine's own positions.** The streamed responses give the
+        engine's walk step by step, so the reference scores each of the
+        engine's steps where the engine took it. The two sides' accepted counts
+        differ at a step only if the deciding draft's outcome flips, which needs
+        some token to gain at least the reference's margin there
+        (``draft_scores``). ``epsilon`` bounds that gain per depth: the target
+        MTP layer's logit error against the reference's on the same trunk
+        hidden states (``MTP_LOGIT_ERROR``, the MTP module gate's measurement)
+        plus the band on the target trunk's logits against the reference's
+        (``TRUNK_LOGIT_BAND``). A step whose count differs where the reference's
+        margin is at least epsilon is **flagged**.
 
-            tol = (sum over d of (D - d + 1) * k_d + D * E) / n
+        **Flagged steps.** epsilon covers the trunk's drift in logit space, but
+        a draft at depth d reads the trunk's hidden state through d applications
+        of the MTP layer, and where the reference's chain is ill-conditioned
+        (an MoE routing switch at a deep depth, say) an ordinary drift of the
+        trunk's hidden state moves the deep draft by more than its logits move.
+        So every flagged step is re-checked from the engine's own inputs: the
+        reference's MTP-Eagle chain runs again, teacher-forced, over the trunk
+        hidden states the engine itself computed (``_TrunkCapture``) at every
+        position up to the step's drafting position q. Those are what the
+        engine's MTP layer read: at q itself, and through the depth-1 keys and
+        values it wrote at every earlier position. The two sides then differ
+        only in the MTP layer's own arithmetic, which ``MTP_LOGIT_ERROR``
+        bounds on identical trunk inputs, and epsilon is that bound plus the
+        trunk's band:
 
-        which at D = 2 is (2 * k1 + k2 + 2 * E) / n. k_d counts the steps whose
-        first d - 1 drafts matched, whose depth-d margin is below epsilon and
-        whose earlier margins are not (k1: the depth-1 margin is below it). E
-        counts the steps AL_trt holds that the reference walk cannot pair, each
-        moving a mean of n steps by at most D / n:
+        - the step is **explained** by the trunk's drift if the reference, so
+          re-run, accepts what the engine accepted, or decides the step by less
+          than epsilon;
+        - otherwise it **fails**: from the same inputs, the target's draft path
+          computes something other than the checkpoint's MTP layer.
+
+        The re-check takes the engine's trunk as it is: the trunk's own
+        accuracy is the other gates' (check_goldens, CUDA-graph identity,
+        GSM8K). A fault anywhere between the trunk's hidden state and the
+        drafts still fails it (``...MtpAcceptanceFault`` plants one).
+
+        Each flagged step is reported with the trunk's drift at q and q - 1
+        (the relative RMS of the engine's hidden state against the
+        reference's, and its rank among the run's positions) and its margin
+        before and after the re-run; the first ``PERTURBATION_STEPS`` also with
+        how many of 16 random perturbations of the reference's trunk hidden
+        state at q - 1 and q, as large as the drift at q, change the deciding
+        draft (``_perturbation_flips``; information on how ill-conditioned the
+        decision is). The capture needs the executor in this process, which
+        TensorRT-LLM runs for one GPU only; on more GPUs a flagged step is not
+        re-checked and fails.
+
+        **Tolerance.** A flip at depth d of D moves the step's count by at most
+        D - d + 1: at D = 2, by 2 at depth 1 and 1 at depth 2. So over the
+        reference's n steps:
+
+            tol = (sum over d of (D - d + 1) * (k_d + x_d) + D * E) / n
+
+        which at D = 2 is (2 * (k1 + x1) + (k2 + x2) + 2 * E) / n. k_d counts
+        the reference walk's steps whose first d - 1 drafts matched, whose
+        depth-d margin is below epsilon and whose earlier margins are not (k1:
+        the depth-1 margin is below it). x_d counts the flagged steps the
+        trunk's drift explains, by their deciding depth. E counts the steps
+        AL_trt holds that the reference walk cannot pair, each moving a mean of
+        n steps by at most D / n:
 
         - the engine's last step of an output whose window passes the last
           token, which the reference cannot score (at most one per request);
         - the steps AL_trt counts beyond the requests' own (``_engine_al``).
-
-        **At the engine's own positions.** The streamed responses give the
-        engine's walk step by step, so the reference scores each of the
-        engine's steps where the engine took it. A step whose accepted count
-        differs must sit at a near-tie of the draft that decides it; anywhere
-        else the target's draft path computed something other than the
-        checkpoint's MTP layer.
 
         AL_trt >= 2.0 is a tripwire for a collapsed draft path. The reference's
         AL with HF's per-depth MTP (``mode="hf"``) is reported beside it.
@@ -395,7 +746,10 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
         prompts = prompts_module.prompt_set(prompts_module.load_tokenizer(self.MODEL_PATH))
         ranks = self._ranks(prompts)
 
-        runs, stats = self._engine_leg(prompts, ranks)
+        capture = self._trunk_capture()
+        if capture is not None:
+            capture.install(monkeypatch)
+        runs, stats, traces = self._engine_leg(prompts, ranks, capture)
         walks = {
             p.name: _engine_walk(p.name, len(p.token_ids), runs[p.name], draft_len) for p in prompts
         }
@@ -412,86 +766,148 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
         gc.collect()
         torch.cuda.empty_cache()
 
-        refs = self._reference_leg(reference, prompts, runs)
-
         epsilon = self._epsilon()
         assert len(epsilon) == draft_len, f"epsilon {epsilon} for {draft_len} draft depths"
-        rows, flips_all, offenders = [], [], []
-        pooled = dict(ref_accepted=[], ref_hf_accepted=[], trt_accepted=[], k=[0] * draft_len)
+        rows, flips_all, flagged = [], [], []
+        pooled = dict(
+            ref_accepted=[],
+            ref_hf_accepted=[],
+            trt_accepted=[],
+            k=[0] * draft_len,
+            x=[0] * draft_len,
+            agree_ref=0,
+            agree_engine_trunk=0,
+            paired=0,
+        )
         boundary_total = 0
-        for p in prompts:
-            run, ref = runs[p.name], refs[p.name]
-            eagle, hf = ref["eagle"], ref["hf"]
-            seq = list(p.token_ids) + run.output
-            walk = walks[p.name]
+        drifts = []
+        model = self._load_reference(reference)
+        try:
+            refs = self._reference_leg(model, prompts, runs, traces)
+            for p in prompts:
+                run, ref = runs[p.name], refs[p.name]
+                eagle, hf = ref["eagle"], ref["hf"]
+                seq = list(p.token_ids) + run.output
+                walk = walks[p.name]
+                engine_trunk = ref.get("engine_trunk")
 
-            # The reference's own walk and its near-ties (the tolerance): a step's count can
-            # flip at depth d + 1 only when its first d drafts matched (a >= d).
-            k = [0] * draft_len
-            for q, a in zip(eagle["positions"], eagle["accepted"]):
-                for depth in range(min(a + 1, draft_len)):
-                    if eagle["margins"][depth][q] < epsilon[depth]:
-                        k[depth] += 1
-                        break
+                # The reference's own walk and its near-ties (the tolerance): a step's count can
+                # flip at depth d + 1 only when its first d drafts matched (a >= d).
+                k = [0] * draft_len
+                for q, a in zip(eagle["positions"], eagle["accepted"]):
+                    for depth in range(min(a + 1, draft_len)):
+                        if eagle["margins"][depth][q] < epsilon[depth]:
+                            k[depth] += 1
+                            break
 
-            # The engine's walk, each step scored by the reference where the engine took it.
-            flips, boundary, matched_trt, matched_ref = [], 0, [], []
-            for step, (q, a) in enumerate(walk):
-                a_ref = _reference_accepted(q, seq, eagle["drafts"])
-                if a_ref is None:
-                    boundary += 1
-                    continue
-                matched_trt.append(a)
-                matched_ref.append(a_ref)
-                if a == a_ref:
-                    continue
-                depth = min(a, a_ref)
-                margin = eagle["margins"][depth][q]
-                flip = dict(
+                # The engine's walk, each step scored by the reference where the engine took it.
+                flips, boundary, matched_trt, matched_ref, agree_engine_trunk = [], 0, [], [], 0
+                for step, (q, a) in enumerate(walk):
+                    a_ref = _reference_accepted(q, seq, eagle["drafts"])
+                    if a_ref is None:
+                        boundary += 1
+                        continue
+                    matched_trt.append(a)
+                    matched_ref.append(a_ref)
+                    if engine_trunk is not None:
+                        agree_engine_trunk += (
+                            _reference_accepted(q, seq, engine_trunk["drafts"]) == a
+                        )
+                    if a == a_ref:
+                        continue
+                    depth = min(a, a_ref)
+                    margin = eagle["margins"][depth][q]
+                    flip = dict(
+                        prompt=p.name,
+                        step=step,
+                        q=q,
+                        accepted_trt=a,
+                        accepted_ref=a_ref,
+                        depth=depth + 1,
+                        margin=round(margin, 4),
+                        epsilon=round(epsilon[depth], 4),
+                        ref_draft=eagle["drafts"][depth][q],
+                        true_token=seq[q + 2 + depth],
+                    )
+                    flips.append(flip)
+                    if margin >= epsilon[depth]:
+                        self._recheck(
+                            model,
+                            reference,
+                            flip,
+                            seq,
+                            ref,
+                            epsilon,
+                            measure_perturbation=len(flagged) < self.PERTURBATION_STEPS,
+                        )
+                        flagged.append(flip)
+                        if flip["explained"]:
+                            pooled["x"][depth] += 1
+                if "drift" in ref:
+                    # From the prompt's last position to the last one the engine's last verify
+                    # step accepted: every position whose captured state is final. The drafts
+                    # that step rejected never run again.
+                    last_q, last_accepted = walk[-1]
+                    drifts.append(ref["drift"][len(p.token_ids) - 1 : last_q + last_accepted + 2])
+
+                al_trt_request = _al([a for _, a in walk])
+                agree_ref = sum(t == r for t, r in zip(matched_trt, matched_ref))
+                row = dict(
                     prompt=p.name,
-                    step=step,
-                    q=q,
-                    accepted_trt=a,
-                    accepted_ref=a_ref,
-                    depth=depth + 1,
-                    margin=round(margin, 4),
-                    epsilon=round(epsilon[depth], 4),
-                    ref_draft=eagle["drafts"][depth][q],
-                    true_token=seq[q + 2 + depth],
+                    **({"rank": ranks[p.name]} if p.name in ranks else {}),
+                    prompt_tokens=len(p.token_ids),
+                    output_tokens=len(run.output),
+                    trt_steps=len(walk),
+                    al_trt=round(al_trt_request, 4),
+                    ref_steps=eagle["verify_steps"],
+                    al_ref=round(eagle["acceptance_length"], 4),
+                    al_ref_hf=round(hf["acceptance_length"], 4),
+                    **{f"k{depth + 1}": k[depth] for depth in range(draft_len)},
+                    al_ref_at_trt_steps=round(_al(matched_ref), 4),
+                    al_trt_at_trt_steps=round(_al(matched_trt), 4),
+                    agree_ref=f"{agree_ref}/{len(matched_trt)}",
+                    **(
+                        {"agree_engine_trunk": f"{agree_engine_trunk}/{len(matched_trt)}"}
+                        if engine_trunk is not None
+                        else {}
+                    ),
+                    flips=len(flips),
+                    flip_margins=[f["margin"] for f in flips],
+                    boundary_steps=boundary,
+                    depth_match=[round(x, 4) for x in eagle["depth_match"]],
+                    ref_greedy_agreement=round(ref["greedy_agreement"], 4),
+                    decoding_iter=run.decoding_iter,
                 )
-                flips.append(flip)
-                if margin >= epsilon[depth]:
-                    offenders.append(flip)
+                rows.append(row)
+                print(f"[modeling_v2] mtp acceptance {json.dumps(row)}")
+                pooled["ref_accepted"] += eagle["accepted"]
+                pooled["ref_hf_accepted"] += hf["accepted"]
+                pooled["trt_accepted"] += [a for _, a in walk]
+                pooled["k"] = [total + mine for total, mine in zip(pooled["k"], k)]
+                pooled["agree_ref"] += agree_ref
+                pooled["agree_engine_trunk"] += agree_engine_trunk
+                pooled["paired"] += len(matched_trt)
+                flips_all += flips
+                boundary_total += boundary
+        finally:
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
 
-            al_trt_request = _al([a for _, a in walk])
-            row = dict(
-                prompt=p.name,
-                **({"rank": ranks[p.name]} if p.name in ranks else {}),
-                prompt_tokens=len(p.token_ids),
-                output_tokens=len(run.output),
-                trt_steps=len(walk),
-                al_trt=round(al_trt_request, 4),
-                ref_steps=eagle["verify_steps"],
-                al_ref=round(eagle["acceptance_length"], 4),
-                al_ref_hf=round(hf["acceptance_length"], 4),
-                **{f"k{depth + 1}": k[depth] for depth in range(draft_len)},
-                al_ref_at_trt_steps=round(_al(matched_ref), 4),
-                al_trt_at_trt_steps=round(_al(matched_trt), 4),
-                flips=len(flips),
-                flip_margins=[f["margin"] for f in flips],
-                boundary_steps=boundary,
-                depth_match=[round(x, 4) for x in eagle["depth_match"]],
-                ref_greedy_agreement=round(ref["greedy_agreement"], 4),
-                decoding_iter=run.decoding_iter,
+        # The trunk's drift over the positions the engine drafted from and accepted, and each
+        # flagged step's rank among them.
+        drift_summary = None
+        if drifts:
+            drift = torch.cat(drifts)
+            drift = drift[~drift.isnan()]
+            quantiles = drift.quantile(torch.tensor([0.5, 0.9, 0.99, 1.0])).tolist()
+            drift_summary = dict(
+                positions=drift.numel(), **dict(zip(("median", "p90", "p99", "max"), quantiles))
             )
-            rows.append(row)
-            print(f"[modeling_v2] mtp acceptance {json.dumps(row)}")
-            pooled["ref_accepted"] += eagle["accepted"]
-            pooled["ref_hf_accepted"] += hf["accepted"]
-            pooled["trt_accepted"] += [a for _, a in walk]
-            pooled["k"] = [total + mine for total, mine in zip(pooled["k"], k)]
-            flips_all += flips
-            boundary_total += boundary
+            drift_summary = {key: round(v, 4) for key, v in drift_summary.items()}
+            for flip in flagged:
+                if "drift" in flip:
+                    flip["drift_rank"] = f"{int((drift > flip['drift']).sum()) + 1}/{drift.numel()}"
 
         n = len(pooled["ref_accepted"])
         al_ref = _al(pooled["ref_accepted"])
@@ -500,12 +916,17 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
         request_steps = len(pooled["trt_accepted"])
         unpaired = boundary_total + extra_steps
         weighted = " + ".join(
-            f"{draft_len - depth} * {pooled['k'][depth]}" for depth in range(draft_len)
+            f"{draft_len - depth} * ({pooled['k'][depth]} + {pooled['x'][depth]})"
+            for depth in range(draft_len)
         )
         tol = (
-            sum((draft_len - depth) * pooled["k"][depth] for depth in range(draft_len))
+            sum(
+                (draft_len - depth) * (pooled["k"][depth] + pooled["x"][depth])
+                for depth in range(draft_len)
+            )
             + draft_len * unpaired
         ) / n
+        unexplained = [f for f in flagged if not f["explained"]]
         summary = dict(
             al_trt=round(al_trt, 4),
             al_trt_from_requests=round(al_trt_requests, 4),
@@ -516,6 +937,7 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
             al_ref_hf=round(al_ref_hf, 4),
             ref_steps=n,
             **{f"k{depth + 1}": pooled["k"][depth] for depth in range(draft_len)},
+            **{f"x{depth + 1}": pooled["x"][depth] for depth in range(draft_len)},
             requests=len(prompts),
             epsilon=[round(e, 4) for e in epsilon],
             tol=round(tol, 4),
@@ -527,21 +949,38 @@ class _MtpAcceptance(LlmapiAccuracyTestHarness):
             ],
             boundary_steps=boundary_total,
             unpaired_steps=unpaired,
-            off_near_tie=len(offenders),
+            flagged=len(flagged),
+            explained=len(flagged) - len(unexplained),
+            unexplained=len(unexplained),
+            agree_ref=f"{pooled['agree_ref']}/{pooled['paired']}",
+            **(
+                dict(
+                    agree_engine_trunk=f"{pooled['agree_engine_trunk']}/{pooled['paired']}",
+                    trunk_drift=drift_summary,
+                    captured_steps=capture.captured_steps,
+                    overflow_steps=capture.overflow_steps,
+                )
+                if capture is not None
+                else {}
+            ),
             mixed_steps_by_rank=dict(sorted(mixed_steps.items())),
         )
         print(f"[modeling_v2] mtp acceptance pooled {json.dumps(summary)}")
+        for flip in flagged[: self.PERTURBATION_STEPS]:
+            print(f"[modeling_v2] mtp acceptance flagged {json.dumps(flip)}")
+        self.report = dict(summary=summary, prompts=rows, flagged=flagged)
         report_path = os.environ.get(REPORT_ENV)
         if report_path:
             engine = {name: asdict(run) for name, run in runs.items()}
             with open(report_path, "w") as f:
-                json.dump(dict(summary=summary, prompts=rows, engine=engine), f, indent=1)
+                json.dump(dict(**self.report, engine=engine), f, indent=1)
 
-        assert not offenders, (
-            f"{len(offenders)} verify steps accept a different number of drafts than the "
-            f"reference where the reference's deciding draft is no near-tie (margin >= epsilon "
-            f"{[round(e, 4) for e in epsilon]}): the target's draft path computes something other "
-            f"than the checkpoint's MTP layer there. First ones: {offenders[:5]}"
+        assert not unexplained, (
+            f"{len(unexplained)} of {len(flagged)} flagged verify steps (the engine accepts a "
+            f"different number of drafts than the reference, whose deciding draft is no near-tie: "
+            f"margin >= epsilon {[round(e, 4) for e in epsilon]}) are not explained by the "
+            f"trunk's drift: the target's draft path computes something other than the "
+            f"checkpoint's MTP layer there. First ones: {unexplained[:5]}"
         )
         assert al_trt >= self.MIN_ACCEPTANCE_LENGTH, (
             f"acceptance length {al_trt:.4f} < {self.MIN_ACCEPTANCE_LENGTH}: the draft path "

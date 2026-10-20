@@ -30,7 +30,8 @@ constants stated in it:
 * MTP on against MTP off, parting only at a near-tie (``...MtpIdentity``,
   criterion B(1));
 * the MTP acceptance length against the checkpoint's own MTP layer
-  (``...MtpAcceptance``, criterion B(2)).
+  (``...MtpAcceptance``, criterion B(2)), and that gate failing on a draft
+  path with a planted fault (``...MtpAcceptanceFault``).
 
 The legs and checks the identity and acceptance gates share are the harnesses
 beside this file: ``_nemotron4_cuda_graph_identity.py``,
@@ -53,6 +54,7 @@ import dataclasses
 from collections import Counter, defaultdict
 
 import pytest
+import torch
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch._experimental.modeling_v2 import (
@@ -1235,17 +1237,15 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp3Acceptance(_MtpAcceptance):
     MTP_DRAFT_LEN = 3
 
     # How far the target's MTP logits can be from the reference's, per draft
-    # depth. Depths 1 and 2 are the MTP module gate's measured worst |logit
-    # difference| against the reference's own drafting chain, as at two drafts
-    # (test_modeling_v2_mtp_layer.py; 2.6806 / 2.4847). The module gate drafts
-    # two depths, so depth 3 is not measured there: it runs the same layer as
-    # depth 2, one step further along its own KV, and takes the larger of the
-    # two measured depths. The trunk term is built as at two drafts: tp1's
-    # verify test run with DRAFT = 3 measured the drift along the same tokens,
-    # |logit diff| at most 2.1281 over 6096 positions (four tokens a verify),
-    # plus the decode step's drift across batches, 0.9276, on top of
-    # check_goldens.py's 2.0.
-    MTP_LOGIT_ERROR = (2.6806, 2.4847, 2.6806)
+    # depth: the MTP module gate's measured worst |logit difference| against
+    # the reference's own drafting chain on the same trunk hidden states
+    # (test_modeling_v2_mtp_layer.py; depths 1 and 2 at two drafts, 2.6806 /
+    # 2.4847; depth 3 at five drafts, 3.4683 over 4,034 rows). The trunk term
+    # is built as at two drafts: tp1's verify test run with DRAFT = 3 measured
+    # the drift along the same tokens, |logit diff| at most 2.1281 over 6096
+    # positions (four tokens a verify), plus the decode step's drift across
+    # batches, 0.9276, on top of check_goldens.py's 2.0.
+    MTP_LOGIT_ERROR = (2.6806, 2.4847, 3.4683)
     TRUNK_LOGIT_BAND = 2.0 + 2.1281 + 0.9276
 
     @skip_not_sm103
@@ -1269,17 +1269,15 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp4Acceptance(_MtpAcceptance):
     MTP_DRAFT_LEN = 4
 
     # How far the target's MTP logits can be from the reference's, per draft
-    # depth. Depths 1 and 2 are the MTP module gate's measured worst |logit
-    # difference| against the reference's own drafting chain, as at two drafts
-    # (test_modeling_v2_mtp_layer.py; 2.6806 / 2.4847). The module gate drafts
-    # two depths, so depths 3 and 4 are not measured there: they run the same
-    # layer as depth 2, one and two steps further along its own KV, and take
-    # the larger of the two measured depths. The trunk term is built as at two
-    # drafts: tp1's verify test run with DRAFT = 4 measured the drift along
-    # the same tokens, |logit diff| at most 1.8349 over 6120 positions (five
-    # tokens a verify), plus the decode step's drift across batches, 0.9276,
-    # on top of check_goldens.py's 2.0.
-    MTP_LOGIT_ERROR = (2.6806, 2.4847, 2.6806, 2.6806)
+    # depth: the MTP module gate's measured worst |logit difference| against
+    # the reference's own drafting chain on the same trunk hidden states
+    # (test_modeling_v2_mtp_layer.py; depths 1 and 2 at two drafts, 2.6806 /
+    # 2.4847; depths 3 and 4 at five drafts, 3.4683 / 5.4508 over 4,034 rows
+    # each). The trunk term is built as at two drafts: tp1's verify test run
+    # with DRAFT = 4 measured the drift along the same tokens, |logit diff| at
+    # most 1.8349 over 6120 positions (five tokens a verify), plus the decode
+    # step's drift across batches, 0.9276, on top of check_goldens.py's 2.0.
+    MTP_LOGIT_ERROR = (2.6806, 2.4847, 3.4683, 5.4508)
     TRUNK_LOGIT_BAND = 2.0 + 1.8349 + 0.9276
 
     @skip_not_sm103
@@ -1303,17 +1301,15 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp5Acceptance(_MtpAcceptance):
     MTP_DRAFT_LEN = 5
 
     # How far the target's MTP logits can be from the reference's, per draft
-    # depth. Depths 1 and 2 are the MTP module gate's measured worst |logit
-    # difference| against the reference's own drafting chain, as at two drafts
-    # (test_modeling_v2_mtp_layer.py; 2.6806 / 2.4847). The module gate drafts
-    # two depths, so depths 3 to 5 are not measured there: they run the same
-    # layer as depth 2, one to three steps further along its own KV, and take
-    # the larger of the two measured depths. The trunk term is built as at two
-    # drafts: tp1's verify test run with DRAFT = 5 measured the drift along
-    # the same tokens, |logit diff| at most 1.8560 over 6096 positions (six
-    # tokens a verify), plus the decode step's drift across batches, 0.9276,
-    # on top of check_goldens.py's 2.0.
-    MTP_LOGIT_ERROR = (2.6806, 2.4847, 2.6806, 2.6806, 2.6806)
+    # depth: the MTP module gate's measured worst |logit difference| against
+    # the reference's own drafting chain on the same trunk hidden states
+    # (test_modeling_v2_mtp_layer.py; depths 1 and 2 at two drafts, 2.6806 /
+    # 2.4847; depths 3 to 5 at five drafts, 3.4683 / 5.4508 / 7.7097 over 4,034
+    # rows each). The trunk term is built as at two drafts: tp1's verify test
+    # run with DRAFT = 5 measured the drift along the same tokens, |logit diff|
+    # at most 1.8560 over 6096 positions (six tokens a verify), plus the decode
+    # step's drift across batches, 0.9276, on top of check_goldens.py's 2.0.
+    MTP_LOGIT_ERROR = (2.6806, 2.4847, 3.4683, 5.4508, 7.7097)
     TRUNK_LOGIT_BAND = 2.0 + 1.8560 + 0.9276
 
     @skip_not_sm103
@@ -1324,6 +1320,82 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp5Acceptance(_MtpAcceptance):
         and AL_trt comes from the iteration statistics.
         """
         self._check_acceptance(monkeypatch)
+
+
+def _perturbed(weight: torch.Tensor, scale: float, seed: int) -> torch.Tensor:
+    """``weight`` plus Gaussian noise of ``scale`` times its RMS, drawn on its device from ``seed``."""
+    generator = torch.Generator(device=weight.device).manual_seed(seed)
+    noise = torch.randn(
+        weight.shape, generator=generator, device=weight.device, dtype=torch.float32
+    )
+    rms = weight.float().pow(2).mean().sqrt()
+    return (weight.float() + scale * rms * noise).to(weight.dtype)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptanceFault(_MtpAcceptance):
+    """nemotron4-nano-preview (text model) / sm_103 / tp1, MTP-Eagle draft 2, a planted fault.
+
+    The acceptance gate must fail on a draft path with a fault in it.
+    ``_MtpAcceptance._check_acceptance`` excuses a flagged step when, re-run over the engine's own
+    trunk hidden states, the reference reproduces the engine's count or decides the step by less
+    than epsilon. This proves the re-check excuses only what the trunk explains: with the MTP
+    layer's eh_proj weight perturbed in the engine alone (Gaussian noise, ``FAULT_SCALE`` times the
+    weight's RMS, planted once the weights load), the target's draft path computes something
+    other than the checkpoint's MTP layer, the reference re-run over the engine's trunk still parts
+    from it at confident decisions, and the gate fails through those re-checked steps.
+    """
+
+    MTP_LOGIT_ERROR = TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance.MTP_LOGIT_ERROR
+    TRUNK_LOGIT_BAND = TestModelingV2Nemotron4NanoPreviewSm103Tp1MtpAcceptance.TRUNK_LOGIT_BAND
+
+    # The fault's size, measured on the reference alone: with the perturbed weight (seed 0),
+    # walked greedily over the target's outputs of the fixed prompts, the reference parts from
+    # its unperturbed self at 26 steps the unperturbed weight decides by at least epsilon, while
+    # its acceptance length moves by only -0.081 (2.8136 -> 2.7326): inside the pooled tolerance
+    # (1.28 in this gate's runs) and above MIN_ACCEPTANCE_LENGTH, so only the per-step check
+    # can fail it. At 0.3 the two part at no such step.
+    FAULT_SCALE = 0.5
+    FAULT_SEED = 0
+
+    @skip_not_sm103
+    def test_mtp2_acceptance_fails_on_a_faulty_mtp_layer(self, monkeypatch):
+        """The gate fails, and every step it fails on was re-checked over the engine's trunk."""
+        from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1 import (  # noqa: E501
+            modeling,
+        )
+
+        core = modeling.Nemotron4NanoPreviewTp1ModelingV2
+        post_load_weights = core.post_load_weights
+        calls = 0
+
+        def plant_fault(model):
+            nonlocal calls
+            post_load_weights(model)
+            # The loader runs the hook more than once (on the shell, which calls its core's, and
+            # on every module it holds), so the fault is planted on the first call only. Nothing
+            # here may keep the model: the reference needs the memory it holds.
+            if not calls:
+                weight = model.w[f"l{model.mtp_layer}_eh"]
+                with torch.no_grad():
+                    weight.copy_(_perturbed(weight, self.FAULT_SCALE, self.FAULT_SEED))
+            calls += 1
+
+        # The engine runs in this process (``_MtpAcceptance._trunk_capture``), so the patch
+        # reaches it; the reference loads its own copy of the weight.
+        monkeypatch.setattr(core, "post_load_weights", plant_fault)
+        with pytest.raises(AssertionError, match="not explained by the trunk's drift"):
+            self._check_acceptance(monkeypatch)
+        assert calls, "the fault was never planted: the engine ran in another process"
+        summary, flagged = self.report["summary"], self.report["flagged"]
+        unexplained = [f for f in flagged if not f["explained"]]
+        print(
+            f"[modeling_v2] mtp acceptance fault: planted once over {calls} post-load calls; "
+            f"{len(unexplained)} of {len(flagged)} flagged steps unexplained; AL_trt "
+            f"{summary['al_trt']} vs AL_ref {summary['al_ref']}, tol {summary['tol']}"
+        )
+        assert all("accepted_sub" in f for f in unexplained), (
+            f"the gate failed on steps it did not re-check over the engine's trunk: {unexplained[:3]}"
+        )
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_MtpAcceptance):
