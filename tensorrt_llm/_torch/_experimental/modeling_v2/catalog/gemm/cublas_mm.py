@@ -36,6 +36,7 @@ _NEMOTRON4_LAYER_ROWS = (
     (1, "decode, one token"),
     (1024, "decode, the largest CUDA-graph batch"),
     (8192, "prefill, an 8192-token chunk"),
+    (16384, "a 16384-token prefill or mixed step"),
 )
 
 #: The lm_head only sees each request's last token plus its draft tokens.

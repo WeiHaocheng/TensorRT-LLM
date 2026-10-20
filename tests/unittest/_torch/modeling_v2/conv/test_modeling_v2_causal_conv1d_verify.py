@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the causal_conv1d_verify entry of nemotron4_nano_preview__sm_103__tp1.
+"""GPU test for the causal_conv1d_verify catalog entry, at nemotron4-nano-preview's tp1 and
+tp4-rank shapes.
 
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into the buffers a target hands the op -- the conv columns of the

@@ -410,18 +410,14 @@ def _as_loaded(pretrained_config, spec_config):
 @pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize(
     "spec_kwargs",
-    [
-        dict(max_draft_len=2),
-        dict(max_draft_len=3),
-        dict(max_draft_len=2, speculative_model=_DUMMY_MODEL),
-    ],
-    ids=["trained_depth", "longer_draft", "speculative_model_is_the_checkpoint"],
+    [dict(max_draft_len=2), dict(max_draft_len=2, speculative_model=_DUMMY_MODEL)],
+    ids=["trained_depth", "speculative_model_is_the_checkpoint"],
 )
 def test_nemotron4_tp1_with_mtp_eagle_matches(mode, spec_kwargs):
     """The checkpoint's MTP layer through the one-model MTP-Eagle loop.
 
     Two depths are declared over one repeated layer, so the engine reads one
-    stored layer and resolves MTP-Eagle; the draft length is a knob. A
+    stored layer and resolves MTP-Eagle, at the trained draft length. A
     ``speculative_model`` naming the checkpoint itself still drafts with its
     own MTP layer.
     """
@@ -502,6 +498,68 @@ def test_nemotron4_with_mtp_eagle_on_another_topology_names_the_topology():
     assert "world_size=2" in message
     assert "speculative decoding MTPDecodingConfig (MTP_EAGLE_ONE_MODEL);" in message
     assert "which the target does not run" not in message
+
+
+#: Every nemotron4 target's layout, as mapping arguments.
+_NEMOTRON4_TOPOLOGIES = {"tp1": {}, "dep4": _DEP4, "tp4": _TP4}
+
+
+@pytest.mark.parametrize("max_draft_len", [1, 3])
+@pytest.mark.parametrize("topology", list(_NEMOTRON4_TOPOLOGIES))
+def test_nemotron4_declines_another_draft_length(topology, max_draft_len):
+    """Every target runs the checkpoint's trained depth, two drafts, the length its MTP
+    identity, acceptance and GSM8K gates run, and declines another one by name. On tp4 the
+    message also says why the length is structural there: a verify request's stride decides
+    whether its tokens round as decode's do."""
+    pretrained_config = _nemotron4_config()
+    spec_config = _as_loaded(pretrained_config, MTPDecodingConfig(max_draft_len=max_draft_len))
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    config = _model_config(
+        pretrained_config, spec_config=spec_config, **_NEMOTRON4_TOPOLOGIES[topology]
+    )
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError) as excinfo:
+        modeling_v2_resolve(config, _llm_args("require"))
+    message = str(excinfo.value)
+    assert f", {topology} (world_size=" in message
+    assert (
+        "(MTP_EAGLE_ONE_MODEL), which the target does not run: "
+        f"max_draft_len={max_draft_len}: the target runs 2 drafts" in message
+    )
+    assert ("verify gives decode's bits" in message) == (topology == "tp4")
+    assert "is not implemented" not in message
+
+
+@pytest.mark.parametrize(
+    "spec_kwargs, schedule",
+    [
+        (dict(draft_len_schedule={4: 2, 64: 1}), "draft_len_schedule={4: 2, 64: 1}"),
+        (dict(max_concurrency=64), "max_concurrency=64 (draft_len_schedule={64: 2})"),
+    ],
+    ids=["draft_len_schedule", "max_concurrency"],
+)
+@pytest.mark.parametrize("topology", list(_NEMOTRON4_TOPOLOGIES))
+def test_nemotron4_declines_a_draft_length_that_changes_per_step(topology, spec_kwargs, schedule):
+    """A ``draft_len_schedule`` -- or ``max_concurrency``, which the config turns into one --
+    sets each step's draft length from the batch size. Under attention DP each rank reads its
+    own batch, so the ranks could run different numbers of draft steps and the MTP layer's
+    collectives would not meet: dep4 declines it for that. tp1 and tp4 decline it because no
+    gate runs a draft length that changes from step to step."""
+    pretrained_config = _nemotron4_config()
+    spec_config = _as_loaded(pretrained_config, MTPDecodingConfig(max_draft_len=2, **spec_kwargs))
+    config = _model_config(
+        pretrained_config, spec_config=spec_config, **_NEMOTRON4_TOPOLOGIES[topology]
+    )
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError) as excinfo:
+        modeling_v2_resolve(config, _llm_args("require"))
+    message = str(excinfo.value)
+    assert f", {topology} (world_size=" in message
+    assert f"which the target does not run: {schedule} changes the draft length per step" in message
+    if topology == "dep4":
+        assert "per-step all-gather and reduce-scatter would not meet" in message
+    else:
+        assert "no gate covers a draft length that changes from step to step" in message
 
 
 # --- nemotron4 dep4: attention DP, the routed experts split four ways -------------

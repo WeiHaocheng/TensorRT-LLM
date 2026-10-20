@@ -66,7 +66,8 @@ bits that token gets as a decode step's one token. On its own rank, cuBLAS
 picks its kernel by the row count, and on six of the GEMM shapes the kernels it
 picks split K differently: decode and verify run those through `invariant_mm`,
 and generation attention through `invariant_gen_attention`, whose KV split is
-fixed and whose program for a verify token is the one that decodes it. Across
+fixed and whose kernels compute a verify token with the arithmetic that decodes
+it. Across
 ranks, a token's routed experts see every rank's tokens: `latent_moe_experts`
 gives a token the same bits whatever rows share its window call, and the
 reduce-scatter adds a token's four fp32 partials in one fixed order whatever

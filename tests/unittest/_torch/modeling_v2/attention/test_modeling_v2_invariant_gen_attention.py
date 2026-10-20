@@ -15,6 +15,7 @@ request's last page, and the slots the call appends into. A read of any of
 them puts a NaN into the output.
 """
 
+import importlib
 import math
 import zlib
 
@@ -32,6 +33,9 @@ __extra_import_path__ = [".."]
 from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "invariant_gen_attention requires a CUDA device"
+
+#: The entry's module, whose `_VERIFY_MIN_SEQS` picks the kernel a verify call runs.
+_entry = importlib.import_module(type(op).__module__)
 
 #: Layers sharing the pool, and the one the calls read.
 _LAYERS, _LAYER = 2, 1
@@ -291,11 +295,11 @@ def test_a_request_does_not_depend_on_its_batch(tokens, batch, heads) -> None:
 def test_verify_row_equals_decode_of_the_same_token(tokens, heads) -> None:
     """Row j of a T-token group gives the bits the same token gives as a decode
     row (T = 1) over the same keys: a verified token's attention is the one
-    MTP-off decode computes. The groups straddle page (32) and split (512)
-    boundaries."""
+    MTP-off decode computes. The groups straddle page (32), tile (64) and split
+    (512) boundaries."""
     spec = _cell(tokens, 64, heads).spec
     gen = torch.Generator().manual_seed(tokens)
-    ends = [31, 32, 33, 511, 512, 513, 1023, 1024, 1025, 4097, 8704, 9344, tokens]
+    ends = [31, 32, 33, 65, 66, 511, 512, 513, 577, 578, 1023, 1024, 1025, 4097, 8704, 9344, tokens]
     lens = ends + [min(n + 1000, 9344) for n in ends]
     lens += torch.randint(
         tokens, 9345, (spec["batch"] - spec["pad_rows"] - len(lens),), generator=gen
@@ -320,6 +324,41 @@ def test_verify_row_equals_decode_of_the_same_token(tokens, heads) -> None:
         assert torch.equal(_bits(call.pool), _bits(pool_after)), (
             f"T={tokens}: decoding token {j} appended other bytes than the group"
         )
+
+
+@pytest.mark.parametrize("tokens,batch,heads", [(2, 64, 16), (3, 64, 16), (3, 512, 16), (3, 64, 4)])
+def test_grouped_verify_kernel_equals_the_per_token_kernel(
+    tokens, batch, heads, monkeypatch
+) -> None:
+    """A verify call of `_VERIFY_MIN_SEQS` or more requests runs one program per
+    (split, request) holding the whole group; a smaller one, and decode, run one
+    program per (token, split). The two compute every token's partial with the
+    same arithmetic, so the same call through either kernel gives the same bits,
+    outputs and appended bytes alike. Group ends sit where a token's keys end a
+    page (32), tile (64) or split (512) before its group's last token's do. Four
+    heads is a tensor-parallel rank's share: both kernels pad it to the 16-row
+    tile the same way."""
+    spec = _cell(tokens, batch, heads).spec
+    gen = torch.Generator().manual_seed(100 + tokens)
+    ends = [31, 32, 33, 64, 65, 66, 511, 512, 513, 514, 576, 577, 578, 1024, 1025, 1026, 4097, 9344]
+    lens = ends + [tokens] + [min(n + 1000, 9344) for n in ends]
+    real = spec["batch"] - spec["pad_rows"]
+    lens += torch.randint(tokens, 9345, (real - len(lens),), generator=gen).tolist()
+    call = _Call(spec, seed=batch + tokens, lens=lens)
+    before = call.pool.clone()
+    outputs, pools = [], []
+    for min_seqs in (1, 2**31):
+        monkeypatch.setattr(_entry, "_VERIFY_MIN_SEQS", min_seqs)
+        call.pool.copy_(before)
+        out = op(**call.args(output=torch.full_like(call.output, float("nan"))))
+        outputs.append(call.real_rows(out).clone())
+        pools.append(call.owned(call.pool).clone())
+    assert torch.equal(_bits(outputs[0]), _bits(outputs[1])), (
+        f"T={tokens} B={batch}: the grouped and per-token kernels give different bits"
+    )
+    assert torch.equal(_bits(pools[0]), _bits(pools[1])), (
+        f"T={tokens} B={batch}: the two kernels appended different bytes"
+    )
 
 
 @pytest.mark.parametrize("heads", HEADS, ids=lambda h: f"{h} heads")
@@ -384,10 +423,13 @@ def test_appends_match_thop_attention(tokens, heads) -> None:
     _compare(thop_out, call.reference())
 
 
+@pytest.mark.parametrize("min_seqs", [1, 2**31], ids=["grouped", "per_token"])
 @pytest.mark.parametrize("heads", HEADS, ids=lambda h: f"{h} heads")
-def test_generation_rows_after_context_rows(heads) -> None:
+def test_generation_rows_after_context_rows(heads, min_seqs, monkeypatch) -> None:
     """With context entries first in `sequence_length` and the page table, the
-    call reads its rows from `num_contexts` on, as `thop_attention` does."""
+    call reads its rows from `num_contexts` on, as `thop_attention` does --
+    through either split kernel."""
+    monkeypatch.setattr(_entry, "_VERIFY_MIN_SEQS", min_seqs)
     call = _Call(_cell(3, 8, heads).spec, seed=5, num_contexts=3)
     before = call.pool.clone()
     _check(call, op(**call.args()), before)

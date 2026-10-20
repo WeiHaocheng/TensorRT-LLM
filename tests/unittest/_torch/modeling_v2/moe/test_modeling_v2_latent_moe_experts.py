@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the latent_moe_experts entry of nemotron4_nano_preview__sm_103__tp1.
+"""GPU test for the latent_moe_experts catalog entry, at nemotron4-nano-preview's tp1 window,
+a dep4 rank's expert windows and a tp4 rank's intermediate slice.
 
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into what the target hands the entry -- a latent batch, top-10
 routing over 512 experts, the window's expert weights -- and holds what a cell cannot show:
-the activation pass on every bf16 input, rows that do not depend on their batch, CUDA-graph
-replay, the band's distance from the plausible wrong orders, what the fp32 output is, the
-four expert-parallel windows adding up to the whole, and the input the guard refuses.
+the activation on every bf16 input, the two paths giving the same bits, the counting sort and
+the grouped path's gather giving the stable sort's layout, rows that do not depend on their
+batch (across the switch between the paths), CUDA-graph replay, the band's distance from the
+plausible wrong orders, what the fp32 output is, the four expert-parallel windows adding up
+to the whole, and the input the guard refuses.
 """
 
 import zlib
@@ -17,7 +20,13 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
-    _clamped_relu2_weighted_kernel,
+    _FUSED_TILES,
+    _activate_rows,
+    _count_sort,
+    _experts,
+    _sort_and_gather,
+    _sort_slots,
+    _tiles_for,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.latent_moe_experts import (
     latent_moe_experts as op,
@@ -161,6 +170,69 @@ def test_the_bf16_output_is_the_fp32_sum_rounded_once(cell) -> None:
     assert torch.equal(fp32.to(torch.bfloat16), op(**dict(args, out_dtype=None)))
 
 
+#: The largest batch the fused path takes; past it, the grouped-GEMM path.
+_FUSED_MOST = _FUSED_TILES[-1][0]
+
+_FUSED_CELLS = [c for c in op.CELLS if c.spec["tokens"] <= _FUSED_MOST]
+
+
+def _takes_fused_path(args) -> bool:
+    return _tiles_for(args["x"], args["topk_ids"], args["up_proj"], args["down_proj"]) is not None
+
+
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_the_counting_sort_is_the_stable_sorts_layout(cell) -> None:
+    """The fused path's one-kernel counting sort against the grouped path's stable torch sort,
+    on every cell's routing and window: the same row for every slot, in the window or not, and
+    the same group ends -- so both paths compute and sum the same rows in the same order."""
+    spec = cell.spec
+    _, ids, _ = _routing(spec, torch.Generator(device="cuda").manual_seed(_seed(cell)))
+    window = (spec["local_expert_offset"], spec["num_local_experts"])
+    order, inv, offs = _count_sort(ids, *window)
+    want_order, want_inv, want_offs = _sort_slots(ids, *window)
+    assert torch.equal(order.long(), want_order)
+    assert torch.equal(inv, want_inv)
+    assert torch.equal(offs, want_offs)
+
+
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def test_the_grouped_paths_gather_is_the_sorts_layout(cell) -> None:
+    """The grouped path's one pass after the sort, against the torch ops it replaces -- the
+    inverse permutation scattered and x's rows gathered by token -- on every cell's routing and
+    window: the same `inv` for every slot, in the window or not, and every row's x."""
+    spec = cell.spec
+    x, ids, _ = _routing(spec, torch.Generator(device="cuda").manual_seed(_seed(cell)))
+    window = (spec["local_expert_offset"], spec["num_local_experts"])
+    order, inv, offs, xg = _sort_and_gather(x, ids, *window)
+    want_order, want_inv, want_offs = _sort_slots(ids, *window)
+    assert torch.equal(order, want_order)
+    assert torch.equal(inv, want_inv)
+    assert torch.equal(offs, want_offs)
+    assert torch.equal(xg, x.index_select(0, want_order // spec["top_k"]))
+
+
+@pytest.mark.parametrize("cell", _FUSED_CELLS, ids=[c.why[:44] for c in _FUSED_CELLS])
+def test_the_fused_path_gives_the_grouped_paths_bits(cell) -> None:
+    """Every cell the fused path takes, through both paths: the same output, bit for bit.
+
+    So switching a batch size between the paths changes its speed and nothing else, and the
+    grouped path's certification -- this entry's before the fused path existed -- carries over.
+    """
+    args = _build(cell.spec, seed=_seed(cell))
+    tiles = _tiles_for(args["x"], args["topk_ids"], args["up_proj"], args["down_proj"])
+    assert tiles is not None, "the cell is expected on the fused path"
+    assert torch.equal(_experts(**args, tiles=tiles), _experts(**args, tiles=None))
+
+
+@pytest.mark.parametrize("tokens", [1, 37, 1024])
+@pytest.mark.parametrize("row", _FUSED_TILES, ids=[f"tiles to {r[0]}" for r in _FUSED_TILES])
+def test_every_tile_gives_the_grouped_paths_bits(row, tokens) -> None:
+    """A tile decides how the work is split and nothing else: each row of `_FUSED_TILES`,
+    forced onto one token, an odd 37 and 1024, gives the grouped path's bits."""
+    args = _build(dict(op.CELLS[0].spec, tokens=tokens), seed=tokens)
+    assert torch.equal(_experts(**args, tiles=row[1:]), _experts(**args, tiles=None))
+
+
 #: The four ranks' windows of a 4-rank expert-parallel target, (128 r, 128).
 _EP_WINDOWS = [(128 * r, 128) for r in range(4)]
 
@@ -219,30 +291,30 @@ def test_the_partition_band_refuses_a_boundary_slip(windows) -> None:
 
 
 @pytest.mark.parametrize("weight", [1.0, 0.31640625, 3.16, 0.123456789])
-def test_the_activation_pass_is_the_checkpoints_on_every_bf16_value(weight) -> None:
+@pytest.mark.parametrize("clamp", [16.0, 10.0], ids=["clamp 16", "clamp 10"])
+def test_the_activation_pass_is_the_checkpoints_on_every_bf16_value(clamp, weight) -> None:
     """Every bf16 bit pattern through the entry's activation pass and through the checkpoint's
     torch ops (`Nemotron4ClampedActivation`, relu2, the product with the fp32 routing weight):
     the same bits, and NaN exactly where the checkpoint gives NaN.
 
     A cell samples the activation; this covers its whole input space, which leaves the GEMMs'
-    accumulation order as the only difference the band has to hold.
+    accumulation order as the only difference the band has to hold. The checkpoint's clamp is
+    16; a clamp of 10, whose reciprocal is not exact, shows that h / clamp is computed the way
+    torch computes the checkpoint's division by a scalar. The fused path's epilogue calls the
+    same helper, so this pins it too.
     """
     vals = torch.arange(-32768, 32768, dtype=torch.int32, device="cuda").to(torch.int16)
     vals = vals.view(torch.bfloat16).reshape(16, 4096)
     w = torch.full((16,), weight, dtype=torch.float32, device="cuda")
     got = vals.clone()
-    _clamped_relu2_weighted_kernel[(16,)](
+    _activate_rows(
         got,
         w,
         torch.arange(16, device="cuda"),
         torch.tensor([16], dtype=torch.int32, device="cuda"),
-        got.stride(0),
-        N=4096,
-        CLAMP=16.0,
-        BLOCK_N=4096,
-        num_warps=8,
+        clamp,
     )
-    clamped = (16.0 * torch.tanh(vals.float() / 16.0)).to(torch.bfloat16)
+    clamped = (clamp * torch.tanh(vals.float() / clamp)).to(torch.bfloat16)
     want = (torch.square(torch.relu(clamped)) * w[:, None]).to(torch.bfloat16)
     nan = torch.isnan(want)
     assert torch.equal(torch.isnan(got), nan)
@@ -256,33 +328,39 @@ def test_the_activation_pass_is_the_checkpoints_on_every_bf16_value(weight) -> N
     ids=["tp1 window, bf16", "dep4 rank 3 window, fp32", "tp4 rank's slice, bf16"],
 )
 def test_a_rows_result_does_not_depend_on_its_batch(offset, count, out_dtype, intermediate) -> None:
-    """The first n tokens computed alone and inside a 2048-token batch: bit-identical.
+    """The first n tokens computed alone and inside a larger batch: bit-identical.
 
     Batch composition and CUDA-graph padding change what surrounds a request, and with it the
     grouped GEMMs' group sizes -- and on an expert-parallel rank, every other rank's tokens
     join the gathered batch too. A row whose bits moved with them would make greedy decoding
     depend on its neighbours, so this is measured rather than assumed, at each intermediate
     width a target runs: a tensor-parallel rank's quarter changes both grouped GEMMs' shapes.
+
+    The batch is twice the fused path's largest, so it takes the grouped-GEMM path, while every
+    part up to that largest takes the fused one: the comparison crosses the switch between the
+    paths, which is where a decode step's rows would part from a prefill's. One part past it
+    stays on the grouped path.
     """
     spec = dict(
         op.CELLS[6].spec,
+        tokens=2 * _FUSED_MOST,
         local_expert_offset=offset,
         num_local_experts=count,
         out_dtype=out_dtype,
         intermediate=intermediate,
     )
     args = _build(spec, seed=123)
+    assert not _takes_fused_path(args)
     full = op(**args)
-    for n in (1, 8, 37, 64, 256, 1024):
-        part = op(
-            **dict(
-                args,
-                x=args["x"][:n],
-                topk_ids=args["topk_ids"][:n],
-                topk_weights=args["topk_weights"][:n],
-            )
+    for n in (1, 8, 37, 64, 256, _FUSED_MOST, _FUSED_MOST + 1):
+        part = dict(
+            args,
+            x=args["x"][:n],
+            topk_ids=args["topk_ids"][:n],
+            topk_weights=args["topk_weights"][:n],
         )
-        assert torch.equal(part, full[:n]), f"the first {n} tokens change when computed alone"
+        assert _takes_fused_path(part) == (n <= _FUSED_MOST)
+        assert torch.equal(op(**part), full[:n]), f"the first {n} tokens change when computed alone"
 
 
 @pytest.mark.parametrize(
@@ -292,16 +370,26 @@ def test_a_rows_result_does_not_depend_on_its_batch(offset, count, out_dtype, in
         (64, 0, 512, None, 4096),
         (256, 0, 512, None, 4096),
         (64, 384, 128, torch.float32, 4096),
+        (_FUSED_MOST + 1, 0, 512, None, 4096),
         (1, 0, 512, None, 1024),
         (64, 0, 512, None, 1024),
     ],
-    ids=["1", "64", "256", "64 gathered, dep4 rank 3, fp32", "1, tp4 slice", "64, tp4 slice"],
+    ids=[
+        "1",
+        "64",
+        "256",
+        "64 gathered, dep4 rank 3, fp32",
+        "past the fused path",
+        "1, tp4 slice",
+        "64, tp4 slice",
+    ],
 )
 def test_a_captured_graph_replays_the_eager_result(
     tokens, offset, count, out_dtype, intermediate
 ) -> None:
     """Captured once at a decode size, replayed on new activations and routing: bitwise the
-    eager call. Nothing on the path syncs the host or sizes a buffer from device data."""
+    eager call. Nothing on either path syncs the host or sizes a buffer from device data; the
+    last batch is past the fused path, as an MTP verify step of many rows can be."""
     spec = dict(
         op.CELLS[0].spec,
         tokens=tokens,

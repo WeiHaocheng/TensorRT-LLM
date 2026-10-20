@@ -34,7 +34,10 @@ class NoauxTcOp(OpWrapper):
     # computes them in fp32. The weights come back in the logits' dtype, so
     # the fp32 cells are the ones that see the renormalization's last bit.
     # The token counts are the ones each target routes at once: one per decode
-    # step, a decode batch, and the chunk a prefill is split into.
+    # step, a decode batch, the chunk a prefill is split into, and for
+    # nemotron4 the largest step a rank runs, 16384 tokens. Its expert-parallel
+    # target routes each rank's own tokens before gathering them, so no
+    # nemotron4 call routes more rows than that.
     #
     # Every bias is fp32. nemotron4's are drawn at its checkpoint's scale
     # (per-layer std 0.025-0.064), which leaves the choice to the sigmoid
@@ -84,6 +87,10 @@ class NoauxTcOp(OpWrapper):
         Cell(
             why="nemotron4 prefill chunk of 8192 tokens, the max_num_tokens budget",
             spec=dict(tokens=8192, **_NEMOTRON4),
+        ),
+        Cell(
+            why="nemotron4 prefill or mixed step of 16384 tokens, the larger budget",
+            spec=dict(tokens=16384, **_NEMOTRON4),
         ),
     )
 

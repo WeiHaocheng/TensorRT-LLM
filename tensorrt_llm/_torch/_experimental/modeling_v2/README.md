@@ -188,7 +188,14 @@ checkpoints", which is the opposite of what this package is for.
    speed moves. The detector is `acceptance_length` against the same
    checkpoint under stock in-tree modeling at the same workload and the same
    `speculative_config` — i.e. `modeling_v2=off` versus `=require`,
-   which is now one variable rather than two harnesses.
+   which is now one variable rather than two harnesses. An architecture with
+   no built-in implementation has no `off` leg: its detector is a plain-torch
+   transcription of the checkpoint's own draft module, run teacher-forced over
+   the target's greedy output, and the acceptance it gives.
+4. **Identity** — for a target whose decode step is batch-invariant: greedy
+   tokens identical with CUDA graphs on and off, and with speculative decoding
+   on and off. Each holds only if every row of a step computes its bits from
+   that row alone, so a failure points at the step that is not.
 
 Compare a variant against an identity run **in the same session**: one target
 measured 94.7688 and 95.0720 on a bit-identical forward a day apart, so a
@@ -198,11 +205,13 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**Every entry is certified on sm_103, and both targets are gated there.**
+**Every entry is certified on sm_103, and all five targets are gated there.**
 
-The 32 entries -- 22 shared, 7 owned by deepseek, 3 by gpt-oss -- each drive
-their cells through `__call__` and `reference` in pre-merge CI, plus the two
-4-rank collective matrices. Certification is per architecture: `ARCHS` says
+The 33 entries -- 23 shared, 7 owned by deepseek, 3 by gpt-oss; the three
+nemotron4 targets own none, every entry they call being shared -- each drive
+their cells through `__call__` and `reference` in pre-merge CI, plus the three
+4-rank collective matrices (all-gather, reduce-scatter, all-reduce).
+Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,
 which is the honest state.
 
@@ -221,21 +230,34 @@ widening a tolerance, and each is written up in its own entry:
 * **The MLA append op now accepts NVFP4 latent pools** as well as fp8 (accepted
   by the op, not certified here).
 
-Both targets are gated by the accuracy suite's modeling_v2 files,
+The gpt-oss and deepseek targets are gated by the accuracy suite's modeling_v2 files,
 `tests/integration/defs/accuracy/test_modeling_v2_{gpt_oss,deepseek_v3}.py`,
 with `modeling_v2="require"` in force, which is what rules out the built-in
 implementation having been measured instead. gpt-oss-120b / sm_103 / tp1 runs
 gsm8k; deepseek-r1-0528-nvfp4 / sm_103 / dep4 runs gsm8k for the identity
 forward and the `mtp3` variant **paired in one session**, and the acceptance
-gate against stock modeling under the same `speculative_config`. The numbers
-live with those runs, not here: a number written into this file is one that
-drifts with nothing to notice.
+gate against stock modeling under the same `speculative_config`.
+nemotron4-nano-preview's text model / sm_103 has three targets, tp1, dep4 and
+tp4, gated in `tests/integration/defs/accuracy/test_modeling_v2_nemotron4.py`:
+routing on the shipped config for all three; gsm8k for all three, tp1's
+paired in one session with its MTP variant (one-model MTP-Eagle, draft length
+2); token identity with CUDA graphs on and off for all three; and, for tp1,
+token identity with MTP on and off, and the acceptance gate (also for tp4).
+TensorRT-LLM has no built-in implementation of this architecture, so there is
+no stock leg: the gsm8k anchor is the checkpoint's own HuggingFace code under
+the same protocol, and the acceptance anchor is a plain-torch transcription of
+its MTP layer. The MTP layer's module accuracy, and the decode and verify
+invariance the identity gates rest on, are unit tests in each target's test
+directory. The numbers live with those runs, not here: a number written into
+this file is one that drifts with nothing to notice.
 
 The acceptance row is the one that matters for a speculative variant:
 rejection sampling makes a miscomputed draft layer *slower*, not wrong, so
 boot and accuracy are blind to it and only the acceptance rate against a
-reference can see it. Draft lengths 1 and 2 remain ungated -- they are the
-dominated end of the measured draft-length axis.
+reference can see it. deepseek's draft lengths 1 and 2 remain ungated -- they
+are the dominated end of the measured draft-length axis. The nemotron4 targets
+run draft length 2, the checkpoint's trained depth, and routing declines every
+other length and any per-step draft-length schedule.
 
 ### What replaced the version pin
 

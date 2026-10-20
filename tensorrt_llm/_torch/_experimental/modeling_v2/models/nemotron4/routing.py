@@ -126,15 +126,21 @@ def _text_shape(text_config: Any) -> dict:
     return shape
 
 
-def _speculation_declined(spec_config: Optional[Any]) -> Optional[str]:
+#: The one draft length the targets run: the checkpoint's trained depth, two
+#: drafts over its one repeated MTP layer, so a verify step carries 3 tokens per
+#: request. It is the length the MTP identity, acceptance and GSM8K gates run.
+_DRAFT_LEN = 2
+
+
+def _speculation_declined(spec_config: Optional[Any], topology: Optional[str]) -> Optional[str]:
     """Why the target does not run this speculative decoding; None when it does.
 
     The draft path is the checkpoint's own MTP layer (``mtp.layers.0``, which
     ``mtp_use_repeated_layer`` repeats for every draft depth) driven by the
     one-model MTP-Eagle loop: one linear draft chain per request, the drafter's
-    weights loaded from the target checkpoint. The model loader resolves the
-    mode against the checkpoint config before routing, so ``spec_dec_mode`` is
-    the mode the engine will run.
+    weights loaded from the target checkpoint, ``_DRAFT_LEN`` drafts on every
+    step. The model loader resolves the mode against the checkpoint config
+    before routing, so ``spec_dec_mode`` is the mode the engine will run.
     """
     if spec_config is None:
         return None
@@ -160,6 +166,35 @@ def _speculation_declined(spec_config: Optional[Any]) -> Optional[str]:
             f"speculative_model={str(spec_config.speculative_model)!r} supplies separate "
             "draft weights, and the target drafts with the checkpoint's own MTP layer"
         )
+    if spec_config.draft_len_schedule is not None:
+        # max_concurrency reaches the engine as a one-entry schedule: no drafts above it.
+        schedule = f"draft_len_schedule={spec_config.draft_len_schedule}"
+        if spec_config.max_concurrency is not None:
+            schedule = f"max_concurrency={spec_config.max_concurrency} ({schedule})"
+        if topology == "dep4":
+            why = (
+                "under attention DP each rank picks its step's draft length from its own batch "
+                "size, so the ranks could run different numbers of draft steps, and the MTP "
+                "layer's per-step all-gather and reduce-scatter would not meet"
+            )
+        else:
+            why = (
+                f"no gate covers a draft length that changes from step to step: the gates run "
+                f"{_DRAFT_LEN} drafts on every step"
+            )
+        return f"{schedule} changes the draft length per step, and {why}"
+    if spec_config.max_draft_len != _DRAFT_LEN:
+        why = (
+            f"the target runs {_DRAFT_LEN} drafts, the checkpoint's trained depth, which is the "
+            "length its gates certify"
+        )
+        if topology == "tp4":
+            why += (
+                "; on a tp4 rank it is also the one certified length whose verify gives "
+                "decode's bits (gdp_verify: a request's stride, (1 + max_draft_len) x 4632, "
+                "must not be a multiple of 16, as decode's 4632 is not)"
+            )
+        return f"max_draft_len={spec_config.max_draft_len}: {why}"
     return None
 
 
@@ -203,13 +238,15 @@ def route(
 
     # Speculative decoding changes the step's structure (a verify step, a draft loop, the
     # MTP layer's weights and KV), so every mode the targets have no path for is declined
-    # here rather than left to crash in the model. The draft length and its schedule, the
-    # acceptance rule and SA drafting are knobs: they change how many tokens a step carries
-    # or which drafts are kept, not which code runs.
-    declined = _speculation_declined(spec_config)
+    # here rather than left to crash in the model. The draft length is part of that
+    # structure: it sets the tokens per request of every verify step and the steps of the
+    # draft loop, and the targets run only the trained depth. So is a schedule that changes
+    # it from step to step. The acceptance rule and SA drafting are knobs: they change
+    # which drafts are kept, not which code runs.
+    declined = _speculation_declined(spec_config, topology)
 
     # nemotron4-nano-preview's text model on GB300s (sm103), with one-model MTP-Eagle on the
-    # checkpoint's MTP layer or no speculative decoding.
+    # checkpoint's MTP layer at its trained draft length or no speculative decoding.
     if compute_capability == (10, 3) and not differs and declined is None:
         # One line per target on purpose: test_modeling_v2_claims finds a family's targets
         # by reading these imports, and the formatter and isort would wrap them.
@@ -251,5 +288,6 @@ def route(
         "dep4 (4 ranks, attention DP, the routed experts split four ways and nothing else "
         "divided) and tp4 (4 ranks, no attention DP, the mixers' heads and every MLP's and "
         "routed expert's intermediate width split four ways), each with one-model MTP-Eagle "
-        "on the checkpoint's MTP layer or without speculative decoding"
+        f"on the checkpoint's MTP layer at max_draft_len={_DRAFT_LEN} without a "
+        "draft_len_schedule, or without speculative decoding"
     )

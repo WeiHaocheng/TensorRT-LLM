@@ -116,6 +116,37 @@ def test_greedy_acceptance_walk(hit, expected):
     assert R.greedy_acceptance(tokens, drafts, first_draft_position=4) == expected
 
 
+def test_greedy_walk_positions():
+    """``greedy_walk`` names the drafting position of every step: each step starts one past the
+    last token the previous step emitted (depth 1 wrong only at q = 7, as above)."""
+    tokens = list(range(100, 120))
+    drafts = [
+        [tokens[q + 2 + d] if q + 2 + d < len(tokens) and not (d == 0 and q == 7) else -1
+         for q in range(20)]
+        for d in range(2)
+    ]  # fmt: skip
+    assert R.greedy_walk(tokens, drafts, first_draft_position=4) == [
+        (4, 2), (7, 0), (8, 2), (11, 2), (14, 2),
+    ]  # fmt: skip
+
+
+def test_draft_scores_margins():
+    """``draft_scores``: the margin is what a competitor must gain on the top-1 token to change
+    whether the draft matches the true token."""
+    logits = torch.tensor(
+        [
+            [5.0, 3.0, 1.0, 0.0],  # draft 0 is the true token: runner-up at 3.0
+            [5.0, 4.5, 1.0, 0.0],  # draft 0 misses, true token 2 at 1.0: only it can fix the miss
+            [2.0, 2.0, 1.0, 0.0],  # a tie: the argmax is the first, and any gain flips it
+            [5.0, 3.0, 1.0, 0.0],  # true token unknown (past the end): runner-up margin
+        ]
+    )
+    true_ids = torch.tensor([0, 2, 0, -1])
+    ids, margins = R.draft_scores(logits, true_ids)
+    assert ids.tolist() == [0, 0, 0, 0]
+    assert margins.tolist() == [2.0, 4.0, 0.0, 2.0]
+
+
 def test_prompt_set_is_pinned(tokenizer):
     """The prompt set builds offline and matches ``PROMPT_SHA256``: >= 4 short prompts and
     >= 4 long ones of 7K-8K tokens."""
