@@ -51,22 +51,25 @@ _JOB = Path(__file__).resolve().with_name("_dep4_decode_invariance_job.py")
 # The bands: how far a probe's decode step may sit from the same step alone on its rank, the other
 # ranks idle. Measured on this model's own state over every probe in every run of the job: eager
 # batches of 2 to 256 rows beside idle, decoding and prefilling ranks, and padded graphs of 1 to
-# 256, every rank padded to the busiest rank's size and an idle rank on the attention-DP dummy. The
-# kernels are deterministic, so the worst cases repeat run to run. The worst cases, over 246 eager
-# and 241 graph rows: |logit diff| 0.8574, top-gap shift 0.2512, recurrent state 0.0275, conv state
-# 0.0355 and K/V 0.0606 of max |alone|; no top-1 changed. A graph batch against the same rows run
-# eagerly, what the CUDA-graph identity gate's legs differ by in one step, measured 0.7520 /
-# 0.2760. Each band is its worst case plus a quarter, rounded up: room for a batch, history, graph
-# size or load on the other ranks the runs did not take, where cuBLAS or thop may pick yet another
-# kernel.
-LOGIT_BAND = 1.08
+# 256, every rank padded to the busiest rank's size and an idle rank on the attention-DP dummy. A
+# graph step runs its bf16 GEMMs on the low-M entries for its few rows and its router on the router
+# kernel, where the step alone (eager) runs cuBLAS; and a step whose ranks hold one count takes the
+# MoE's all-to-all where a ragged one takes the reduce-scatter, which group a token's four partials
+# differently. The kernels are deterministic, so the worst cases repeat run to run. The worst
+# cases, over 246 eager and 241 graph rows: |logit diff| 0.5442 eager and 0.9601 in graphs, top-gap
+# shift 0.2974 and 0.5563, recurrent state 0.022 and 0.0425, conv state 0.0496 and K/V 0.0482 of
+# max |alone|; no top-1 changed. A graph batch against the same rows run eagerly, what the
+# CUDA-graph identity gate's legs differ by in one step, measured 0.9659 / 0.5406. Each band is its
+# worst case plus a quarter, rounded up: room for a batch, history, graph size or load on the other
+# ranks the runs did not take, where a GEMM or thop may pick yet another kernel.
+LOGIT_BAND = 1.21
 """max |batched logit - alone logit| over the vocabulary, fp32."""
-GAP_BAND = 0.32
+GAP_BAND = 0.70
 """The largest change, batched against alone, of the gap between the alone step's top-1 and any of
 its top `J.TOP` tokens: how close to a tie the batch can tip the alone step's choice."""
-SSM_BAND = 0.035
-CONV_BAND = 0.045
-KV_BAND = 0.076
+SSM_BAND = 0.054
+CONV_BAND = 0.062
+KV_BAND = 0.061
 """max |batched - alone| / max |alone|, per tensor, over every GDP layer (recurrent state fp32, conv
 state bf16) and every attention layer (the appended K/V)."""
 
@@ -229,8 +232,8 @@ def test_the_band_tells_a_state_one_token_off(measured) -> None:
     """The bands have teeth: a decode step from the state one token too far -- every GDP slot
     holding the state its own decode step left, as a rollback that kept a rejected draft would
     leave it -- moves every probe's logits by more than twice the logit band, each probe alone on
-    its rank, the other ranks idle. (Measured: at least 4.604, on the 4096-token prefix of
-    `gsm8k_multiturn`, whose top gaps it moves by only 0.282, inside the gap band: there the logit
+    its rank, the other ranks idle. (Measured: at least 4.596, on the 4096-token prefix of
+    `gsm8k_multiturn`, whose top gaps it moves by only 0.322, inside the gap band: there the logit
     band is what tells the two states apart.)"""
     records = measured["teeth"]
     assert len(records) == J.WORLD_SIZE

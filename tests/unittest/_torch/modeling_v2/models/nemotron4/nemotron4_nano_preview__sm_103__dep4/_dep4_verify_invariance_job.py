@@ -248,34 +248,38 @@ WORST_KEYS = ("logit", "gap", "ssm", "conv", "kv")
 """The compared quantities a run records the worst case of."""
 
 # The bands. A verify token differs from its decode step through every kernel whose choice moves
-# with the step: cuBLAS at 3B rows against B, thop_attention's generation kernels at three tokens a
-# row against one, the GDP and conv verify entries against the decode ones, and the routed MoE's
-# window and reduce-scatter over every rank's tokens, which the other ranks' load changes. Each
-# rounds within a bf16 step of the other, and every later layer carries the difference into the
-# token's state, its K/V and its logits. How far is measured over every run below, every rank: each
-# probe's three tokens alone, in eager batches beside idle, verifying, decoding or prefilling ranks,
-# in padded graphs, at the length limit and through the commit. The kernels are deterministic, so
-# the worst cases repeat run to run: |logit diff| 0.7644 alone and 0.9792 in batches and graphs;
-# top-gap shift 0.2601 alone, 0.3949 in batches; recurrent state, conv state and K/V 0.04898 /
-# 0.06904 / 0.08275 of max |decode| (the commit's slots 0.0229 / 0.0447); no top-1 changed. Each
+# with the step: the bf16 GEMMs at 3B rows against B (cuBLAS, or on a graph's few rows the low-M
+# entry for that row count) and the router's (cuBLAS, or the router kernel), thop_attention's
+# generation kernels at three tokens a row against one, the GDP and conv verify entries against the
+# decode ones, and the routed MoE's window and combine over every rank's tokens, which the other
+# ranks' load changes (the all-to-all on a balanced step, the reduce-scatter on a ragged one, which
+# group a token's four partials differently). Each rounds within a bf16 step of the other, and every
+# later layer carries the difference into the token's state, its K/V and its logits. How far is
+# measured over every run below, every rank: each probe's three tokens alone, in eager batches
+# beside idle, verifying, decoding or prefilling ranks, in padded graphs, at the length limit and
+# through the commit. The kernels are deterministic, so the worst cases repeat run to run: |logit
+# diff| 0.7595 alone, 0.7585 in batches and graphs and 1.376 at the length limit (a graph of 4
+# beside two probes, at 12 rows on the low-M kernels); top-gap shift 0.2553 alone, 0.3853 in
+# batches; recurrent state, conv state and K/V 0.08067 (the length limit; 0.05662 elsewhere) /
+# 0.07004 / 0.09235 of max |decode| (the commit's slots 0.0566 / 0.0697); no top-1 changed. Each
 # band is its worst case plus a quarter, rounded up: room for a batch, history, graph size or load
-# on the other ranks the runs did not take, where cuBLAS or thop may pick yet another kernel.
-LOGIT_BAND = 1.23
+# on the other ranks the runs did not take, where a GEMM or thop may pick yet another kernel.
+LOGIT_BAND = 1.72
 """max |verify logit - decode logit| over the vocabulary, fp32."""
 GAP_BAND = 0.50
 """The largest change, verify against decode, of the gap between the decode step's top-1 and any of
 its top `TOP` tokens: how close to a tie the verify can tip the decode step's choice."""
-SSM_BAND = 0.062
-CONV_BAND = 0.087
-KV_BAND = 0.11
+SSM_BAND = 0.101
+CONV_BAND = 0.088
+KV_BAND = 0.116
 """max |verify - decode| / max |decode| per tensor, over every GDP layer (recurrent state fp32,
 conv state bf16) and every attention layer (K/V)."""
-DRIFT_LOGIT_BAND = 5.03
-DRIFT_GAP_BAND = 1.17
+DRIFT_LOGIT_BAND = 2.02
+DRIFT_GAP_BAND = 2.08
 """The same two quantities over the drift's 6132 matched positions, where the verify's state and K/V
-carry each earlier verify's deviation: worst cases 4.0192 (|logit diff|, on the 2-shot chat
-`clips`; 0.61-1.41 on every other probe) and 0.9300 (top-gap shift, on `haiku`), plus a quarter,
-rounded up; ten top-1 changes, at decode margins of at most 0.0384. dep4's MTP identity gate's
+carry each earlier verify's deviation: worst cases 1.6122 (|logit diff|) and 1.6573 (top-gap
+shift), both on `news_digest`'s 1023 tokens (0.52-1.60 and 0.22-0.99 on every other probe), plus a
+quarter, rounded up; ten top-1 changes, at decode margins of at most 0.0999. dep4's MTP identity gate's
 near-tie band is built on the measured top-gap shift; its MTP acceptance gate's verify term is the
 measured |logit diff|."""
 
@@ -1279,6 +1283,7 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                 finite=all(bool(torch.isfinite(t["logits"]).all()) for t in steps),
                 failures=at_limit["failures"] + in_graph["failures"],
                 compared=at_limit["compared"] + in_graph["compared"],
+                worst=[w for w in (at_limit["worst"], in_graph["worst"]) if w],
             )
         )
     say(f"limit: lengths up to {longest}, max_seq_len {bound}, window {window} (net {MAX_SEQ_LEN})")

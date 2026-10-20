@@ -3,19 +3,20 @@
 """The 4-rank job behind `test_modeling_v2_dep4_mtp_rollback.py`: an MTP verify step of the dep4
 target's GDP mixer, committed by the engine's own promotion, on every rank's own cache manager.
 
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python _dep4_mtp_rollback_job.py --out <json> [--checkpoint <dir>]
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python _dep4_mtp_rollback_job.py --out <json> [--draft D] [--checkpoint <dir>]
 
 Run plainly, this script is its own launcher: it starts one MPI rank per device under `mpirun`, as
 a dep4 serving engine starts its ranks, with a deadline it enforces by killing the job.
 
 What every rank builds, as the engine builds it for its rank under ``MTPDecodingConfig(max_draft_len
-=2)``: ``ModelConfig`` off the checkpoint with the rank's dep4 ``Mapping``, and the hybrid cache
+=D)`` (``--draft``, one of the draft lengths dep4 runs, `DRAFTS`): ``ModelConfig`` off the checkpoint
+with the rank's dep4 ``Mapping``, and the hybrid cache
 manager for that mapping (``_create_kv_cache_manager``; under attention DP one manager holds the
 trunk's state and KV and the MTP layer's KV, with the verify's per-position buffers) -- both
 managers the engine offers, ``MambaHybridCacheManagerV2`` (the default) and
 ``CppMambaHybridCacheManager``. Requests, the attention-DP dummy (``ATTENTION_DP_DUMMY_REQUEST_ID``,
 a generation request carrying the drafts, as the executor pads an idle rank) and the runner's MTP
-padding dummy (``CUDA_GRAPH_DUMMY_REQUEST_ID - 2``) are registered with the manager, which hands out
+padding dummy (``CUDA_GRAPH_DUMMY_REQUEST_ID - D``) are registered with the manager, which hands out
 their slots. The mixer is layer 0's, on the checkpoint's own weights laid out by dep4's weight table
 transforms, run through the targets' own code (``DecodeTarget._gdp`` for a decode or verify step,
 ``PrefillTarget._gdp`` for a mixed one); the commit is the manager's ``update_mamba_states`` with the
@@ -23,8 +24,8 @@ engine's own slots, as the worker calls it.
 
 The cases, each on every rank with its own seed, on both managers (`CASES`):
 
-* ``padded``: 5 requests verifying 1 + 2 tokens, padded to a graph batch of 8 with the padding dummy's
-  rows, two verify -> commit rounds whose accepted counts cover 1..3;
+* ``padded``: 5 requests verifying 1 + D tokens, padded to a graph batch of 8 with the padding dummy's
+  rows, two verify -> commit rounds whose accepted counts cover 1..1 + D;
 * ``idle``: a rank with no request: the attention-DP dummy padded to a graph batch of 4;
 * ``dummy alone``: the attention-DP dummy alone, eagerly;
 * ``mixed``: a fresh 37-token prompt (a context row) beside 3 verify rows.
@@ -33,9 +34,9 @@ Per case, every real row against its slot after `accepted` MTP-off decode steps 
 over the same tokens: its committed conv state bit for bit -- a window of the in_proj output's conv
 columns, which both conv entries copy rather than compute -- and its committed recurrent state
 within `STATE_ULP`; the verify's GDP entry outputs within `OUT_ULP` of the decode steps', observed
-where `_gdp_generation` calls `gdp_verify` and `gdp_recurrent`; and the states after one, two
-and three tokens differ pairwise -- the conv states in some bit, the recurrent ones by more than
-their band -- so a commit from the wrong position cannot pass. The verify writes no slot, and the
+where `_gdp_generation` calls `gdp_verify` and `gdp_recurrent`; and the states after each of the
+1 + D tokens differ pairwise -- the conv states in some bit, the recurrent ones by more than their
+band -- so a commit from the wrong position cannot pass. The verify writes no slot, and the
 commit writes only the step's rows' engine slots (the dummies' included, whose stale snapshot it
 copies) and never a context row's. Rank 0 writes every rank's records to `--out` as JSON.
 
@@ -62,8 +63,21 @@ _WORKER_FLAG = "--rank-worker"
 _PID_DIR_ENV = "NEMOTRON4_DEP4_MTP_ROLLBACK_PID_DIR"
 DEADLINE_S = 1200
 WORLD_SIZE = 4
+DRAFTS = (2, 3)
+"""The draft lengths dep4 runs: the checkpoint's trained depth, and the repeated layer's next."""
 DRAFT = 2
+"""The draft length of this run (`--draft`); a verify row carries `TOKENS` = 1 + DRAFT tokens."""
 TOKENS = 1 + DRAFT
+#: Per 1 + D, the accepted counts of the 5 real rows in each of the two padded rounds: every count
+#: 1..1 + D in each round up to 1 + D = 5; at 6, one more count than rows, in the two together.
+_ROUNDS = {
+    3: ([3, 1, 2, 3, 1], [1, 2, 3, 2, 3]),
+    4: ([4, 1, 2, 3, 4], [1, 4, 3, 2, 4]),
+    5: ([5, 1, 3, 4, 2], [2, 5, 4, 1, 3]),
+    6: ([6, 1, 3, 5, 2], [4, 6, 2, 1, 5]),
+}
+#: Per 1 + D, the accepted counts of the mixed step's 3 verify rows, the last position among them.
+_MIXED = {3: [2, 3, 1], 4: [4, 1, 3], 5: [5, 2, 4], 6: [6, 4, 1]}
 MAX_BATCH = 8
 LAYER = 0
 """A `linear_attention` block; every GDP mixer of the model is the same mixer."""
@@ -101,7 +115,7 @@ def _standalone_env() -> dict[str, str]:
     return env
 
 
-def spawn_ranks(out: str, checkpoint: str) -> None:
+def spawn_ranks(out: str, checkpoint: str, draft: int) -> None:
     """Start one MPI rank per claimed device under mpirun; kill the job on failure or deadline."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     assert visible, "set CUDA_VISIBLE_DEVICES to the four devices this run owns"
@@ -119,7 +133,7 @@ def spawn_ranks(out: str, checkpoint: str) -> None:
     if os.geteuid() == 0:
         command.insert(1, "--allow-run-as-root")
     command += [sys.executable, str(Path(__file__).resolve()), _WORKER_FLAG]
-    command += ["--out", out, "--checkpoint", checkpoint]
+    command += ["--out", out, "--checkpoint", checkpoint, "--draft", str(draft)]
     print(f"[launcher] {' '.join(command)}", flush=True)
     job = subprocess.Popen(command, env=env, start_new_session=True)
     deadline = time.monotonic() + DEADLINE_S
@@ -319,8 +333,10 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             return ssm[index].clone(), conv[index].clone()
 
         def step(slots: list, **context) -> dict:
-            """What `step_args` hands the mixer for these rows' slots."""
+            """What `step_args` hands the mixer for these rows' slots: an eager step's, so the
+            GEMMs are cuBLAS's."""
             return dict(
+                graph=False,
                 state_slots=torch.tensor(slots, dtype=torch.int32, device="cuda"),
                 ssm_states={LAYER: ssm},
                 conv_states={LAYER: conv},
@@ -403,7 +419,7 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             prime(g, real, steps=6)
             failures, distinct_all = [], True
             state, out_ulp, separation = 0.0, 0.0, float("inf")
-            for accepted in ([3, 1, 2, 3, 1], [1, 2, 3, 2, 3]):
+            for accepted in _ROUNDS[TOKENS]:
                 start = snapshot()
                 x = rows(g, len(padded) * TOKENS).view(len(padded), TOKENS, -1)
                 decode._gdp(x.reshape(-1, x.shape[-1]), mixer, step(padded))
@@ -438,9 +454,10 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                     manager=type(manager).__name__,
                     kind=kind,
                     case="padded",
+                    draft=DRAFT,
                     failures=failures,
                     distinct=distinct_all,
-                    accepted=[1, 2, 3],
+                    accepted=sorted({n for counts in _ROUNDS[TOKENS] for n in counts}),
                     state=state,
                     out=out_ulp,
                     separation=separation,
@@ -470,6 +487,7 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                         manager=type(manager).__name__,
                         kind=kind,
                         case=case,
+                        draft=DRAFT,
                         failures=failures,
                         distinct=True,
                         accepted=[],
@@ -479,7 +497,7 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             # --- mixed: a fresh 37-token prompt beside 3 verify rows ---
             context_slot, real = slot[request_ids[5]], [slot[r] for r in request_ids[:3]]
             prime(g, real, steps=4)
-            accepted = [2, 3, 1]
+            accepted = _MIXED[TOKENS]
             start = snapshot()
             context = rows(g, 37)
             x = rows(g, len(real) * TOKENS).view(len(real), TOKENS, -1)
@@ -492,8 +510,8 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                     num_rows=1 + len(real),
                     num_contexts=1,
                     num_ctx_tokens=37,
+                    max_ctx_len=37,
                     query_start_loc=starts,
-                    query_start_loc_long=starts.long(),
                     has_initial_state=torch.zeros(1, dtype=torch.bool, device="cuda"),
                 ),
             )
@@ -524,6 +542,7 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                     manager=type(manager).__name__,
                     kind=kind,
                     case="mixed",
+                    draft=DRAFT,
                     failures=failures,
                     distinct=conv_distinct and apart > 1,
                     accepted=accepted,
@@ -575,6 +594,9 @@ def _parse(argv) -> argparse.Namespace:
     parser.add_argument(_WORKER_FLAG, action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--out", required=True, help="where rank 0 writes the records (JSON)")
     parser.add_argument(
+        "--draft", type=int, default=DRAFT, choices=DRAFTS, help="the draft length (default: 2)"
+    )
+    parser.add_argument(
         "--checkpoint",
         default=os.path.join(os.environ.get("LLM_MODELS_ROOT", ""), "nemotron4-nano-preview"),
         help="the checkpoint directory (default: $LLM_MODELS_ROOT/nemotron4-nano-preview)",
@@ -584,6 +606,8 @@ def _parse(argv) -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse(sys.argv[1:])
+    # Every function reads the run's draft length off these module globals.
+    DRAFT, TOKENS = args.draft, 1 + args.draft
     if args.rank_worker:
         sys.exit(_run_one_rank(args.out, args.checkpoint))
-    spawn_ranks(args.out, args.checkpoint)
+    spawn_ranks(args.out, args.checkpoint, args.draft)

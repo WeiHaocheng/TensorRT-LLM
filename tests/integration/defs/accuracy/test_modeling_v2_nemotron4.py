@@ -144,6 +144,7 @@ class TestModelingV2Nemotron4NanoPreviewRouting:
             ("tp1", 5),
             ("dep4", 0),
             ("dep4", 2),
+            ("dep4", 3),
             ("tp4", 0),
             ("tp4", 2),
         ],
@@ -170,8 +171,8 @@ class TestModelingV2Nemotron4NanoPreviewRouting:
             ),
             (
                 "dep4",
-                lambda: MTPDecodingConfig(max_draft_len=3),
-                "max_draft_len=3: the target runs 2 drafts",
+                lambda: MTPDecodingConfig(max_draft_len=4),
+                "max_draft_len=4: the target runs 2 or 3 drafts",
             ),
             (
                 "dep4",
@@ -183,7 +184,7 @@ class TestModelingV2Nemotron4NanoPreviewRouting:
             "tp2",
             "vanilla_mtp",
             "tp1_draft_len_6",
-            "dep4_draft_len_3",
+            "dep4_draft_len_4",
             "draft_len_schedule_under_attention_dp",
         ],
     )
@@ -387,7 +388,7 @@ def _acceptance_length(requests: list) -> float:
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
-    """nemotron4-nano-preview (text model) / sm_103 / dep4, identity and the mtp2 variant."""
+    """nemotron4-nano-preview (text model) / sm_103 / dep4, identity and the mtp2 and mtp3 variants."""
 
     MODEL_NAME = "Nemotron4/nemotron4-nano-preview"
     MODEL_PATH = f"{llm_models_root()}/nemotron4-nano-preview"
@@ -421,6 +422,14 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
     # depths. MTPDecodingConfig defaults to a depth of 1, so it is stated.
     MTP_DRAFT_LEN = 2
 
+    # The longer draft dep4 also runs: the repeated MTP layer's third depth. Its
+    # leg serves at most 448 requests a rank, the largest batch the verify
+    # entries' four-token cells certify, and a step holds 8192 tokens a rank plus
+    # 448 rows of 4.
+    MTP3_DRAFT_LEN = 3
+    MTP3_MAX_BATCH_SIZE = 448
+    MTP3_MAX_NUM_TOKENS = 8192 + 448 * 4
+
     # There is deliberately no standalone identity gsm8k case. The paired test
     # below evaluates the identity config as its first leg, and
     # ``task.evaluate`` asserts accuracy against the reference on the way past,
@@ -450,6 +459,22 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_gsm8k_identity_vs_mtp2(self, mocker):
+        """The identity gate and MTP at two drafts, paired (``_gsm8k_identity_vs_mtp``)."""
+        self._gsm8k_identity_vs_mtp(
+            mocker, self.MTP_DRAFT_LEN, self.MTP_MAX_BATCH_SIZE, self.MTP_MAX_NUM_TOKENS
+        )
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_gsm8k_identity_vs_mtp3(self, mocker):
+        """The identity gate and MTP at three drafts, paired (``_gsm8k_identity_vs_mtp``)."""
+        self._gsm8k_identity_vs_mtp(
+            mocker, self.MTP3_DRAFT_LEN, self.MTP3_MAX_BATCH_SIZE, self.MTP3_MAX_NUM_TOKENS
+        )
+
+    def _gsm8k_identity_vs_mtp(
+        self, mocker, draft_len: int, mtp_max_batch_size: int, mtp_max_num_tokens: int
+    ):
         """The identity accuracy gate on 4 ranks, and the gate on MTP not moving it.
 
         It holds dep4 to the bar tp1 is held to: the anchor is a property of
@@ -492,17 +517,17 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
         # tenth of the free memory the fraction leaves, ~17 GiB, is over three
         # times what tp1's MTP leg would keep at the default (``MTP_KV``).
         with self._llm(
-            self.MTP_MAX_BATCH_SIZE,
-            self.MTP_MAX_NUM_TOKENS,
-            speculative_config=MTPDecodingConfig(max_draft_len=self.MTP_DRAFT_LEN),
+            mtp_max_batch_size,
+            mtp_max_num_tokens,
+            speculative_config=MTPDecodingConfig(max_draft_len=draft_len),
         ) as llm:
             requests = _record_requests(llm, mocker)
-            mtp2 = task.evaluate(llm)
+            mtp = task.evaluate(llm)
             acceptance_length = _acceptance_length(requests)
 
-        delta = mtp2 - identity
+        delta = mtp - identity
         print(
-            f"[modeling_v2] gsm8k dep4 identity={identity:.4f} mtp2={mtp2:.4f} "
+            f"[modeling_v2] gsm8k dep4 identity={identity:.4f} mtp{draft_len}={mtp:.4f} "
             f"delta={delta:+.4f} acceptance_length={acceptance_length:.4f} "
             f"over {len(requests)} requests"
         )
@@ -510,7 +535,7 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4(LlmapiAccuracyTestHarness):
         # score near 57%, as on tp1.
         assert abs(delta) < 2.7, (
             f"MTP moved gsm8k by {delta:+.4f} on dep4 (identity={identity:.4f}, "
-            f"mtp2={mtp2:.4f}); greedy MTP emits the target's own tokens, so "
+            f"mtp{draft_len}={mtp:.4f}); greedy MTP emits the target's own tokens, so "
             f"this is not near-tie noise"
         )
 
@@ -1099,8 +1124,9 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
     Attention DP over the 4 GPUs of one node: every rank runs its own
     requests, and the ranks meet in every routed MoE block, the MTP layer's
     included. Each prompt is pinned to a rank, the same one in both legs: the
-    MoE's reduce-scatter adds a token's four partial sums in an order that ends
-    at the token's own rank, so the rank is part of what a token computes.
+    MoE's combine (the all-to-all's on a balanced step, the reduce-scatter's on a
+    ragged one) adds a token's four partial sums in an order that depends on the
+    token's own rank, so the rank is part of what a token computes.
 
     Alone, the prompt's rank runs it and the other three run the attention-DP
     dummy, a generation row of 1 + D tokens with MTP on and of one token with
@@ -1128,12 +1154,13 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
     # top tokens: the verify's drift from decode -- dep4's verify test
     # (test_modeling_v2_dep4_verify_invariance.py, the drift in its job) follows
     # each fixed prompt alone on its rank for the tokens this gate generates, MTP
-    # on along MTP off's own tokens, and measured a top-gap shift of at most
-    # 0.9300 over 6132 positions -- plus the decode step's drift across batches,
-    # since a decode row moves with the batch it runs in and the load on the
-    # other ranks (test_modeling_v2_dep4_decode_invariance.py: at most 0.2512);
-    # plus a quarter, rounded up.
-    NEAR_TIE_BAND = 1.48
+    # on (a CUDA graph of one) along MTP off's own tokens (eager), and measured a
+    # top-gap shift of at most 1.6573 over 6132 positions -- plus the decode
+    # step's drift across batches, since a decode row moves with the batch it
+    # runs in, with the GEMM kernels a CUDA graph runs its rows on and with the
+    # load on the other ranks (test_modeling_v2_dep4_decode_invariance.py: at
+    # most 0.5563, a graph row); plus a quarter, rounded up.
+    NEAR_TIE_BAND = 2.77
 
     def _ranks(self, prompts) -> dict[str, int]:
         """One long prompt per rank, the short ones dealt round-robin."""
@@ -1154,6 +1181,27 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity(_MtpIdentity):
         arrival times.
         """
         return sorted(requests, key=lambda r: r.max_tokens != self.LONG_TOKENS)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Dep4Mtp3Identity(
+    TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpIdentity
+):
+    """nemotron4-nano-preview (text model) / sm_103 / dep4: MTP-Eagle at three drafts on against off.
+
+    dep4 also runs max_draft_len 3: the checkpoint's one repeated MTP layer
+    drafts a third depth, and a verify step carries 4 tokens per request. The
+    two-draft class's ranks, prompts and step budget.
+    """
+
+    MTP_DRAFT_LEN = 3
+
+    # How far dep4's verify of 4 tokens can move a gap between MTP off's top-1
+    # and another of its top tokens: dep4's verify test run with DRAFT = 3,
+    # following each fixed prompt alone on its rank for the tokens this gate
+    # generates, four tokens a verify, measured at most 2.436 over 6096
+    # positions; plus the decode step's drift across batches, 0.5563, as
+    # at two drafts; plus a quarter, rounded up.
+    NEAR_TIE_BAND = 3.75
 
 
 class TestModelingV2Nemotron4NanoPreviewSm103Tp4MtpIdentity(_MtpIdentity):
@@ -1321,14 +1369,15 @@ class TestModelingV2Nemotron4NanoPreviewSm103Tp1Mtp5Acceptance(_MtpAcceptance):
         self._check_acceptance(monkeypatch)
 
 
-class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_MtpAcceptance):
-    """nemotron4-nano-preview (text model) / sm_103 / dep4, MTP-Eagle draft 2.
+class _Dep4MtpAcceptance(_MtpAcceptance):
+    """nemotron4-nano-preview (text model) / sm_103 / dep4, MTP-Eagle, every draft length.
 
-    The acceptance length against the checkpoint's own MTP layer, on 4 ranks
-    with attention DP. Each rank drafts and verifies its own requests, and the
-    ranks meet in every routed MoE block, the MTP layer's included; a rank with
-    no request left runs the attention-DP dummy. Every prompt is pinned to a
-    rank, and MAX_BATCH_SIZE and the CUDA graphs are per rank.
+    What each draft length's acceptance class shares. The acceptance length
+    against the checkpoint's own MTP layer, on 4 ranks with attention DP. Each
+    rank drafts and verifies its own requests, and the ranks meet in every routed
+    MoE block, the MTP layer's included; a rank with no request left runs the
+    attention-DP dummy. Every prompt is pinned to a rank, and MAX_BATCH_SIZE and
+    the CUDA graphs are per rank.
     """
 
     # Attention DP over the 4 GPUs of one node with the routed experts split
@@ -1343,24 +1392,6 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_MtpAcceptance):
         enable_chunked_prefill=True,
     )
     RANKS = 4
-
-    # How far the target's MTP logits can move a margin of the reference's
-    # drafts, per draft depth: the larger of the MTP module gate's worst |logit
-    # difference| against the reference's own drafting chain on the same trunk
-    # hidden states and its largest gain of any token on that chain's top-1,
-    # over the 4 ranks, each running the prompt set in its own rotation
-    # (test_modeling_v2_dep4_mtp_layer.py; depth 1: 2.6806 and 2.619, depth 2:
-    # 2.8998 and 4.5655, the gain rank 3's), plus the band on the target trunk's
-    # logits against the reference's: dep4's trunk passes check_goldens_dep4.py
-    # with tp1's bands, whose free-running logits band is 2.0. The trunk band
-    # gains two measured terms: the verify's drift from decode along the same
-    # tokens, 4.0192 (test_modeling_v2_dep4_verify_invariance.py, the drift over
-    # 6132 positions of the fixed prompts), and the decode step's drift across
-    # batches and the other ranks' load, 0.8574
-    # (test_modeling_v2_dep4_decode_invariance.py), since decode and verify rows
-    # move with the batch they run in.
-    MTP_LOGIT_ERROR = (2.6806, 4.5655)
-    TRUNK_LOGIT_BAND = 2.0 + 4.0192 + 0.8574
 
     def _ranks(self, prompts) -> dict[str, int]:
         """One long prompt per rank, the short ones dealt round-robin.
@@ -1415,6 +1446,28 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_MtpAcceptance):
             ),
         )
 
+
+class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_Dep4MtpAcceptance):
+    """nemotron4-nano-preview (text model) / sm_103 / dep4, MTP-Eagle draft 2."""
+
+    # How far the target's MTP logits can move a margin of the reference's
+    # drafts, per draft depth: the larger of the MTP module gate's worst |logit
+    # difference| against the reference's own drafting chain on the same trunk
+    # hidden states and its largest gain of any token on that chain's top-1,
+    # over the 4 ranks, each running the prompt set in its own rotation
+    # (test_modeling_v2_dep4_mtp_layer.py; depth 1: 2.6806 and 2.619, depth 2:
+    # 2.8998 and 4.5655, the gain rank 3's), plus the band on the target trunk's
+    # logits against the reference's: dep4's trunk passes check_goldens_dep4.py
+    # with tp1's bands, whose free-running logits band is 2.0. The trunk band
+    # gains two measured terms: the verify's drift from decode along the same
+    # tokens, 1.6122 (test_modeling_v2_dep4_verify_invariance.py, the drift
+    # over 6132 positions of the fixed prompts), and the decode step's drift
+    # across batches, the graph kernels and the other ranks' load, 0.9601
+    # (test_modeling_v2_dep4_decode_invariance.py), since decode and verify rows
+    # move with the batch they run in.
+    MTP_LOGIT_ERROR = (2.6806, 4.5655)
+    TRUNK_LOGIT_BAND = 2.0 + 1.6122 + 0.9601
+
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_mtp2_acceptance_matches_reference(self, monkeypatch):
@@ -1424,6 +1477,33 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4MtpAcceptance(_MtpAcceptance):
         and beside ranks that verify, prefill or idle, and AL_trt comes from the
         requests' own walks.
         """
+        self._check_acceptance(monkeypatch)
+
+
+class TestModelingV2Nemotron4NanoPreviewSm103Dep4Mtp3Acceptance(_Dep4MtpAcceptance):
+    """nemotron4-nano-preview (text model) / sm_103 / dep4, MTP-Eagle draft 3.
+
+    The acceptance length at the longer draft dep4 also runs: the repeated MTP
+    layer drafts a third depth, and the reference walks three depths deep.
+    """
+
+    MTP_DRAFT_LEN = 3
+
+    # How far the target's MTP logits can be from the reference's, per draft
+    # depth. Depths 1 and 2 are the two-draft class's. The module gate drafts two
+    # depths, so depth 3 is not measured there: it runs the same layer as depth
+    # 2, one step further along its own KV, and takes the larger of the two
+    # measured depths. The trunk term: dep4's verify test run with DRAFT = 3
+    # measured the verify's drift along the same tokens at most 1.7918 over
+    # 6096 positions (four tokens a verify), on top of the free-running 2.0
+    # and the decode step's 0.9601.
+    MTP_LOGIT_ERROR = (2.6806, 4.5655, 4.5655)
+    TRUNK_LOGIT_BAND = 2.0 + 1.7918 + 0.9601
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_mtp3_acceptance_matches_reference(self, monkeypatch):
+        """The acceptance length at three drafts matches the reference's (``_check_acceptance``)."""
         self._check_acceptance(monkeypatch)
 
 
