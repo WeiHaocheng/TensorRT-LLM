@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the gdp_verify entry of nemotron4-nano-preview's tp1 target."""
+"""GPU test for the gdp_verify catalog entry, at nemotron4-nano-preview's tp1 and tp4-rank shapes."""
 
 import math
 import zlib
@@ -18,12 +18,49 @@ from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: 
 
 assert torch.cuda.is_available(), "gdp_verify requires a CUDA device"
 
-#: What a v1 (`CppMambaHybridCacheManager`) slot carries after a GDP layer's
-#: ssm state: its conv state, conv_dim 16896 x (kernel 4 - 1) bf16 values.
-_CONV_STATE_FLOATS = 16896 * 3 * 2 // 4
 #: A v2 (`MambaHybridCacheManagerV2`) slot holds the ssm states of all 32 GDP
 #: layers back to back; the view under test is this one's.
 _V2_LAYERS, _V2_LAYER = 32, 13
+#: The head counts the cells certify: tp1's 24 and a tp4 rank's 6.
+HEADS = sorted({c.spec["heads"] for c in op.CELLS}, reverse=True)
+
+
+def _conv_dim(spec) -> int:
+    """The GDP conv's channels at a cell's geometry, [V0..V2 | K0..K2 | Q]: 16896 at
+    24 heads, 4224 at 6."""
+    h, nh, dk, dv = spec["heads"], spec["householder"], spec["key_dim"], spec["value_dim"]
+    return nh * h * dv + (nh + 1) * h * dk
+
+
+def _conv_state_floats(spec) -> int:
+    """What a v1 (`CppMambaHybridCacheManager`) slot carries after a GDP layer's
+    ssm state: its conv state, conv_dim x (kernel 4 - 1) bf16 values, in floats."""
+    return _conv_dim(spec) * 3 * 2 // 4
+
+
+def _cell_spec(heads: int, batch: int, tokens: int):
+    """The spec of the cell at this head count, batch and token count."""
+    return next(
+        c.spec
+        for c in op.CELLS
+        if c.spec["heads"] == heads and c.spec["batch"] == batch and c.spec["tokens"] == tokens
+    )
+
+
+def _rows_view(proj: torch.Tensor, start: int, inner: tuple, tokens: int | None) -> torch.Tensor:
+    """Columns ``start:`` of the in_proj-shaped ``proj`` as ``[rows, *inner]`` (``tokens`` None)
+    or ``[rows / tokens, tokens, *inner]``, every view keeping ``proj``'s row stride for a token
+    -- the views the targets hand the GDP entries."""
+    strides, size = [], 1
+    for n in reversed(inner):
+        strides.insert(0, size)
+        size *= n
+    rows, row = proj.shape[0], proj.stride(0)
+    if tokens is None:
+        shape, stride = (rows, *inner), (row, *strides)
+    else:
+        shape, stride = (rows // tokens, tokens, *inner), (tokens * row, row, *strides)
+    return proj.as_strided(shape, stride, proj.storage_offset() + start)
 
 
 def _compare_out(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -100,7 +137,7 @@ def _raw_pool(spec, num_slots: int, g: torch.Generator) -> torch.Tensor:
     if spec["pool"] == "v2":
         shape = (num_slots, _V2_LAYERS * ssm)
     else:
-        shape = (num_slots + 1, ssm + _CONV_STATE_FLOATS)
+        shape = (num_slots + 1, ssm + _conv_state_floats(spec))
     return torch.randn(shape, generator=g, device="cuda") * 0.5
 
 
@@ -122,28 +159,35 @@ def _raw_intermediate(spec, g: torch.Generator) -> torch.Tensor:
 
 
 def _inputs(spec, batch: int, g: torch.Generator):
-    """(q, k, v, g, beta) as the target holds them after the conv of a verify
-    step: the generation rows are request-major, so q, k and v are `[B, T, ...]`
-    views of one post-SiLU conv-output row per token, packed [V0..V2 | K0..K2 |
-    Q] as `Nemotron4GDPMixer` splits it; beta is the bf16 sigmoid of an in_proj
-    slice; g is HF's fp32 decay over the checkpoint's parameter ranges
+    """(q, k, v, g, beta, proj) as the target holds them after the conv of a
+    verify step, which writes its post-SiLU output in place into the in_proj
+    output's conv columns: the generation rows are request-major, one in_proj row
+    per token, so q, k and v are `[B, T, ...]` views of `proj`, packed [V0..V2 |
+    K0..K2 | Q] as `Nemotron4GDPMixer` splits it, a token's row stride the in_proj
+    width and a request's T times it. The rest of each row is NaN, which a read
+    outside the views would carry into the result. beta is the bf16 sigmoid of an
+    in_proj slice; g is HF's fp32 decay over the checkpoint's parameter ranges
     (exp(A_log) in [0.0061, 18.3], dt_bias in [-7.03, -1.94] across its 32 GDP
     layers), so some heads forget within a token and others barely at all."""
     h, nh, dk, dv = spec["heads"], spec["householder"], spec["key_dim"], spec["value_dim"]
     tokens = spec["tokens"]
-    conv_dim = nh * h * dv + (nh + 1) * h * dk
-    mixed = F.silu(torch.randn(batch, tokens, conv_dim, generator=g, device="cuda"))
-    mixed = mixed.to(torch.bfloat16)
-    v = mixed[..., : nh * h * dv].view(batch, tokens, nh, h, dv)
-    k = mixed[..., nh * h * dv : nh * h * (dv + dk)].view(batch, tokens, nh, h, dk)
-    q = mixed[..., nh * h * (dv + dk) :].view(batch, tokens, h, dk)
+    conv_dim = _conv_dim(spec)
+    mixed = F.silu(torch.randn(batch * tokens, conv_dim, generator=g, device="cuda"))
+    proj = torch.full(
+        (batch * tokens, spec["proj_width"]), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    lo = spec["conv_offset"]
+    proj[:, lo : lo + conv_dim].copy_(mixed)
+    v = _rows_view(proj, lo, (nh, h, dv), tokens)
+    k = _rows_view(proj, lo + nh * h * dv, (nh, h, dk), tokens)
+    q = _rows_view(proj, lo + nh * h * (dv + dk), (h, dk), tokens)
     b = torch.randn(batch, tokens, nh * h, generator=g, device="cuda").to(torch.bfloat16)
     beta = b.sigmoid().view(batch, tokens, nh, h)
     a_log = torch.empty(h, device="cuda").uniform_(math.log(0.0061), math.log(18.3), generator=g)
     dt_bias = torch.empty(h, device="cuda").uniform_(-7.03, -1.94, generator=g).to(torch.bfloat16)
     a = torch.randn(batch, tokens, h, generator=g, device="cuda").to(torch.bfloat16)
     decay = -a_log.exp() * F.softplus(a.float() + dt_bias.float())
-    return q, k, v, decay, beta
+    return q, k, v, decay, beta, proj
 
 
 def _slots(batch: int, pad_rows: int, num_slots: int, g: torch.Generator) -> torch.Tensor:
@@ -155,12 +199,13 @@ def _slots(batch: int, pad_rows: int, num_slots: int, g: torch.Generator) -> tor
 
 
 def _build(spec, seed: int):
-    """One cell: (args, the pool's raw memory, the intermediate's raw memory)."""
+    """One cell: (args, the pool's raw memory, the intermediate's raw memory). The in_proj
+    buffer q, k and v view is `args["q"]`'s base."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     num_slots = _num_slots(spec)
     pool_raw = _raw_pool(spec, num_slots, g)
     inter_raw = _raw_intermediate(spec, g)
-    q, k, v, decay, beta = _inputs(spec, spec["batch"], g)
+    q, k, v, decay, beta, _ = _inputs(spec, spec["batch"], g)
     args = dict(
         q=q,
         k=k,
@@ -196,11 +241,24 @@ def _check(out, ref_out, ref_inter, args, pool_raw, pool_before, inter_raw, inte
     )
 
 
-def _decode(args):
+def _decode_rows(x: torch.Tensor, t: int, spec) -> torch.Tensor:
+    """Token t of every request, as a decode step's target holds it: one in_proj row per
+    request, its row stride the in_proj width."""
+    batch, tokens = x.shape[:2]
+    proj = torch.full((batch, spec["proj_width"]), float("nan"), dtype=x.dtype, device=x.device)
+    start = x.storage_offset() % spec["proj_width"]
+    inner = tuple(x.shape[2:])
+    view = _rows_view(proj, start, inner, None)
+    view.copy_(x[:, t])
+    return view
+
+
+def _decode(args, spec):
     """What MTP-off decode computes for the same tokens: T consecutive
     `gdp_recurrent` calls, each advancing the request's state in place -- on
     a dense copy of the requests' slots, since the verify's pool must stay as it
-    is. Returns (out `[B, T, H, V]`, the state after each token `[B, T, H, V, K]`)."""
+    is -- each on the views a decode step's target passes (`_decode_rows`).
+    Returns (out `[B, T, H, V]`, the state after each token `[B, T, H, V, K]`)."""
     slots = args["slots"]
     pad = slots < 0
     pool = args["state_pool"][torch.where(pad, 0, slots).long()].clone()
@@ -208,7 +266,8 @@ def _decode(args):
     rows = torch.where(pad, PAD_SLOT_ID, rows).to(torch.int32)
     outs, states = [], []
     for t in range(args["q"].shape[1]):
-        step = {name: args[name][:, t] for name in ("q", "k", "v", "g", "beta")}
+        step = {name: _decode_rows(args[name], t, spec) for name in ("q", "k", "v")}
+        step.update({name: args[name][:, t] for name in ("g", "beta")})
         outs.append(gdp_recurrent(**step, state_pool=pool, slots=rows, scale=args["scale"]))
         states.append(pool.clone())
     return torch.stack(outs, 1), torch.stack(states, 1)
@@ -231,8 +290,12 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     # left in the slot. Not the padding rows: a decode call starts a padding
     # row from zero and keeps nothing, so from the second token on its outputs
     # come from another state than the verify carries -- discarded either way.
+    # Not where the request stride's divisibility by 16 differs from decode's
+    # row stride (`decode_bits`; `test_an_even_draft_at_a_tp4_rank_rounds_otherwise`).
     del pool_before, inter_before
-    dec_out, dec_states = _decode(args)
+    if not spec["decode_bits"]:
+        return
+    dec_out, dec_states = _decode(args, spec)
     real = _real_rows(args["slots"])
     assert torch.equal(out[real], dec_out[real]), "out differs from T gdp_recurrent calls"
     assert torch.equal(args["intermediate"][real, : spec["tokens"]], dec_states[real]), (
@@ -264,7 +327,7 @@ def test_cuda_graph_replays_verify_commit_verify() -> None:
     real_slots = args["slots"][:n_real].clone()
     for replay in range(2):
         fresh = _inputs(spec, spec["batch"], g)
-        for name, value in zip(("q", "k", "v", "g", "beta"), fresh):
+        for name, value in zip(("q", "k", "v", "g", "beta"), fresh[:5]):
             args[name].copy_(value)
         order = real_slots[torch.randperm(n_real, generator=g, device="cuda")]
         args["slots"][:n_real].copy_(order)
@@ -279,11 +342,12 @@ def test_cuda_graph_replays_verify_commit_verify() -> None:
         args["state_pool"][order.long()] = args["intermediate"][rows, accepted - 1]
 
 
-def test_a_row_does_not_depend_on_its_batch() -> None:
+@pytest.mark.parametrize("heads", HEADS)
+def test_a_row_does_not_depend_on_its_batch(heads: int) -> None:
     """Bit-identical output and snapshots for a request whether it runs alone,
     in a batch of three or in the padded graph batch of 1024: a row's
     arithmetic is fixed by the kernel's tile, never by the batch around it."""
-    spec = next(c.spec for c in op.CELLS if c.spec["batch"] == 1024 and c.spec["tokens"] == 3)
+    spec = _cell_spec(heads, 1024, 3)
     args, _, _ = _build(spec, seed=1024)
     full_out = op(**args)
     full_inter = args["intermediate"][: spec["batch"]].clone()
@@ -293,6 +357,44 @@ def test_a_row_does_not_depend_on_its_batch() -> None:
         out = op(**sub, state_pool=args["state_pool"], intermediate=inter, scale=args["scale"])
         assert torch.equal(out, full_out[rows]), f"rows {rows}: out depends on the batch"
         assert torch.equal(inter, full_inter[rows]), f"rows {rows}: snapshots depend on the batch"
+
+
+def test_an_even_draft_at_a_tp4_rank_rounds_otherwise() -> None:
+    """The stride condition of the note, at a tp4 rank's 6 heads (in_proj width 4632). With one
+    draft token a request's two tokens sit 9264 apart, a multiple of 16 where decode's row
+    stride 4632 is not, and the verify of a 64-request batch moves some output or snapshot off
+    decode's bits. The same tokens laid out one in_proj row further apart per request -- 13896,
+    a draft-2 request's stride -- give decode's bits again. If the first assertion fails, Triton
+    compiles the two strides alike and the condition in the note can go."""
+    spec = _cell_spec(6, 64, 2)
+    assert not spec["decode_bits"]
+    args, _, _ = _build(spec, seed=264)
+    real = _real_rows(args["slots"])
+    dec_out, dec_states = _decode(args, spec)
+    out = op(**args)
+    moved = not torch.equal(out[real], dec_out[real]) or not torch.equal(
+        args["intermediate"][real, :2], dec_states[real]
+    )
+    assert moved, "the hazard the note describes is gone: a draft-1 verify rounds as decode does"
+
+    batch, tokens, width = spec["batch"], spec["tokens"], spec["proj_width"]
+    gapped = torch.full(
+        (batch * (tokens + 1), width), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    spaced = {}
+    for name in ("q", "k", "v"):
+        x = args[name]
+        inner = tuple(x.shape[2:])
+        strides = [math.prod(inner[i + 1 :]) for i in range(len(inner))]
+        start = x.storage_offset() % width
+        spaced[name] = gapped.as_strided(
+            x.shape, ((tokens + 1) * width, width, *strides), gapped.storage_offset() + start
+        )
+        spaced[name].copy_(x)
+    intermediate = torch.zeros_like(args["intermediate"])
+    out = op(**dict(args, **spaced, intermediate=intermediate))
+    assert torch.equal(out[real], dec_out[real]), "spaced out, the outputs still move"
+    assert torch.equal(intermediate[real, :2], dec_states[real]), "spaced out, a state moves"
 
 
 def test_rows_may_share_a_slot() -> None:

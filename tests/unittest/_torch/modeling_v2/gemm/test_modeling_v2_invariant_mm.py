@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the invariant_mm entry of nemotron4_nano_preview__sm_103__tp1.
+"""GPU test for the invariant_mm catalog entry, at nemotron4-nano-preview's GEMM shapes.
 
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the guard.
 This file turns a cell into the operands a target hands the op, proves the property the entry
@@ -44,7 +44,8 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     agree to a few 1e-6 relative, so what is left is a rounding flip -- one bf16 spacing, at most 2 of
     these ulps at the top binade of a row. Measured over every cell: worst element 1.98 (that
     flip), worst RMS 0.070. The reference is the more accurate side: 0.019 RMS from a float64
-    product, against the kernel's 0.070.
+    product, against the kernel's 0.070. A tp4 rank's GDP in_proj (3072 -> 4632): worst element
+    1.98, worst RMS 0.040; kernel and reference both 1.00 / 0.43 of a float64 product.
 
     fp32 out (the router and the lm_head): 1024 ulp (2^-23) element-wise, 512 of relative RMS. Here
     the fp32 sums are the output. Measured worst: 60.5 element and 27.8 RMS, the kernel again the
@@ -183,6 +184,7 @@ CUBLAS_MOVES = (
     "MoE router",
     "fc1_latent_proj",
     "MTP eh_proj",
+    "tp4 GDP in_proj",
 )
 
 

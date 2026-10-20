@@ -17,13 +17,18 @@ from .._op import Arch, Cell, OpWrapper
 # is [T, 18528] = [z 1536 | conv 16896 | b0..b2 72 | a 24], so b and a are column slices of it at
 # offsets 18432 and 18504, row stride 18528.
 _GDP = dict(heads=24, householder=3, proj_width=18528, b_offset=18432, a_offset=18504)
+# A tp4 rank holds 6 of the heads, and its in_proj output keeps the segments in that order at a
+# quarter of each width: [T, 4632] = [z 384 | conv 4224 | b0..b2 18 | a 6], so b and a sit at
+# offsets 4608 and 4626. Each row of a then starts 4 bytes past a 16-byte boundary, where tp1's
+# start on one, and Triton compiles another variant of the kernel for that pointer.
+_GDP_TP4 = dict(heads=6, householder=3, proj_width=4632, b_offset=4608, a_offset=4626)
 
 # torch's softplus at its defaults (beta 1, threshold 20): the input itself above the threshold.
 _SOFTPLUS_THRESHOLD = 20.0
 
 
-def _cell(why: str, tokens: int) -> Cell:
-    return Cell(why=why, spec=dict(tokens=tokens, **_GDP))
+def _cell(why: str, tokens: int, geometry: dict = _GDP) -> Cell:
+    return Cell(why=why, spec=dict(tokens=tokens, **geometry))
 
 
 @triton.jit
@@ -86,7 +91,8 @@ class GdpGates(OpWrapper):
 
     # Token counts that differ in kind: one decode token, one request's MTP verify (1 + 2 drafts),
     # a count no power of two divides, the largest CUDA-graph decode batch, and the two prefill
-    # chunk budgets. The kernel is one program per token, so these differ only in the grid.
+    # chunk budgets, at tp1's geometry and a tp4 rank's. The kernel is one program per token, so
+    # the counts differ only in the grid.
     CELLS: tuple[Cell, ...] = (
         _cell("decode: one token", 1),
         _cell("one request's MTP verify: 3 tokens", 3),
@@ -94,20 +100,30 @@ class GdpGates(OpWrapper):
         _cell("1024 tokens: the largest CUDA-graph decode batch", 1024),
         _cell("8192 tokens: a prefill chunk at max_num_tokens 8192", 8192),
         _cell("16384 tokens: a prefill chunk at max_num_tokens 16384", 16384),
+        _cell("tp4 rank, decode: one token", 1, _GDP_TP4),
+        _cell("tp4 rank, one request's MTP verify: 3 tokens", 3, _GDP_TP4),
+        _cell("tp4 rank, 37 tokens", 37, _GDP_TP4),
+        _cell("tp4 rank, 1024 tokens: the largest graph batch", 1024, _GDP_TP4),
+        _cell("tp4 rank, 8192 tokens: a max_num_tokens 8192 chunk", 8192, _GDP_TP4),
+        _cell("tp4 rank, 16384 tokens: a 16384-token chunk", 16384, _GDP_TP4),
     )
 
     note = """
     Bit-exact with HF's torch ops, not merely close: besides the cells, the test drives every
     bf16 bit pattern through each gate (b for beta; a, at several heads' dt_bias and A_log, for g),
-    NaN included. One exception: where HF's decay is an fp32 subnormal (|g| < 2^-126, which takes
-    a + dt_bias below about -84), libdevice flushes it to a zero of the same sign. The
-    recurrences read g through exp(), which maps both to exactly 1.0.
+    NaN included, at both certified head counts. One exception: where exp(a + dt_bias) falls below
+    2^-126 (a + dt_bias under about -87.3), libdevice flushes it to zero, so the kernel's decay is a
+    zero of HF's sign while HF's is the subnormal softplus times exp(A_log) -- a subnormal, or
+    where exp(A_log) > 1 a normal number below 2^-126 * exp(A_log) (2.2e-37 at the checkpoint's
+    largest). The recurrences read g through exp(), which maps both to exactly 1.0.
 
     A token's results depend on that token alone, so a row is batch-invariant and a CUDA-graph
     padding row only computes something nobody reads. CUDA-graph capturable: one launch, no host
     sync, nothing allocated besides the two outputs. `T = 0` launches nothing.
 
-    Uncertified: another head count or Householder count, fp16 or fp32 b and a, a bf16 `neg_a`.
+    Certified: 24 heads (tp1) and 6 (a tp4 rank), 3 Householder steps, each as its target's in_proj
+    column slices. Uncertified: another head count or Householder count, fp16 or fp32 b and a, a
+    bf16 `neg_a`.
     """
 
     def __call__(

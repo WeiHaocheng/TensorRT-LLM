@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the gated_rmsnorm entry of nemotron4_nano_preview__sm_103__tp1.
+"""GPU test for the gated_rmsnorm catalog entry, at nemotron4-nano-preview's tp1 and tp4-rank
+shapes.
 
 The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is_valid` the
 guard. This file turns a cell into the tensors a target hands the op -- the recurrence output
@@ -26,6 +27,16 @@ assert torch.cuda.is_available(), "gated_rmsnorm requires a CUDA device"
 #: Bound on the fraction of outputs that may differ from the reference at all; see `_compare`.
 MAX_MISMATCH_FRACTION = 1e-3
 
+#: The head counts the cells certify: tp1's 24 and a tp4 rank's 6.
+HEADS = sorted({c.spec["num_heads"] for c in op.CELLS}, reverse=True)
+
+
+def _cell_spec(num_heads: int, tokens: int):
+    """The spec of the cell at this head count and token count."""
+    return next(
+        c.spec for c in op.CELLS if c.spec["num_heads"] == num_heads and c.spec["tokens"] == tokens
+    )
+
 
 def _ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Element-wise distance between two bf16 tensors in ulps, counted on the bit patterns."""
@@ -47,7 +58,8 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     relative. So an output can only land on the neighbouring bf16 value, and only when its fp32
     value sits on a rounding boundary. Measured over every cell at five seeds each: the 1- and
     3-token cells are bit-identical, and from 1024 tokens up at most 1.53e-5 of the outputs
-    differ at all, each by exactly one ulp of its own value.
+    differ at all (2.0e-5 at a tp4 rank's 384 channels), each by exactly one ulp of its own
+    value.
 
     Two gates:
       * every output within one bf16 ulp of its own value, counted on the bit patterns. Each
@@ -55,7 +67,7 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
         1536-wide group or groups of 128 by 858 or more, a sigmoid gate by 32661 or more, a
         `(1 + w)` weight by 312 or more. eps 2e-5 in place of 1e-5 misses by 66 or more,
         because `_build` puts groups on both sides of eps.
-      * at most 1e-3 of the outputs not bit-identical: 65x the worst measured. Rounding the
+      * at most 1e-3 of the outputs not bit-identical: 49x the worst measured. Rounding the
         normalized value to bf16 before the weight multiply, as the checkpoint's plain
         `Nemotron4RMSNorm` does, keeps every output within one ulp but changes about a quarter
         of them. Rounding the gate product to bf16 before the norm changes 34 to 38%, by up to 3
@@ -74,13 +86,14 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 def _build(spec, seed):
     """Materialize one cell as `(proj, kwargs)`.
 
-    x is the recurrence output, a contiguous `[T, 24 * 64]`; z is the first 1536 columns of an
-    in_proj-shaped `[T, 18528]` buffer, whose other columns stand for the conv, beta and decay
-    inputs. Every (token, head) group of x gets its own magnitude, log-uniform over [1e-3, 3]:
-    the smallest groups' mean square sits below eps, where eps sets the output, and the largest
-    are far above it. The gate pre-activations are N(0, 4), so silu's negative tail is covered.
-    The weight follows the checkpoint's: its 32 `mixer.norm.weight` tensors have mean 1.06,
-    standard deviation 0.26, and every value in [0.044, 3.03].
+    x is the recurrence output, a contiguous `[T, heads * 64]`; z is the first `heads * 64`
+    columns of an in_proj-shaped `[T, proj_width]` buffer (`[T, 18528]` at tp1, `[T, 4632]` on a
+    tp4 rank), whose other columns stand for the conv, beta and decay inputs. Every (token, head)
+    group of x gets its own magnitude, log-uniform over [1e-3, 3]: the smallest groups' mean
+    square sits below eps, where eps sets the output, and the largest are far above it. The gate
+    pre-activations are N(0, 4), so silu's negative tail is covered. The weight follows the
+    checkpoint's: its 32 `mixer.norm.weight` tensors have mean 1.06, standard deviation 0.26,
+    and every value in [0.044, 3.03].
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
     tokens, heads, group = spec["tokens"], spec["num_heads"], spec["group_size"]
@@ -118,15 +131,16 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     _compare(out, ref)
 
 
-def test_rows_do_not_depend_on_the_batch() -> None:
+@pytest.mark.parametrize("num_heads", HEADS)
+def test_rows_do_not_depend_on_the_batch(num_heads: int) -> None:
     """A row comes out the same bits whatever batch it runs in.
 
     CUDA-graph padding changes a decode step's row count, and an MTP verify step normalizes
     three rows per request where a step without drafts normalizes one. The identity criteria
-    compare runs that differ in exactly that way, so this pins it bitwise on slices of the
-    largest cell.
+    compare runs that differ in exactly that way, so this pins it bitwise on slices of each
+    width's largest cell.
     """
-    _, kwargs = _build(op.CELLS[-1].spec, seed=7)
+    _, kwargs = _build(_cell_spec(num_heads, 16384), seed=7)
     full = op(**kwargs)
     for begin, end in ((0, 1), (7, 10), (100, 1124), (5000, 13192), (16383, 16384)):
         part = op(**dict(kwargs, x=kwargs["x"][begin:end], z=kwargs["z"][begin:end]))
@@ -136,10 +150,11 @@ def test_rows_do_not_depend_on_the_batch() -> None:
     assert torch.equal(op(**kwargs), full), "two identical calls differ"
 
 
-def test_a_packed_gate_gives_the_same_bits() -> None:
+@pytest.mark.parametrize("num_heads", HEADS)
+def test_a_packed_gate_gives_the_same_bits(num_heads: int) -> None:
     """The gate's row stride is only an address: a packed copy of the in_proj slice gives the
     same bits, so a target may pass either."""
-    _, kwargs = _build(op.CELLS[2].spec, seed=11)
+    _, kwargs = _build(_cell_spec(num_heads, 1024), seed=11)
     sliced = op(**kwargs)
     packed = op(**dict(kwargs, z=kwargs["z"].contiguous()))
     assert torch.equal(sliced, packed)

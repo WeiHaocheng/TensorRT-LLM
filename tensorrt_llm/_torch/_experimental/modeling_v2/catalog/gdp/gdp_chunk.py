@@ -261,11 +261,13 @@ class GdpChunk(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # nemotron4-nano-preview's GDP mixer, the only shape any of its 32 GDP and
-    # linear_attention layers runs: gdp_num_heads 24 (== gdp_num_groups, so no
+    # nemotron4-nano-preview's GDP mixer, the one shape all 32 of its GDP and
+    # linear_attention layers share: gdp_num_heads 24 (== gdp_num_groups, so no
     # head repeat), gdp_key_head_dim 128, gdp_head_dim 64, gdp_num_householder 3.
     # `scale` is what the target passes for HF's `query / sqrt(key_head_dim)`.
     _NEMOTRON4 = dict(heads=24, householder=3, key_dim=128, value_dim=64, scale=128**-0.5)
+    # A tp4 rank runs the same mixer on 6 of the 24 heads.
+    _NEMOTRON4_TP4 = dict(_NEMOTRON4, heads=6)
 
     # A token is 3 sub-steps and a chunk 64, so a chunk boundary falls inside a
     # token in 2 of every 3 chunks. Lengths run from one token to the 16384-token
@@ -273,7 +275,8 @@ class GdpChunk(OpWrapper):
     # less than one chunk, exactly one, and many. "fresh" sequences start from
     # zero over slots holding a stale state they must not read; "continued" ones
     # resume a saved state (chunked prefill); "mixed" alternates the two in one
-    # batch.
+    # batch. The same eighteen batches run at both geometries: tensor parallelism
+    # splits the heads, not the tokens.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="1 token, fresh: 3 sub-steps, one partial chunk",
@@ -347,6 +350,78 @@ class GdpChunk(OpWrapper):
             why="8 sequences summing to 2048, even ones continued",
             spec=dict(seq_lens=(1, 2, 17, 64, 129, 300, 511, 1024), init="mixed", **_NEMOTRON4),
         ),
+        Cell(
+            why="tp4 rank, 1 token, fresh",
+            spec=dict(seq_lens=(1,), init="fresh", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 1 token, continued",
+            spec=dict(seq_lens=(1,), init="continued", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 7 tokens, fresh: one chunk",
+            spec=dict(seq_lens=(7,), init="fresh", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 7 tokens, continued",
+            spec=dict(seq_lens=(7,), init="continued", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 64 tokens, fresh: exactly 3 chunks",
+            spec=dict(seq_lens=(64,), init="fresh", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 64 tokens, continued",
+            spec=dict(seq_lens=(64,), init="continued", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 512 tokens, fresh: 24 chunks",
+            spec=dict(seq_lens=(512,), init="fresh", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 512 tokens, continued",
+            spec=dict(seq_lens=(512,), init="continued", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 2048 tokens, fresh: 96 chunks",
+            spec=dict(seq_lens=(2048,), init="fresh", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 2048 tokens, continued",
+            spec=dict(seq_lens=(2048,), init="continued", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 8192 tokens, fresh: max_num_tokens",
+            spec=dict(seq_lens=(8192,), init="fresh", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 8192 tokens, continued",
+            spec=dict(seq_lens=(8192,), init="continued", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 16384 tokens, fresh",
+            spec=dict(seq_lens=(16384,), init="fresh", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 16384 tokens, continued",
+            spec=dict(seq_lens=(16384,), init="continued", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 4 sequences summing to 8192, all fresh",
+            spec=dict(seq_lens=(3, 509, 2600, 5080), init="fresh", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 4 sequences summing to 8192, even ones continued",
+            spec=dict(seq_lens=(3, 509, 2600, 5080), init="mixed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 8 sequences summing to 2048, all fresh",
+            spec=dict(seq_lens=(1, 2, 17, 64, 129, 300, 511, 1024), init="fresh", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, 8 sequences summing to 2048, even ones continued",
+            spec=dict(seq_lens=(1, 2, 17, 64, 129, 300, 511, 1024), init="mixed", **_NEMOTRON4_TP4),
+        ),
     )
 
     note = """
@@ -382,9 +457,10 @@ class GdpChunk(OpWrapper):
     offsets this call derives -- so every call syncs, every layer. Not
     CUDA-graph capturable; prefill only.
 
-    Uncertified: any other head count, head dims or Householder count, a bf16
-    state pool, query/key heads fewer than value heads, fp16 or fp32 q/k/v,
-    MTP verify (several tokens per request with per-position states).
+    Certified head counts: 24 (tp1) and 6 (a tp4 rank). Uncertified: any other
+    head count, head dims or Householder count, a bf16 state pool, query/key
+    heads fewer than value heads, fp16 or fp32 q/k/v, MTP verify (several
+    tokens per request with per-position states).
     """
 
     def __call__(

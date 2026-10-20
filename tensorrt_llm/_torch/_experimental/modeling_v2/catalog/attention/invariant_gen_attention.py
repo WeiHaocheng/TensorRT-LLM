@@ -34,6 +34,34 @@ _NEMOTRON4 = dict(
     max_seq_len=9344,
     q_scaling=1.0,
 )
+#: The same layers on one rank of the tp4 target: 4 of the 16 query heads, over
+#: the one KV head, which every rank keeps whole.
+_NEMOTRON4_TP4 = dict(_NEMOTRON4, num_heads=4)
+
+#: Every (B, padding rows) a cell runs, and what it stands for.
+_BATCHES = (
+    (1, 0, "one request, history max_seq_len"),
+    (2, 1, "graph batch, one request and one padding row"),
+    (3, 0, "eager batch, mixed histories"),
+    (4, 2, "graph batch with two padding rows"),
+    (8, 2, "graph batch with two padding rows"),
+    (64, 2, "graph batch with two padding rows"),
+    (256, 2, "graph batch with two padding rows"),
+    (512, 2, "graph batch with two padding rows"),
+    (1024, 2, "graph batch with two padding rows"),
+)
+
+
+def _cells(geometry: dict, label: str, largest: str) -> tuple[Cell, ...]:
+    """Every T x B cell at one head geometry; `largest` says what the largest batch is there."""
+    return tuple(
+        Cell(
+            why=f"{label}T={tokens} B={batch}: {kind}{f' ({largest})' if batch == 1024 else ''}",
+            spec=dict(tokens=tokens, batch=batch, pad_rows=pad_rows, **geometry),
+        )
+        for tokens in (1, 2, 3)
+        for batch, pad_rows, kind in _BATCHES
+    )
 
 
 class _DevicePtr:
@@ -235,24 +263,10 @@ class InvariantGenAttention(OpWrapper):
     # end, 64, 256, 512, 1024 where the kernel is bandwidth-bound -- plus the
     # eager size 3. Every batch mixes history lengths up to max_seq_len; graph
     # batches end in padding rows that share one dummy request's pages, as the
-    # CUDA-graph runner pads.
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(
-            why=f"T={tokens} B={batch}: {kind}",
-            spec=dict(tokens=tokens, batch=batch, pad_rows=pad_rows, **_NEMOTRON4),
-        )
-        for tokens in (1, 2, 3)
-        for batch, pad_rows, kind in (
-            (1, 0, "one request, history max_seq_len"),
-            (2, 1, "graph batch, one request and one padding row"),
-            (3, 0, "eager batch, mixed histories"),
-            (4, 2, "graph batch with two padding rows"),
-            (8, 2, "graph batch with two padding rows"),
-            (64, 2, "graph batch with two padding rows"),
-            (256, 2, "graph batch with two padding rows"),
-            (512, 2, "graph batch with two padding rows"),
-            (1024, 2, "graph batch with two padding rows (a DP rank)"),
-        )
+    # CUDA-graph runner pads. The heads are the tp1 and dep4 targets' 16 and a
+    # tp4 rank's 4, whose program fills 4 of its 16 head rows.
+    CELLS: tuple[Cell, ...] = _cells(_NEMOTRON4, "", "a DP rank") + _cells(
+        _NEMOTRON4_TP4, "tp4 rank, 4 heads: ", "the largest graph batch"
     )
 
     note = """
@@ -261,12 +275,13 @@ class InvariantGenAttention(OpWrapper):
     trtllm-gen variants for decode and verify), so a token's attention output
     differs in its last bits between a padded CUDA-graph batch, an eager batch
     and position j of an MTP verify group. Here one program computes one query
-    token's 16 heads over one fixed 512-key split (64-key tiles, fp32 online
-    softmax), and one program per (head, token) merges the token's splits in
-    one fixed-order reduction. T rides as a runtime argument, so one compiled
-    kernel serves every call: a token gets the same bits alone, inside any
-    batch, and as token j of a T-token group as the same token decoded alone
-    over the same keys -- that program is literally the decode program.
+    token's heads (16 rows: all 16 heads on tp1, a tp4 rank's 4 and 12 masked
+    rows) over one fixed 512-key split (64-key tiles, fp32 online softmax), and
+    one program per (head, token) merges the token's splits in one fixed-order
+    reduction. T rides as a runtime argument, so one compiled kernel serves
+    every call: a token gets the same bits alone, inside any batch, and as
+    token j of a T-token group as the same token decoded alone over the same
+    keys -- that program is literally the decode program.
 
     Cost of that choice: the T tokens of a verify group each read the
     request's pages (through L2), so T = 3 verify takes 2.15-2.3x the time of

@@ -150,18 +150,36 @@ class GdpRecurrent(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # nemotron4-nano-preview's GDP mixer, the only shape any of its 32 GDP and
-    # linear_attention layers runs: gdp_num_heads 24 (== gdp_num_groups, so no
+    # nemotron4-nano-preview's GDP mixer, the one shape all 32 of its GDP and
+    # linear_attention layers share: gdp_num_heads 24 (== gdp_num_groups, so no
     # head repeat), gdp_key_head_dim 128, gdp_head_dim 64, gdp_num_householder 3.
     # `scale` is what the target passes for HF's `query / sqrt(key_head_dim)`.
-    _NEMOTRON4 = dict(heads=24, householder=3, key_dim=128, value_dim=64, scale=128**-0.5)
+    # In decode q, k and v are views of the in_proj output's conv columns, so
+    # their row stride is that output's width, 18528, and the conv columns start
+    # at 1536.
+    _NEMOTRON4 = dict(
+        heads=24,
+        householder=3,
+        key_dim=128,
+        value_dim=64,
+        scale=128**-0.5,
+        proj_width=18528,
+        conv_offset=1536,
+    )
+    # A tp4 rank runs the same mixer on 6 of the 24 heads, its in_proj output
+    # [z 384 | conv 4224 | b 18 | a 6] = 4632 wide. That row stride is not a
+    # multiple of 16, so Triton compiles another variant of the kernel for it
+    # than for 18528.
+    _NEMOTRON4_TP4 = dict(_NEMOTRON4, heads=6, proj_width=4632, conv_offset=384)
 
-    # The batch sizes are the decode CUDA graphs the target captures (1 ... 1024,
+    # The batch sizes are the decode CUDA graphs the targets capture (1 ... 1024,
     # 1024 covering the per-rank batch of a DP topology) plus the eager
-    # non-power-of-two size 3. Padding rows sit at the end of a graph batch and
-    # carry PAD_SLOT_ID. "packed" is the hybrid cache manager's pool, whose
-    # per-layer view of a slot is followed by that slot's conv state, so the slot
-    # stride exceeds H*V*K; "dense" is a [num_slots, H, V, K] tensor.
+    # non-power-of-two size 3, at both geometries. Tensor parallelism splits the
+    # heads, not the batch, so a tp4 rank runs every request of the step.
+    # Padding rows sit at the end of a graph batch and carry PAD_SLOT_ID.
+    # "packed" is the hybrid cache manager's pool, whose per-layer view of a
+    # slot is followed by that slot's conv state, so the slot stride exceeds
+    # H*V*K; "dense" is a [num_slots, H, V, K] tensor.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="concurrency 1: a single request, no padding row",
@@ -211,6 +229,54 @@ class GdpRecurrent(OpWrapper):
             why="graph batch 1024 (a DP rank's batch): 24576 request x head rows",
             spec=dict(batch=1024, pad_rows=1, pool="packed", **_NEMOTRON4),
         ),
+        Cell(
+            why="tp4 rank, concurrency 1: 6 request x head rows, no padding row",
+            spec=dict(batch=1, pad_rows=0, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 2: one request and one padding row",
+            spec=dict(batch=2, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, eager batch 3 over a dense per-layer pool",
+            spec=dict(batch=3, pad_rows=0, pool="dense", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 4 with a padding row",
+            spec=dict(batch=4, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 8 with a padding row",
+            spec=dict(batch=8, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 16 with a padding row",
+            spec=dict(batch=16, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 32 with a padding row",
+            spec=dict(batch=32, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 64: the CUDA-graph test's batch",
+            spec=dict(batch=64, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 128 with a padding row",
+            spec=dict(batch=128, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 256 with a padding row",
+            spec=dict(batch=256, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 512 with a padding row",
+            spec=dict(batch=512, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, graph batch 1024: 6144 request x head rows",
+            spec=dict(batch=1024, pad_rows=1, pool="packed", **_NEMOTRON4_TP4),
+        ),
     )
 
     note = """
@@ -219,7 +285,9 @@ class GdpRecurrent(OpWrapper):
     sigmoid and the softplus decay), before its n_h-fold expansion -- q `[B, H,
     K]` and k `[B, n_h, H, K]` not yet l2-normalized, v `[B, n_h, H, V]`, g `[B,
     H]` the fp32 log decay `-exp(A_log) * softplus(a + dt_bias)`, beta `[B, n_h,
-    H]` after sigmoid. Any strides: the target passes views of the conv output.
+    H]` after sigmoid. Any strides: the targets pass views of the conv output,
+    which the decode conv writes in place into the in_proj output's conv
+    columns, so a token's q, k and v sit in one in_proj row.
 
     State layout: `state_pool` is `[num_slots, H, V, K]` fp32 with K innermost,
     the pool layout of the vendored FLA kernels (`modules/fla/fused_recurrent.py`,
@@ -244,12 +312,21 @@ class GdpRecurrent(OpWrapper):
 
     A row's result does not depend on the batch it runs in: one tile shape
     and one reduction order for every batch size, so the same request gets the
-    same bits in a padded graph batch and in an eager one.
+    same bits in a padded graph batch and in an eager one -- as long as the
+    batch's strides agree on being multiples of 16. Triton specializes the
+    kernel on that, and its variants round the reductions differently. A
+    one-row `x[:, cols].view(1, ...)` takes the inner block's size as its row
+    stride where a larger batch keeps the in_proj width: at tp1's 18528 both
+    are multiples of 16, but a tp4 rank's 4632 is not, and a request alone
+    then moves about a quarter of its state elements against the same request
+    in a batch. Pass views whose row stride is the in_proj width at every batch
+    size (`as_strided`).
 
-    Uncertified: more than one token per request (MTP verify, per-position
-    states), any other head count, head dims or Householder count, a bf16
-    state pool, query/key heads fewer than value heads. CUDA-graph capturable:
-    no host sync and no allocation besides `out`.
+    Certified head counts: 24 (tp1) and 6 (a tp4 rank), each with its own
+    in_proj row stride. Uncertified: more than one token per request (MTP
+    verify, per-position states), any other head count, head dims or
+    Householder count, a bf16 state pool, query/key heads fewer than value
+    heads. CUDA-graph capturable: no host sync and no allocation besides `out`.
     """
 
     def __call__(

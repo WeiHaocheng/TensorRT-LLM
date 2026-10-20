@@ -68,12 +68,18 @@ class ThopAttention(OpWrapper):
         max_seq_len=9344,
     )
 
+    # Its tp4 target makes the same calls on a rank's 4 query heads over the
+    # replicated KV head: the same pool and batches, a quarter of the query
+    # heads per KV head.
+    _NEMOTRON4_TP4 = dict(_NEMOTRON4, num_heads=4)
+
     # The shapes the shipped targets reach, which are different code paths
     # rather than different sizes. gpt-oss alternates its two window classes
     # inside one engine, so both of its cells are live every step; deepseek runs
     # context and generation against the same pool; nemotron4 is single-KV-head
     # GQA, decoded at batches of 1 to 1024 and verified at 1 to 512, where the
-    # kernel the op picks changes with batch size and history length.
+    # kernel the op picks changes with batch size and history length -- and
+    # with the query heads per KV head, so tp4's 4 have cells of their own.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="gpt-oss sliding layer: GQA 64q/8kv d64, sinks, window 128",
@@ -169,6 +175,50 @@ class ThopAttention(OpWrapper):
             why="nemotron4 mixed verify: two contexts beside 6 three-token rows",
             spec=dict(
                 contexts=((0, 1000), (4096, 2048)), generations=6, gen_tokens=3, **_NEMOTRON4
+            ),
+        ),
+        Cell(
+            why="nemotron4 tp4 prefill: one fresh 8192-token prompt, 4 q heads",
+            spec=dict(contexts=((0, 8192),), generations=0, gen_tokens=1, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 chunk: 2048 new tokens on 6144 cached",
+            spec=dict(contexts=((6144, 2048),), generations=0, gen_tokens=1, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 mixed: a fresh and a chunked context beside 6 decodes",
+            spec=dict(
+                contexts=((0, 1000), (4096, 2048)), generations=6, gen_tokens=1, **_NEMOTRON4_TP4
+            ),
+        ),
+        Cell(
+            why="nemotron4 tp4 decode B=1: one request at the longest history",
+            spec=dict(contexts=(), generations=1, gen_tokens=1, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 decode B=64: histories spread up to max_seq_len",
+            spec=dict(contexts=(), generations=64, gen_tokens=1, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 decode B=1024: the largest CUDA-graph batch",
+            spec=dict(contexts=(), generations=1024, gen_tokens=1, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 verify B=1: 3 query tokens per request",
+            spec=dict(contexts=(), generations=1, gen_tokens=3, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 verify B=64: 3 query tokens per request",
+            spec=dict(contexts=(), generations=64, gen_tokens=3, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 verify B=512: 3 query tokens per request",
+            spec=dict(contexts=(), generations=512, gen_tokens=3, **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="nemotron4 tp4 mixed verify: two contexts beside 6 three-token rows",
+            spec=dict(
+                contexts=((0, 1000), (4096, 2048)), generations=6, gen_tokens=3, **_NEMOTRON4_TP4
             ),
         ),
     )

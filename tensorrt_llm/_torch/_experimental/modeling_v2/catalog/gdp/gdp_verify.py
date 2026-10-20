@@ -193,7 +193,30 @@ class GdpVerify(OpWrapper):
     # linear_attention layers runs: gdp_num_heads 24 (== gdp_num_groups, so no
     # head repeat), gdp_key_head_dim 128, gdp_head_dim 64, gdp_num_householder 3.
     # `scale` is what the target passes for HF's `query / sqrt(key_head_dim)`.
-    _NEMOTRON4 = dict(heads=24, householder=3, key_dim=128, value_dim=64, scale=128**-0.5)
+    # q, k and v are views of the in_proj output's conv columns, a token per row:
+    # a token's row stride is that output's width, 18528, a request's T times it,
+    # and the conv columns start at 1536. `decode_bits`: a cell whose tokens must
+    # get the bits of T `gdp_recurrent` calls on decode's views of the same rows.
+    _NEMOTRON4 = dict(
+        heads=24,
+        householder=3,
+        key_dim=128,
+        value_dim=64,
+        scale=128**-0.5,
+        proj_width=18528,
+        conv_offset=1536,
+        decode_bits=True,
+    )
+    # A tp4 rank runs the same mixer on 6 of the 24 heads, its in_proj output
+    # [z 384 | conv 4224 | b 18 | a 6] = 4632 wide. Triton specializes both
+    # kernels on each stride's divisibility by 16. Decode's row stride 4632 is
+    # not divisible, and neither is a draft-2 request's 3 * 4632 = 13896, so a
+    # token there rounds as its decode step does. A draft-1 request's 9264 is
+    # divisible: that compiled variant rounds the reductions otherwise, within
+    # the band of the reference but not with decode's bits (measured: in every
+    # batch of two rows or more some output or state moved).
+    _NEMOTRON4_TP4 = dict(_NEMOTRON4, heads=6, proj_width=4632, conv_offset=384)
+    _NEMOTRON4_TP4_DRAFT1 = dict(_NEMOTRON4_TP4, decode_bits=False)
 
     # tokens is 1 + max_draft_len: 3 for the checkpoint's trained depth (draft
     # length 2), 2 for draft length 1. The batch sizes are the decode CUDA graphs
@@ -303,6 +326,78 @@ class GdpVerify(OpWrapper):
             why="draft 1, graph batch 1024 (a DP rank's batch), v1 pool",
             spec=dict(tokens=2, batch=1024, pad_rows=1, pool="v1", **_NEMOTRON4),
         ),
+        Cell(
+            why="tp4 rank, draft 2, concurrency 1: one request, v2 pool",
+            spec=dict(tokens=3, batch=1, pad_rows=0, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 2 with a padding row, v1 pool",
+            spec=dict(tokens=3, batch=2, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, eager batch 3, v1 pool",
+            spec=dict(tokens=3, batch=3, pad_rows=0, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 4 with a padding row, v2 pool",
+            spec=dict(tokens=3, batch=4, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 8 with a padding row, v1 pool",
+            spec=dict(tokens=3, batch=8, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 16 with a padding row, v2 pool",
+            spec=dict(tokens=3, batch=16, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 32 with a padding row, v1 pool",
+            spec=dict(tokens=3, batch=32, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 64 with a padding row, v2 pool",
+            spec=dict(tokens=3, batch=64, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 128 with a padding row, v1 pool",
+            spec=dict(tokens=3, batch=128, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 256 with a padding row, v2 pool",
+            spec=dict(tokens=3, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 512 with a padding row, v2 pool",
+            spec=dict(tokens=3, batch=512, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 2, graph batch 1024 with a padding row, v1 pool",
+            spec=dict(tokens=3, batch=1024, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
+        ),
+        Cell(
+            why="tp4 rank, draft 1, concurrency 1: one request, v1 pool",
+            spec=dict(tokens=2, batch=1, pad_rows=0, pool="v1", **_NEMOTRON4_TP4_DRAFT1),
+        ),
+        Cell(
+            why="tp4 rank, draft 1, graph batch 2 with a padding row, v2 pool",
+            spec=dict(tokens=2, batch=2, pad_rows=1, pool="v2", **_NEMOTRON4_TP4_DRAFT1),
+        ),
+        Cell(
+            why="tp4 rank, draft 1, eager batch 3, v2 pool",
+            spec=dict(tokens=2, batch=3, pad_rows=0, pool="v2", **_NEMOTRON4_TP4_DRAFT1),
+        ),
+        Cell(
+            why="tp4 rank, draft 1, graph batch 64 with a padding row, v1 pool",
+            spec=dict(tokens=2, batch=64, pad_rows=1, pool="v1", **_NEMOTRON4_TP4_DRAFT1),
+        ),
+        Cell(
+            why="tp4 rank, draft 1, graph batch 256 with a padding row, v2 pool",
+            spec=dict(tokens=2, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4_TP4_DRAFT1),
+        ),
+        Cell(
+            why="tp4 rank, draft 1, graph batch 1024 with a padding row, v1 pool",
+            spec=dict(tokens=2, batch=1024, pad_rows=1, pool="v1", **_NEMOTRON4_TP4_DRAFT1),
+        ),
     )
 
     note = """
@@ -340,6 +435,17 @@ class GdpVerify(OpWrapper):
     request. The entry's test compares the two bit for bit. A padding row
     differs from its second token on, since a decode call restarts it from
     zero and keeps nothing.
+
+    The bits hold only where both kernels compile alike: Triton specializes
+    them on each stride's divisibility by 16. Every stride a token's q, k and v
+    are read through -- the request's here, the row's in a decode call -- has
+    to agree in it with decode's row stride. tp1's in_proj width 18528 and every
+    multiple of it are divisible; a tp4 rank's 4632 is not, and neither is a
+    draft-2 request's 13896, but a draft-1 request's 9264 is (and a draft-3
+    request's 18528). There the verify stays within the reference's band but
+    is not bitwise decode's: measured, and pinned by the entry's test. A target
+    that needs those bits at an even T has to lay its requests out at a stride
+    that is not a multiple of 16.
 
     Uncertified: T other than 2 and 3, an intermediate whose token dim exceeds
     T, a pool other than the two managers' layouts, and the shapes

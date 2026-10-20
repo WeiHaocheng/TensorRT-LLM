@@ -30,11 +30,15 @@ _GDP = dict(
     pool_ssm_bytes=24 * 64 * 128 * 4,
     silu_activation=True,
 )
+# A tp4 rank convolves the channels of its 6 GDP heads, a quarter of every segment: 4224 channels,
+# the conv columns of its in_proj output [T, 4632] = [z 384 | conv 4224 | b 18 | a 6], and a slot
+# block whose recurrent state is 6 x 64 x 128 fp32.
+_GDP_TP4 = dict(_GDP, dim=4224, proj_width=4632, proj_offset=384, pool_ssm_bytes=6 * 64 * 128 * 4)
 
 
-def _cell(why: str, seq_lens: tuple[int, ...], init: str) -> Cell:
+def _cell(why: str, seq_lens: tuple[int, ...], init: str, geometry: dict = _GDP) -> Cell:
     """`init`: "fresh" (no sequence resumes), "continued" (every one does), "mixed" (even ones do)."""
-    return Cell(why=why, spec=dict(seq_lens=seq_lens, init=init, **_GDP))
+    return Cell(why=why, spec=dict(seq_lens=seq_lens, init=init, **geometry))
 
 
 class CausalConv1dVarlen(OpWrapper):
@@ -56,11 +60,13 @@ class CausalConv1dVarlen(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The batches of the GDP recurrence entries, so a chunk of prefill is certified end to end.
-    # Single sequences run on 32-token chunks up to 2048 tokens and on 64-token chunks from 8192
-    # (`causal_conv1d_channellast_fwd_dispatch` takes 64 once channel blocks x 64-token chunks x
-    # sequences reach 1024); the 4- and 8-sequence batches run on 64-token chunks and put
-    # sequences shorter than the 3-input state next to long ones.
+    # The batches of the GDP recurrence entries, so a chunk of prefill is certified end to end, at
+    # tp1's 16896 channels and a tp4 rank's 4224. `causal_conv1d_channellast_fwd_dispatch` takes
+    # 64-token chunks once channel blocks (of 1024 channels) x 64-token chunks x sequences reach
+    # 1024, else 32: at 17 channel blocks single sequences run on 32-token chunks up to 2048 tokens
+    # and on 64 from 8192; at a tp4 rank's 5 they stay on 32 through 8192 and take 64 at 16384.
+    # The 4- and 8-sequence batches run on 64-token chunks at both widths and put sequences
+    # shorter than the 3-input state next to long ones.
     CELLS: tuple[Cell, ...] = (
         _cell("1 token, fresh: shorter than the 3-input state", (1,), "fresh"),
         _cell("1 token, continued: the saved state shifts by one", (1,), "continued"),
@@ -88,6 +94,44 @@ class CausalConv1dVarlen(OpWrapper):
             (1, 2, 17, 64, 129, 300, 511, 1024),
             "mixed",
         ),
+        _cell("tp4 rank, 1 token, fresh", (1,), "fresh", _GDP_TP4),
+        _cell("tp4 rank, 1 token, continued", (1,), "continued", _GDP_TP4),
+        _cell("tp4 rank, 7 tokens, fresh", (7,), "fresh", _GDP_TP4),
+        _cell("tp4 rank, 7 tokens, continued", (7,), "continued", _GDP_TP4),
+        _cell("tp4 rank, 64 tokens, fresh", (64,), "fresh", _GDP_TP4),
+        _cell("tp4 rank, 64 tokens, continued", (64,), "continued", _GDP_TP4),
+        _cell("tp4 rank, 512 tokens, fresh", (512,), "fresh", _GDP_TP4),
+        _cell("tp4 rank, 512 tokens, continued", (512,), "continued", _GDP_TP4),
+        _cell("tp4 rank, 2048 tokens, fresh", (2048,), "fresh", _GDP_TP4),
+        _cell("tp4 rank, 2048 tokens, continued", (2048,), "continued", _GDP_TP4),
+        _cell("tp4 rank, 8192 tokens, fresh: still 32-token chunks", (8192,), "fresh", _GDP_TP4),
+        _cell("tp4 rank, 8192 tokens, continued", (8192,), "continued", _GDP_TP4),
+        _cell("tp4 rank, 16384 tokens, fresh: 64-token chunks", (16384,), "fresh", _GDP_TP4),
+        _cell("tp4 rank, 16384 tokens, continued", (16384,), "continued", _GDP_TP4),
+        _cell(
+            "tp4 rank, 4 sequences summing to 8192, all fresh",
+            (3, 509, 2600, 5080),
+            "fresh",
+            _GDP_TP4,
+        ),
+        _cell(
+            "tp4 rank, 4 sequences summing to 8192, even ones continue",
+            (3, 509, 2600, 5080),
+            "mixed",
+            _GDP_TP4,
+        ),
+        _cell(
+            "tp4 rank, 8 sequences summing to 2048, all fresh",
+            (1, 2, 17, 64, 129, 300, 511, 1024),
+            "fresh",
+            _GDP_TP4,
+        ),
+        _cell(
+            "tp4 rank, 8 sequences summing to 2048, even ones continue",
+            (1, 2, 17, 64, 129, 300, 511, 1024),
+            "mixed",
+            _GDP_TP4,
+        ),
     )
 
     note = """
@@ -100,7 +144,8 @@ class CausalConv1dVarlen(OpWrapper):
 
     Certified: the channel-last kernel, reached by passing the in_proj output's conv columns
     transposed, with an explicit channel-last `out`, no bias, SiLU on, and every sequence owning
-    a real slot. Not certified, because no target here reaches it: the channel-major kernel
+    a real slot; 16896 channels (tp1) and 4224 (a tp4 rank), each at its target's in_proj row
+    stride and conv offset. Not certified, because no target here reaches it: the channel-major kernel
     (a token-contiguous `[dim, T]` x, which also runs in place), the batched `(B, dim, L)` form
     without `query_start_loc`, a bias, `pad_slot_id` entries, a zero-token batch, widths 2 and 3,
     and a row stride or offset off the 16-byte grid (the dispatcher then falls back to scalar
