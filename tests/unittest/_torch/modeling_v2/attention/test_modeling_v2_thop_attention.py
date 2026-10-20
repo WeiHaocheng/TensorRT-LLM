@@ -5526,8 +5526,8 @@ _LONGEST = -1
 
 @pytest.mark.parametrize(
     "geometry, step",
-    [(N4, 3), (N4_TP4, 3), (N4, 4), (N4, 5), (N4, 6)],
-    ids=["16q", "tp4-4q", "16q-T4", "16q-T5", "16q-T6"],
+    [(N4, 3), (N4_TP4, 3), (N4, 4), (N4, 5), (N4, 6), (N4_TP4, 6)],
+    ids=["16q", "tp4-4q", "16q-T4", "16q-T5", "16q-T6", "tp4-4q-T6"],
 )
 @pytest.mark.parametrize(
     "batch, histories",

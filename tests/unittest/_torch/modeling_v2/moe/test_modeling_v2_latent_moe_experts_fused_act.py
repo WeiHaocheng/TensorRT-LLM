@@ -232,6 +232,23 @@ def test_the_fused_act_path_gives_latent_moe_experts_bits(
 
 
 @pytest.mark.parametrize(
+    "tokens, intermediate", [(2048, 4096), (8192, 1024)], ids=["tp1 2048", "tp4 rank's slice 8192"]
+)
+def test_a_repeated_call_launches_the_cached_kernels_with_the_same_bits(
+    tokens, intermediate
+) -> None:
+    """The fused-activation path's kernels go through `Launch`: a call whose specialization is
+    cached goes straight to the compiled kernels, with the up GEMM's host-built TMA descriptors
+    among its arguments. The first call of a fresh process compiles through Triton's own launch;
+    the second and later calls take the cached path. Both give `latent_moe_experts`' bits."""
+    args = _build(_spec(tokens, intermediate=intermediate), seed=tokens + intermediate)
+    assert _takes_fused_act(args["x"], args["topk_ids"], args["up_proj"], args["down_proj"])
+    want = latent_moe_experts(**args)
+    for _ in range(3):
+        assert torch.equal(op(**args), want)
+
+
+@pytest.mark.parametrize(
     "offset, count, out_dtype, intermediate",
     [(0, 512, None, 4096), (384, 128, torch.float32, 4096), (0, 512, None, 1024)],
     ids=["tp1 window, bf16", "dep4 rank 3 window, fp32", "tp4 rank's slice, bf16"],

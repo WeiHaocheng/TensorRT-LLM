@@ -108,22 +108,25 @@ TOP = 8
 # rows) and the padded graphs (1 to 1024, 192 rows) below; the kernels are deterministic, so the
 # worst cases repeat run to run. A tp4 rank attends with 4 of the 16 query heads and runs its GEMMs
 # at a quarter of their width, so the bands are tp4's own: the logits alike on every rank (each
-# forms them whole), the states over the rank's own heads. The worst cases over the four ranks,
-# eager and graph alike: |logit diff| 0.6593, top-gap shift 0.3229, recurrent state 0.0299, conv
-# state 0.0382 and K/V 0.0509 of max |alone|; no top-1 changed. A graph batch against the same rows
-# run eagerly, what the CUDA-graph identity gate's legs differ by in one step, measured 0.5672 /
-# 0.3229. Each band is its worst case plus a quarter, rounded up: room for a batch, history or graph
-# size the runs did not take, where cuBLAS or thop may pick yet another kernel.
+# forms them whole), the states over the rank's own heads. A decode step's GEMMs of a few rows run
+# the low-M kernel certified for their row count (`_mm`), and a batch of another size another
+# kernel, which rounds its sums in another order: the alone step's in_proj, qkv and MLP rows round
+# otherwise than the same rows in a batch. The worst cases over the four ranks, eager and graph
+# alike: |logit diff| 1.2191, top-gap shift 0.4389, recurrent state 0.0479, conv state 0.0651 and
+# K/V 0.0795 of max |alone|; no top-1 changed. A graph batch against the same rows run eagerly,
+# what the CUDA-graph identity gate's legs differ by in one step, measured 0.7520 / 0.1949. Each
+# band is its worst case plus a quarter, rounded up: room for a batch, history or graph size the
+# runs did not take, where cuBLAS, a low-M kernel or thop may pick yet another variant.
 #: max |batched logit - alone logit| over the vocabulary, fp32.
-LOGIT_BAND = 0.83
+LOGIT_BAND = 1.53
 #: The largest change, batched against alone, of the gap between the alone step's top-1 and any of
 #: its top `TOP` tokens: how close to a tie the batch can tip the alone step's choice.
-GAP_BAND = 0.41
+GAP_BAND = 0.55
 #: max |batched - alone| / max |alone|, per tensor, over every GDP layer (the rank's heads of the
 #: recurrent state, fp32, and of the conv state, bf16) and every attention layer (the appended K/V).
-SSM_BAND = 0.038
-CONV_BAND = 0.048
-KV_BAND = 0.064
+SSM_BAND = 0.060
+CONV_BAND = 0.082
+KV_BAND = 0.10
 
 # Bound inside the rank body, never in the launcher: tensorrt_llm calls MPI_Init at import.
 COMM = None

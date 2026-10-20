@@ -5,9 +5,9 @@ back to the state MTP-off decode reaches, on every rank's own hybrid cache manag
 
 Collected entry point of ``_tp4_mtp_rollback_ranks.py`` beside it, which says what runs and how,
 and derives its bands (``state_band`` and ``OUT_BAND``): layer 0's real GDP mixer at each rank's 6
-heads, through the targets' own ``_gdp`` with its real all-reduce, on both hybrid managers built
-under ``MTPDecodingConfig(max_draft_len=2)``, committed by the managers' own
-``update_mamba_states``. The job runs its four ranks as an MPI world under
+heads, through the targets' own ``_gdp``, on both hybrid managers built under
+``MTPDecodingConfig(max_draft_len=D)`` for each draft length D tp4 runs (2 and 5, one job each),
+committed by the managers' own ``update_mamba_states``. The job runs its four ranks as an MPI world under
 ``mpirun``, so it is started in a fresh interpreter: the launcher must not import
 ``tensorrt_llm``, which calls ``MPI_Init``, and an MPI-initialized process cannot start
 ``mpirun``. Each test reads its own case from the job's report, every rank's record of it.
@@ -48,8 +48,10 @@ def _job_constants() -> dict:
     }
 
 
-@pytest.fixture(scope="module")
-def report():
+@pytest.fixture(scope="module", params=(2, 5), ids=lambda d: f"draft{d}")
+def report(request):
+    """The job's report at one draft length tp4 runs (`DRAFTS`)."""
+    draft = request.param
     constants = _job_constants()
     world = constants["WORLD_SIZE"]
     if torch.cuda.device_count() < world:
@@ -74,7 +76,7 @@ def report():
     with tempfile.TemporaryDirectory(prefix="tp4_mtp_rollback_") as tmp:
         out = Path(tmp) / "report.json"
         completed = subprocess.run(
-            [sys.executable, str(_JOB), "--report", str(out)],
+            [sys.executable, str(_JOB), "--report", str(out), "--draft", str(draft)],
             env=env,
             capture_output=True,
             text=True,
@@ -87,7 +89,9 @@ def report():
                 f"--- stdout ---\n{completed.stdout[-20000:]}\n"
                 f"--- stderr ---\n{completed.stderr[-20000:]}"
             )
-        yield json.loads(out.read_text())
+        report = json.loads(out.read_text())
+        assert report["draft"] == draft, (report["draft"], draft)
+        yield report
 
 
 def _records(report: dict, kind: str, case: str) -> list[dict]:
@@ -109,11 +113,11 @@ def _separated(records: list[dict]) -> None:
 @pytest.mark.parametrize("kind", ["v2", "v1"])
 def test_verify_then_commit_reaches_decode_over_the_accepted_tokens(report, kind):
     """A padded CUDA-graph-shaped verify step on every rank: 5 requests and 3 padding rows
-    (graph batch 8), T = 3, two verify -> commit rounds covering accepted counts 1..3. Every real
+    (graph batch 8), T = 1 + D, two verify -> commit rounds covering accepted counts 1..T. Every real
     row's committed state of the rank's heads is its slot's after the accepted decode steps (one
     token each through the decode entries, on the verify's own in_proj output): the conv state
-    bit for bit, the recurrent state within the job's ``state_band``; the states after one, two
-    and three tokens lie farther apart than that band; the verify writes no slot and the commit
+    bit for bit, the recurrent state within the job's ``state_band``; the states after each of
+    the T tokens lie farther apart than that band; the verify writes no slot and the commit
     only the step's slots; the GDP verify entry's output rows lie within the job's ``OUT_BAND`` of
     the decode entry's."""
     records = _records(report, kind, "padded")
