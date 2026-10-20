@@ -3,26 +3,29 @@
 """Module accuracy of a nemotron4 target's MTP layer, on the checkpoint's own weights: the harness.
 
 Target-independent: a test hands it the target's modeling module (`M`), its shell built under
-one-model MTP-Eagle (`max_draft_len` 2) with the MTP layer, the embedding and the lm_head real, the
-cache manager holding the MTP layer's KV and the engine's TRTLLM attention metadata over it. What
-runs is the target's MTP layer as the engine runs it: the worker's own draft loop
-(`Eagle3OneModelWorker._forward_linear_draft_loop`) -- step 0 over every row of the step through
-`draft_model.mtp_layers[0]` (context chunks, and the 1 + D tokens of each verify row), the gather of
-one row per request, the worker's in-place rewrite of the metadata, and step 1 (depth 2) over one
-row per request against the depth-1 KV. Under attention DP the draft steps' collectives take the
-counts the worker hands them; a `Driver` given `rank_counts` asks for them every step.
+one-model MTP-Eagle (`max_draft_len` D, 2 unless the test builds a longer one) with the MTP layer,
+the embedding and the lm_head real, the cache manager holding the MTP layer's KV and the engine's
+TRTLLM attention metadata over it. What runs is the target's MTP layer as the engine runs it: the
+worker's own draft loop (`Eagle3OneModelWorker._forward_linear_draft_loop`) -- step 0 over every
+row of the step through `draft_model.mtp_layers[0]` (context chunks, and the 1 + D tokens of each
+verify row), the gather of one row per request, the worker's in-place rewrite of the metadata, and
+steps 1 .. D - 1 (depths 2 .. D) over one row per request, each against the depth-1 KV and the
+entries the earlier depths of the step wrote after it. Under attention DP the draft steps'
+collectives take the counts the worker hands them; a `Driver` given `rank_counts` asks for them
+every step.
 
 The inputs are teacher forced on real text: the fixed prompt set, and the trunk's final normed
 hidden state at every position from the plain-torch reference (`_nemotron4_reference`, the
 transcription of `modeling_nemotron4.py`). Depth k at position i reads token i + k: at step 0
-every row reads the token after it, and step 1 reads the true token after the depth-1 draft's
-position (the worker's step-0 sample is recorded as the depth-1 draft and replaced by the true
-token, as the reference's teacher forcing does; greedy acceptance never sees the difference,
-because a depth-2 draft only counts when the depth-1 draft was the true token). Which positions a
-request visits follows the engine: a verify at q accepts what the target's own drafts got right,
-the gather row is q + accepted - 1, and the next verify starts after it.
+every row reads the token after it, and step k - 1 reads the true token k positions after the
+depth-1 draft's position (the worker's sample at each step but the last is recorded as that depth's
+draft and replaced by the true token, as the reference's teacher forcing does; greedy acceptance
+never sees the difference, because a depth-k draft only counts when the shallower drafts were the
+true tokens). Which positions a request visits follows the engine: a verify at q accepts what the
+target's own drafts got right, the gather row is q + accepted - 1, and the next verify starts
+after it.
 
-The cells (`run_campaign`), each compared at depth 1 (step 0) and depth 2 (step 1):
+The cells (`run_campaign`), each compared at every depth (depth k is step k - 1):
 
 * ``prefill_8k``: a long prompt's 7680-token context, fresh, in one step;
 * ``prefill_chunked``: another's in 2048-token chunks, each over the earlier chunks' KV;
@@ -39,8 +42,9 @@ References (`Numerics`; IEEE fp32 GEMMs and fp32 attention, rounded to bf16 once
 * `R_t`: the reference on exactly the target row's inputs with the target's routing (expert ids
   and fp32 weights), rounding where the target's entries round -- each RMSNorm once, the fused
   residual add normed from its fp32 sum (the entries' own `reference`s). The gated comparison:
-  what is left is the kernels' accumulation order. Depth 2 reads the hidden state the target's
-  depth 1 produced, over the reference's own depth-1 keys and values.
+  what is left is the kernels' accumulation order. Depth k >= 2 reads the hidden state the
+  target's depth k - 1 produced, over the reference's own depth-1 keys and values and the keys and
+  values the same reference computed at depths 2 .. k - 1 of the step.
 * `R_hf_t` / `H_t`: the reference at HF's rounding points, and HF's own implementation (bf16
   cuBLAS, bf16 SDPA, HF's expert loop), on the same inputs with the same routing. `H_t`
   against `R_hf_t` calibrates every band, which must admit the code the model was trained with.
@@ -85,7 +89,8 @@ import _nemotron4_reference as R  # noqa: E402
 from _validating import ULP  # noqa: E402
 
 DRAFT = 2
-"""`max_draft_len`: the checkpoint's trained depth, the one the target is gated at."""
+"""The default `max_draft_len`: the checkpoint's trained depth. A test may build its shell at a
+longer one; the `Driver` drafts as deep as the shell's speculative config says."""
 
 TOKENS_PER_BLOCK = 32
 MAX_SEQ_LEN = 9344
@@ -108,16 +113,18 @@ class Request:
     """One sequence being drafted for.
 
     ``cached`` positions (0 .. cached - 1) hold their final depth-1 keys and values in the draft
-    KV; ``drafts`` are the depth-1 and depth-2 drafts proposed at position ``cached - 1`` (for the
-    tokens at ``cached + 1`` and ``cached + 2``), which the next verify accepts or rejects.
+    KV; ``drafts`` are the depth-1 .. depth-``draft`` drafts proposed at position ``cached - 1``
+    (for the tokens at ``cached + 1`` .. ``cached + draft``), which the next verify accepts or
+    rejects.
     """
 
     rid: int
     seq: int
     prompt_len: int
     stop: int
+    draft: int = DRAFT
     cached: int = 0
-    drafts: tuple[int, int] | None = None
+    drafts: tuple[int, ...] | None = None
     handle: object = None
 
     @property
@@ -127,8 +134,8 @@ class Request:
     @property
     def done(self) -> bool:
         """No further verify fits: one at q reads tokens up to q + D + 1 and, accepting all, sends
-        depth 2 the token at q + D + 2."""
-        return not self.in_context and self.cached + DRAFT + 3 > self.stop
+        depth D the token at q + 2D."""
+        return not self.in_context and self.cached + 2 * self.draft + 1 > self.stop
 
 
 @dataclasses.dataclass
@@ -151,13 +158,13 @@ class Row:
 @dataclasses.dataclass
 class StepRecord:
     """What one step of the worker's draft loop ran and produced: the step's rows, and per call of
-    the MTP layer (step 0, step 1) what it read, returned and routed and each op's output
+    the MTP layer (step 0 .. D - 1) what it read, returned and routed and each op's output
     (`MtpLayerObserver`)."""
 
     kind: str
     rows: list[Row]
     calls: list[dict]
-    drafts: torch.Tensor  # [requests, 2]: the recorded argmax drafts of depth 1 and depth 2
+    drafts: torch.Tensor  # [requests, D]: the recorded argmax drafts of depths 1 .. D
 
 
 class MtpLayerObserver:
@@ -284,7 +291,8 @@ class Driver:
 
     Each step: the metadata is prepared over the manager holding the MTP layer's KV as the runner
     prepares a step (contexts first; a verify row carries 1 + D tokens), the worker's draft loop
-    runs both draft steps, and the record keeps what each MTP-layer call read and returned.
+    runs its D draft steps, and the record keeps what each MTP-layer call read and returned. D is
+    the shell's `max_draft_len`.
 
     ``rank_counts(tokens, rows)``, when given, returns the counts the worker hands the draft steps
     under attention DP -- every rank's tokens of step 0 and rows of step 1, in rank order
@@ -302,6 +310,7 @@ class Driver:
         self.sequences = sequences
         self.max_batch = max_batch
         self.spec = model.model_config.spec_config
+        self.draft = self.spec.max_draft_len
         self.next_rid = 1
         self.observer = MtpLayerObserver(model, M)
         self.rank_counts = rank_counts
@@ -313,10 +322,10 @@ class Driver:
     def new_request(self, seq: int, prompt_len: int, stop: int | None = None) -> Request:
         n = len(self.sequences[seq].ids)
         stop = n if stop is None else min(stop, n)
-        assert 0 < prompt_len and prompt_len + DRAFT + 2 <= stop, (prompt_len, stop)
-        req = Request(self.next_rid, seq, prompt_len, stop)
+        assert 0 < prompt_len and prompt_len + self.draft + 2 <= stop, (prompt_len, stop)
+        req = Request(self.next_rid, seq, prompt_len, stop, self.draft)
         self.next_rid += 1
-        handles = self.manager.add_dummy_requests([req.rid], token_nums=[stop + DRAFT + 2])
+        handles = self.manager.add_dummy_requests([req.rid], token_nums=[stop + self.draft + 2])
         assert handles, f"the KV manager has no room for {stop} tokens"
         req.handle = handles[0]
         return req
@@ -360,22 +369,24 @@ class Driver:
             ),
             is_spec_dec_tree=False,
             is_spec_dec_dynamic_tree=False,
-            max_draft_len=DRAFT,
-            max_total_draft_tokens=DRAFT,
+            max_draft_len=self.draft,
+            max_total_draft_tokens=self.draft,
             spec_metadata=None,
             num_contexts=num_contexts,
         )
         md.prepare()
 
     def step(self, rows: list[Row], kind: str) -> StepRecord:
-        """One engine step over ``rows`` (contexts first), both draft steps; advances the requests."""
+        """One engine step over ``rows`` (contexts first), every draft step; advances the
+        requests."""
         md = self.md
+        draft = self.draft
         num_contexts = sum(r.context for r in rows)
         batch = len(rows)
         for r in rows:
             seq = self.sequences[r.request.seq]
             assert r.start + r.length + 1 <= len(seq.ids), (r.start, r.length, len(seq.ids))
-            assert r.gather + 2 < len(seq.ids)
+            assert r.gather + draft < len(seq.ids)
         self._prepare(rows)
         seqs = [self.sequences[r.request.seq] for r in rows]
         positions = [torch.arange(r.start, r.start + r.length) for r in rows]
@@ -387,20 +398,23 @@ class Driver:
         num_accepted = torch.tensor(
             [1 if r.context else r.accepted for r in rows], dtype=torch.int32, device="cuda"
         )
-        # The true token at gather + 2: what teacher forcing feeds depth 2 in place of the
-        # depth-1 draft.
+        # The true tokens at gather + 2 .. gather + D: what teacher forcing feeds depths 2 .. D in
+        # place of the drafts of depths 1 .. D - 1 (column s replaces draft step s's sample).
         true_next = torch.tensor(
-            [self.sequences[r.request.seq].ids[r.gather + 2] for r in rows],
+            [
+                [self.sequences[r.request.seq].ids[r.gather + 2 + s] for s in range(draft - 1)]
+                for r in rows
+            ],
             dtype=torch.int32,
             device="cuda",
-        )
+        ).view(batch, draft - 1)
         all_rank_num_tokens = subseq_all_rank_num_tokens = None
         if self.rank_counts is not None:
             all_rank_num_tokens, subseq_all_rank_num_tokens = self.rank_counts(
                 int(input_ids.shape[0]), batch
             )
         spec_metadata = SimpleNamespace(
-            runtime_draft_len=DRAFT,
+            runtime_draft_len=draft,
             batch_indices_cuda=torch.arange(self.max_batch, dtype=torch.int32, device="cuda"),
             wants_advanced_draft_sampling=False,
             all_rank_num_tokens=all_rank_num_tokens,
@@ -413,7 +427,9 @@ class Driver:
         def teacher_forced_sample(logits, spec_md, batch_size, *, draft_step=None, **kwargs):
             tokens = sample(logits, spec_md, batch_size, draft_step=draft_step, **kwargs)
             drafts.append(tokens.clone())
-            return true_next.to(tokens.dtype) if draft_step == 0 else tokens
+            if draft_step < draft - 1:
+                return true_next[:, draft_step].contiguous().to(tokens.dtype)
+            return tokens
 
         inputs = dict(
             input_ids=input_ids,
@@ -442,28 +458,29 @@ class Driver:
                 self.worker._restore_attn_metadata_from_spec_dec(md)
         torch.cuda.synchronize()
         calls = self.observer.take()
-        assert len(calls) == DRAFT, len(calls)
-        assert calls[0]["num_contexts"] == num_contexts and calls[1]["num_contexts"] == 0
+        assert len(calls) == draft, len(calls)
+        assert calls[0]["num_contexts"] == num_contexts, calls[0]["num_contexts"]
+        assert all(call["num_contexts"] == 0 for call in calls[1:])
         record = StepRecord(kind=kind, rows=list(rows), calls=calls, drafts=torch.stack(drafts, 1))
         # Advance: positions up to the gather row are final; the drafts made there are next.
-        for r, (d1, d2) in zip(rows, record.drafts.tolist()):
+        for r, row_drafts in zip(rows, record.drafts.tolist()):
             req = r.request
             req.cached = r.gather + 1
-            req.drafts = (d1, d2)
+            req.drafts = tuple(row_drafts)
         return record
 
     def verify_row(self, req: Request) -> Row:
-        """The next verify of ``req``: what its last drafts get right is accepted."""
+        """The next verify of ``req``: what its last drafts get right is accepted, the longest
+        prefix of them that matches the text."""
         assert not req.in_context and req.drafts is not None
         ids = self.sequences[req.seq].ids
         q = req.cached
-        d1, d2 = req.drafts
         accepted = 1
-        if d1 == ids[q + 1]:
+        for k, token in enumerate(req.drafts):
+            if token != ids[q + 1 + k]:
+                break
             accepted += 1
-            if d2 == ids[q + 2]:
-                accepted += 1
-        return Row(req, q, 1 + DRAFT, context=False, accepted=accepted)
+        return Row(req, q, 1 + self.draft, context=False, accepted=accepted)
 
     def context_row(self, req: Request, chunk: int) -> Row:
         length = min(chunk, req.prompt_len - req.cached)
@@ -690,27 +707,34 @@ def _front_rest(x, routed, o, k, v, weights, config: R.TextConfig, nm: Numerics)
     return Front(x=x, routed=routed, mid=mid, shared=shared, k=k, v=v)
 
 
-def front(hidden, embeds, weights, config: R.TextConfig, nm: Numerics = REF, base_kv=None) -> Front:
+def front(
+    hidden, embeds, weights, config: R.TextConfig, nm: Numerics = REF, base_kv=None, extra_kv=()
+) -> Front:
     """``Nemotron4MultiTokenPredictionLayer`` up to its MoE at every position of one sequence.
 
     Depth 1 (``base_kv`` None): ordinary causal attention over the sequence (`R.mtp_layer`).
-    Depth 2 (MTP-Eagle, `R._mtp_eagle_depth` with no earlier private keys): the query at i attends
-    over the depth-1 keys of positions 0..i and its own key.
+    Depth k >= 2 (MTP-Eagle, `R._mtp_eagle_depth`): the query at i attends over the depth-1 keys of
+    positions 0..i, the keys depths 2 .. k - 1 computed at i (``extra_kv``, ``(k, v)`` per depth,
+    each ``[N, kv_heads, head_dim]``) and its own key.
     """
     x, routed, q, k, v = _front_qkv(hidden, embeds, weights, config, nm)
     scale = config.head_dim**-0.5
     if base_kv is None:
         o = nm.attention(q, k, v, scale)
     else:
-        assert nm.attention is R.causal_attention, "depth 2 over a whole sequence: reference only"
-        o = nm.attention(q, base_kv[0], base_kv[1], scale, extra_k=k[:, None], extra_v=v[:, None])
+        assert nm.attention is R.causal_attention, (
+            "depth >= 2 over a whole sequence: reference only"
+        )
+        extra_k = torch.stack([kk for kk, _ in extra_kv] + [k], dim=1)
+        extra_v = torch.stack([vv for _, vv in extra_kv] + [v], dim=1)
+        o = nm.attention(q, base_kv[0], base_kv[1], scale, extra_k=extra_k, extra_v=extra_v)
     return _front_rest(x, routed, o, k, v, weights, config, nm)
 
 
 def front_rows(hidden, embeds, weights, config: R.TextConfig, base_kv_rows, nm: Numerics = REF):
-    """Depth 2 of single rows: row j's query attends over ``base_kv_rows[j]`` (its sequence's
-    depth-1 keys and values of positions 0..g) and its own key -- `front`'s depth-2 arrangement
-    for one position at a time."""
+    """Depth k >= 2 of single rows: row j's query attends over ``base_kv_rows[j]`` (its sequence's
+    depth-1 keys and values of positions 0..g, then those depths 2 .. k - 1 computed at g) and its
+    own key -- `front`'s arrangement for one position at a time."""
     x, routed, q, k, v = _front_qkv(hidden, embeds, weights, config, nm)
     scale = config.head_dim**-0.5
     o = torch.empty_like(q)
@@ -775,33 +799,49 @@ def back(front_rows_: Front, weights, config: R.TextConfig, nm: Numerics = REF, 
 class SequenceReference:
     """The references at every position of one sequence, teacher forced on the trunk's hidden
     state and the next tokens: depth 1's front at HF's rounding points, at the target's and in
-    HF's own numerics; `R_own`'s output at both depths and its depth-2 routed input."""
+    HF's own numerics; `R_own`'s output and routed input at every depth."""
 
     front1: Front
     front1_t: Front
     hf_front1: Front
-    own1: torch.Tensor
-    own2: torch.Tensor
-    routed2: torch.Tensor
+    own: list[torch.Tensor]  # depth 1 .. D
+    routed: list[torch.Tensor]  # depth 1 .. D
+
+    @property
+    def own1(self) -> torch.Tensor:
+        return self.own[0]
+
+    @property
+    def own2(self) -> torch.Tensor:
+        return self.own[1]
 
 
 @torch.inference_mode()
-def sequence_reference(seq: Sequence, embed, weights, config: R.TextConfig) -> SequenceReference:
-    """`R_own` over one sequence is `mtp_draft_hidden(mode="eagle", num_depths=2)` in pieces -- the
-    same ops in the same order, so the same bits (`test_reference_pieces_are_mtp_draft_hidden`)."""
+def sequence_reference(
+    seq: Sequence, embed, weights, config: R.TextConfig, depths: int = DRAFT
+) -> SequenceReference:
+    """`R_own` over one sequence is `mtp_draft_hidden(mode="eagle", num_depths=depths)` in pieces --
+    the same ops in the same order, so the same bits (`test_reference_pieces_are_mtp_draft_hidden`).
+    """
     ids = seq.ids_cuda
     next1 = F.pad(ids[1:], (0, 1))
-    next2 = F.pad(ids[2:], (0, 2))
     front1 = front(seq.hidden, embed[next1], weights, config)
-    own1 = back(front1, weights, config)
-    front2 = front(own1, embed[next2], weights, config, base_kv=(front1.k, front1.v))
+    own, routed, extra = [back(front1, weights, config)], [front1.routed], []
+    next_ids = next1
+    for _ in range(1, depths):
+        next_ids = F.pad(next_ids[1:], (0, 1))
+        fk = front(
+            own[-1], embed[next_ids], weights, config, base_kv=(front1.k, front1.v), extra_kv=extra
+        )
+        extra.append((fk.k, fk.v))
+        own.append(back(fk, weights, config))
+        routed.append(fk.routed)
     return SequenceReference(
         front1=front1,
         front1_t=front(seq.hidden, embed[next1], weights, config, nm=REF_T),
         hf_front1=front(seq.hidden, embed[next1], weights, config, nm=HF),
-        own1=own1,
-        own2=back(front2, weights, config),
-        routed2=front2.routed,
+        own=own,
+        routed=routed,
     )
 
 
@@ -934,9 +974,11 @@ class Comparator:
     """Compares each MTP-layer call of a step with the references, row by row.
 
     Every row is (sequence, depth, position): step 0's rows are depth 1 at each of the step's
-    positions, step 1's rows depth 2 at each request's gather position. The target's own keys and
-    values of every depth-1 row are kept per request: they are what its draft KV cache holds, the
-    history the attention stage reads.
+    positions, step k - 1's rows depth k at each request's gather position. The target's own keys
+    and values of every depth-1 row are kept per request: they are what its draft KV cache holds,
+    the history the attention stage reads. Within a step, depth k >= 3 also reads what depths
+    2 .. k - 1 wrote after the gather position: the target its own keys, each reference the keys it
+    computed itself at those depths (``chain``, kept for the step).
     """
 
     def __init__(self, sequences, seqrefs, embed, weights, lm_head, layer, config: R.TextConfig):
@@ -960,7 +1002,7 @@ class Comparator:
         """``(row index into the call, [(sequence, position)], [(request, call rows, first
         position)])``: the rows compared, and each request's contiguous rows."""
         index, where, segments = [], [], []
-        if depth == 2:
+        if depth >= 2:
             for j, r in enumerate(record.rows):
                 index.append(j)
                 where.append((r.request.seq, r.gather))
@@ -978,7 +1020,8 @@ class Comparator:
     @torch.inference_mode()
     def compare(self, record: StepRecord, cells: dict, stride: int = 1) -> None:
         """Merge the step's comparisons into ``cells[(record.kind, depth)]``."""
-        for depth, call in ((1, record.calls[0]), (2, record.calls[1])):
+        chain: dict = {}
+        for depth, call in enumerate(record.calls, start=1):
             index, where, segments = self._rows(record, depth, stride)
             idx = torch.tensor(index, device="cuda")
             cell = cells.setdefault((record.kind, depth), CellStats())
@@ -987,12 +1030,12 @@ class Comparator:
             cell.max_batch = max(cell.max_batch, len(record.rows))
             cell.max_tokens = max(cell.max_tokens, call["out"].shape[0])
             cell.max_position = max(cell.max_position, max(p for _, p in where))
-            outputs, routed = self._outputs(call, depth, idx, where)
+            outputs, routed = self._outputs(call, depth, idx, where, chain)
             for a, b in OUTPUT_PAIRS:
                 _note(cell.output, f"{a}|{b}", errors(outputs[a], outputs[b]))
             same_routing = self._routing(cell, call, idx, routed)
             self._logits(cell, outputs, same_routing)
-            self._stages(cell, call, depth, idx, segments)
+            self._stages(cell, call, depth, idx, segments, chain)
             for name, rows in self._by_sequence(where).items():
                 for a, b in (("T", "R_t"), ("H_t", "R_hf_t")):
                     table = cell.by_sequence.setdefault(name, {})
@@ -1016,9 +1059,15 @@ class Comparator:
             i = j
         return out
 
-    def _outputs(self, call, depth, idx, where):
-        """Every side's output on the compared rows, and R_own's / H_own's routed inputs."""
+    def _outputs(self, call, depth, idx, where, chain=None):
+        """Every side's output on the compared rows, and R_own's / H_own's routed inputs.
+
+        ``chain`` (one dict a step, which its depths share in order) carries what depth k >= 3
+        reads from the step's earlier depths: each reference's own fronts of depths 2 .. k - 1 at
+        the gather rows (their keys and values), and HF's own chain. Without it, depths 1 and 2.
+        """
         cfg, w = self.config, self.weights
+        chain = {} if chain is None else chain
         routing = (call["ids"][idx], call["weights"][idx])
         if depth == 1:
             r_front = Front.cat(self._take(where, lambda r, p: r.front1.rows(p)))
@@ -1028,26 +1077,46 @@ class Comparator:
             h_own, h_routed = back(h_front, w, cfg, HF), h_front.routed
             own_routed = r_front.routed
         else:
+            assert depth == 2 or chain.get("depth") == depth - 1, "compare a step's depths in order"
             hidden = call["hidden"][idx]
             embeds = self.embed[call["input_ids"][idx].long()]
             refs = [self.seqrefs[s] for s, _ in where]
 
-            def base(field):
-                return [
-                    (getattr(r, field).k[: g + 1], getattr(r, field).v[: g + 1])
-                    for r, (_, g) in zip(refs, where)
-                ]
+            def base(field, side):
+                """Each row's history: the side's depth-1 keys and values of positions 0..g, then
+                the ones it computed itself at depths 2 .. k - 1 of this step."""
+                earlier = chain.get(side, ())
+                rows = []
+                for j, (r, (_, g)) in enumerate(zip(refs, where)):
+                    first = getattr(r, field)
+                    keys = torch.cat([first.k[: g + 1]] + [f.k[j : j + 1] for f in earlier])
+                    values = torch.cat([first.v[: g + 1]] + [f.v[j : j + 1] for f in earlier])
+                    rows.append((keys, values))
+                return rows
 
-            r_front = front_rows(hidden, embeds, w, cfg, base("front1"))
-            t_front = front_rows(hidden, embeds, w, cfg, base("front1_t"), nm=REF_T)
-            h_kv = base("hf_front1")
-            h_front = front_rows(hidden, embeds, w, cfg, h_kv, nm=HF)
-            own = torch.cat(self._take(where, lambda r, p: r.own2[p]))
-            own_routed = torch.cat(self._take(where, lambda r, p: r.routed2[p]))
-            # H's own chain: its own depth 1 at the gather position, then its own depth 2.
-            h1 = back(Front.cat(self._take(where, lambda r, p: r.hf_front1.rows(p))), w, cfg, HF)
-            h2_front = front_rows(h1, embeds, w, cfg, h_kv, nm=HF)
-            h_own, h_routed = back(h2_front, w, cfg, HF), h2_front.routed
+            r_front = front_rows(hidden, embeds, w, cfg, base("front1", "R"))
+            t_front = front_rows(hidden, embeds, w, cfg, base("front1_t", "R_t"), nm=REF_T)
+            h_front = front_rows(hidden, embeds, w, cfg, base("hf_front1", "H"), nm=HF)
+            own = torch.cat(self._take(where, lambda r, p: r.own[depth - 1][p]))
+            own_routed = torch.cat(self._take(where, lambda r, p: r.routed[depth - 1][p]))
+            # H's own chain: its own depth 1 at the gather position, then its own depths 2 .. k.
+            if depth == 2:
+                chain["H_own_out"] = back(
+                    Front.cat(self._take(where, lambda r, p: r.hf_front1.rows(p))), w, cfg, HF
+                )
+            h_own_front = front_rows(
+                chain["H_own_out"], embeds, w, cfg, base("hf_front1", "H_own"), nm=HF
+            )
+            h_own, h_routed = back(h_own_front, w, cfg, HF), h_own_front.routed
+            for side, f in (
+                ("R", r_front),
+                ("R_t", t_front),
+                ("H", h_front),
+                ("H_own", h_own_front),
+            ):
+                chain.setdefault(side, []).append(f)
+            chain["H_own_out"] = h_own
+            chain["depth"] = depth
         outputs = {
             "T": call["out"][idx],
             "R_t": back(t_front, w, cfg, REF_T, routing),
@@ -1119,9 +1188,13 @@ class Comparator:
             cell.routing_vs_own[side] = cell.routing_vs_own.get(side, 0) + differ
         return (ids_t == ids_own).all(-1)
 
-    def _stages(self, cell: CellStats, call, depth, idx, segments) -> None:
+    def _stages(self, cell: CellStats, call, depth, idx, segments, chain=None) -> None:
         """Each op against its entry's reference fed the target's own input to that op, and HF's
-        own op on the same input against the reference at HF's rounding points."""
+        own op on the same input against the reference at HF's rounding points.
+
+        The attention at depth k >= 2 reads the request's depth-1 keys and values up to the gather
+        position, then what the target itself wrote at depths 2 .. k - 1 of the step (``chain``,
+        as `_outputs` takes it), then its own."""
         cfg, w = self.config, self.weights
         eps = cfg.rms_norm_eps
         block = R.sub(w, "block.")
@@ -1153,12 +1226,14 @@ class Comparator:
         qkv = call["qkv"]
         attn = torch.empty_like(call["attn"])
         attn_hf = torch.empty_like(call["attn"])
+        earlier = [] if chain is None else chain.get("T", [])
         for req, rows, first in segments:
             q = qkv[rows, :q_width].reshape(-1, heads, dim)
             k = qkv[rows, q_width : q_width + kv_width].reshape(-1, kv_heads, dim)
             v = qkv[rows, q_width + kv_width :].reshape(-1, kv_heads, dim)
             kc, vc = self._cache(req, k)
-            keys, values = torch.cat([kc[:first], k]), torch.cat([vc[:first], v])
+            keys = torch.cat([kc[:first]] + [ek[rows] for ek, _ in earlier] + [k])
+            values = torch.cat([vc[:first]] + [ev[rows] for _, ev in earlier] + [v])
             attn[rows] = R.causal_attention(q, keys, values, dim**-0.5).reshape(-1, q_width)
             attn_hf[rows] = hf_attention(q, keys, values, dim**-0.5).reshape(-1, q_width)
             if depth == 1:
@@ -1166,6 +1241,13 @@ class Comparator:
                 vc[first : first + v.shape[0]] = v
         note("attention", c["attn"], attn[idx])
         note("attention", attn_hf[idx], attn[idx], cell.stages_hf)
+        if chain is not None and depth >= 2:
+            chain.setdefault("T", []).append(
+                (
+                    qkv[:, q_width : q_width + kv_width].reshape(-1, kv_heads, dim),
+                    qkv[:, q_width + kv_width :].reshape(-1, kv_heads, dim),
+                )
+            )
         pre_moe, residual = target_add_norm(c["x"], c["o"], block["pre_moe_layernorm.weight"], eps)
         note("residual", c["mid"], residual)
         note("pre_moe_norm", c["shared"], pre_moe)
@@ -1183,7 +1265,7 @@ class Comparator:
 
     def _cache(self, req: Request, like: torch.Tensor):
         if req.rid not in self.kv:
-            shape = (req.stop + DRAFT + 2, *like.shape[1:])
+            shape = (req.stop + req.draft + 2, *like.shape[1:])
             self.kv[req.rid] = (like.new_zeros(shape), like.new_zeros(shape))
         return self.kv[req.rid]
 
@@ -1199,14 +1281,25 @@ chunks over the earlier chunks' KV; the rest of the text is walked."""
 CHUNK = 2048
 DECODE_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 """The CUDA-graph decode batch sizes: each runs ``ROUNDS`` verify steps (step 0 over B rows of
-1 + D tokens, step 1 over B rows)."""
+1 + D tokens, steps 1 .. D - 1 over B rows)."""
 
 ROUNDS = 3
 
 
-def _half(length: int) -> int:
+def _half(length: int, draft: int) -> int:
     """A short prompt's context: its first half, leaving room for one draft window after it."""
-    return max(1, min(length // 2, length - DRAFT - 2))
+    return max(1, min(length // 2, length - draft - 2))
+
+
+def _short_requests(driver: Driver, short) -> list[Request]:
+    """Requests over the short prompts' first halves, each that leaves room for a draft window
+    after it (at five drafts, not the five-token one)."""
+    seqs = driver.sequences
+    return [
+        driver.new_request(i, _half(len(seqs[i].ids), driver.draft))
+        for i in short
+        if _half(len(seqs[i].ids), driver.draft) + driver.draft + 2 <= len(seqs[i].ids)
+    ]
 
 
 def _long(sequences) -> list[int]:
@@ -1253,7 +1346,7 @@ def _prefills_and_walks(driver, run, seqs, long_, short, walk, log) -> None:
     while b.in_context:
         run([driver.context_row(b, CHUNK)], "prefill_chunked")
     # Prefill, a varlen batch of fresh contexts: the short prompts' first halves.
-    shorts = [driver.new_request(i, _half(len(seqs[i].ids))) for i in short]
+    shorts = _short_requests(driver, short)
     run([driver.context_row(r, CHUNK) for r in shorts], "prefill_varlen")
     log("prefills done")
     if not walk:
@@ -1286,7 +1379,9 @@ def _ladder(driver, run, long_, log) -> None:
         lo, hi = (6000, 7400) if i < 16 else (1024, 4096) if i < 128 else (64, 1024)
         prefix = int(torch.randint(lo, hi, (1,), generator=g))
         rounds = sum(ROUNDS for n in DECODE_BATCHES if n > i)
-        pool.append(driver.new_request(seq, prefix, stop=prefix + 3 * rounds + 8))
+        # Room for every round to accept all its drafts, and for the last one's draft window.
+        stop = prefix + (1 + driver.draft) * rounds + 2 * driver.draft + 4
+        pool.append(driver.new_request(seq, prefix, stop=stop))
     pending = list(pool)
     while pending:
         rows, budget = [], MAX_NUM_TOKENS
@@ -1479,7 +1574,7 @@ def run_rival(name: str, M, model, driver_factory, comparator_factory, log=print
         cells: dict = {}
         long_ = _long(sequences)
         short = [i for i in range(len(sequences)) if i not in long_]
-        requests = [driver.new_request(i, _half(len(sequences[i].ids))) for i in short]
+        requests = _short_requests(driver, short)
         requests.append(driver.new_request(long_[0], CHUNK, stop=CHUNK + 64))
         rows = [driver.context_row(r, CHUNK) for r in requests]
         comparator.compare(driver.step(rows, name), cells)
@@ -1510,7 +1605,7 @@ def by_depth(cells: dict) -> dict:
     """Every cell of one depth merged: the drafts' agreement with R_own, the MTP logits' distances
     (the epsilon `mtp-acceptance` needs) and the distribution of the gain on R_own's top token."""
     out = {}
-    for depth in (1, 2):
+    for depth in sorted({d for _, d in cells}):
         mine = [c for (_, d), c in cells.items() if d == depth]
         if not mine:
             continue
