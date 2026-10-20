@@ -4,21 +4,37 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
-#: Columns of the [K, V] state one program holds. Eight 128-float columns are
-#: 4 KiB of fp32 state in one warp's registers, the tile the vendored
-#: fused-recurrent kernels use for the same update.
-_BLOCK_V = 8
+#: Columns of the [K, V] state one program holds: four 128-float columns, 2 KiB
+#: of fp32 state in one warp's registers. At 63 registers a thread, the 32
+#: one-warp programs an SM can hold all fit, where eight columns (80 registers)
+#: fit 25. The width does not reach the arithmetic: each column is reduced over
+#: K on its own, in an order set by the K extent and the warp count alone.
+_BLOCK_V = 4
+#: One warp: K is spread four values to a lane across its 32 lanes, the layout
+#: every reduction over K here is ordered by. A second warp would split K too.
 _NUM_WARPS = 1
 #: CUDA's limit on the second grid dimension; rows past it are grid-strided.
 _MAX_GRID_ROWS = 65535
+#: Rows of programs per SM in the decode grid. Past that the programs
+#: grid-stride over the rows, each loading its next row's state while it
+#: computes the current one.
+_ROWS_PER_SM = 16
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 @triton.jit(do_not_specialize=["num_rows", "num_slots"])
@@ -67,6 +83,12 @@ def _gdp_recurrent_kernel(
     steps in fp32 registers and stored once: decay before the first step, the
     query read after the last -- exactly the order the HF expansion feeds the
     per-step recurrence.
+
+    The next row's slot and tile are loaded before the current row's
+    arithmetic, so a load is in flight while the warp computes. A padding row
+    (slot < 0), and the row after a program's last, load nothing and store
+    nothing: their masks are off. The state is read and written once a step,
+    so its loads are evict-first and its stores streaming.
     """
     i_v = tl.program_id(0)
     i_row = tl.program_id(1)
@@ -76,22 +98,40 @@ def _gdp_recurrent_kernel(
     mask_v = o_v < V
     mask_kv = mask_k[:, None] & mask_v[None, :]
 
+    # Element [k, v] of the HF state lives at pool[slot, h, v, k].
+    n_next = (i_row // H).to(tl.int64)
+    h_next = i_row % H
+    slot_next = tl.load(slots + n_next, mask=i_row < num_rows, other=-1).to(tl.int64)
+    b_next = tl.load(
+        state_pool
+        + slot_next * stride_s_s
+        + h_next * stride_s_h
+        + o_k[:, None] * stride_s_k
+        + o_v[None, :] * stride_s_v,
+        mask=mask_kv & (slot_next >= 0),
+        other=0.0,
+        eviction_policy="evict_first",
+    )
     while i_row < num_rows:
-        i_n = (i_row // H).to(tl.int64)
-        i_h = i_row % H
-        slot = tl.load(slots + i_n).to(tl.int64)
-        # Element [k, v] of the HF state lives at pool[slot, h, v, k].
-        p_state = (
+        i_n = n_next
+        i_h = h_next
+        slot = slot_next
+        tl.device_assert(slot < num_slots, "slot out of range")
+        b_h = b_next.to(tl.float32)
+        i_row += tl.num_programs(1)
+        n_next = (i_row // H).to(tl.int64)
+        h_next = i_row % H
+        slot_next = tl.load(slots + n_next, mask=i_row < num_rows, other=-1).to(tl.int64)
+        b_next = tl.load(
             state_pool
-            + slot * stride_s_s
-            + i_h * stride_s_h
+            + slot_next * stride_s_s
+            + h_next * stride_s_h
             + o_k[:, None] * stride_s_k
-            + o_v[None, :] * stride_s_v
+            + o_v[None, :] * stride_s_v,
+            mask=mask_kv & (slot_next >= 0),
+            other=0.0,
+            eviction_policy="evict_first",
         )
-        b_h = tl.zeros([BK, BV], dtype=tl.float32)
-        if slot >= 0:
-            tl.device_assert(slot < num_slots, "slot out of range")
-            b_h = tl.load(p_state, mask=mask_kv, other=0.0).to(tl.float32)
 
         b_g = tl.load(g + i_n * stride_g_t + i_h * stride_g_h).to(tl.float32)
         b_h *= tl.exp(b_g)
@@ -119,14 +159,25 @@ def _gdp_recurrent_kernel(
         b_q = b_q * tl.math.rsqrt(tl.sum(b_q * b_q) + 1e-6) * scale
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(out + (i_n * H + i_h) * V + o_v, b_o.to(out.dtype.element_ty), mask=mask_v)
-        if slot >= 0:
-            tl.store(p_state, b_h.to(state_pool.dtype.element_ty), mask=mask_kv)
-        i_row += tl.num_programs(1)
+        tl.store(
+            state_pool
+            + slot * stride_s_s
+            + i_h * stride_s_h
+            + o_k[:, None] * stride_s_k
+            + o_v[None, :] * stride_s_v,
+            b_h.to(state_pool.dtype.element_ty),
+            mask=mask_kv & (slot >= 0),
+            cache_modifier=".cs",
+        )
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
     """HF `l2norm`: `x * rsqrt(sum(x * x) + 1e-6)` over the head dim."""
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + 1e-6)
+
+
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_GDP_RECURRENT = Launch(_gdp_recurrent_kernel)
 
 
 class GdpRecurrent(OpWrapper):
@@ -310,17 +361,17 @@ class GdpRecurrent(OpWrapper):
     so a request that reaches a decode row without a prefill (a one-token
     prompt promoted into a graph batch) needs its slot zeroed first.
 
-    A row's result does not depend on the batch it runs in: one tile shape
-    and one reduction order for every batch size, so the same request gets the
-    same bits in a padded graph batch and in an eager one -- as long as the
-    batch's strides agree on being multiples of 16. Triton specializes the
-    kernel on that, and its variants round the reductions differently. A
-    one-row `x[:, cols].view(1, ...)` takes the inner block's size as its row
-    stride where a larger batch keeps the in_proj width: at tp1's 18528 both
-    are multiples of 16, but a tp4 rank's 4632 is not, and a request alone
-    then moves about a quarter of its state elements against the same request
-    in a batch. Pass views whose row stride is the in_proj width at every batch
+    Strides: Triton specializes the kernel on each stride's divisibility by
+    16, and the cells drive views whose row stride is the in_proj width at
+    every batch size. A one-row `x[:, cols].view(1, ...)` takes the inner
+    block's size as its row stride instead: at tp1's 18528 both are multiples
+    of 16, but at a tp4 rank's 4632 a request alone would run a variant no cell
+    drives. Pass views whose row stride is the in_proj width at every batch
     size (`as_strided`).
+
+    Grid: one tile shape for every batch size. The batch sets only how many
+    rows each program strides over (at most `_ROWS_PER_SM` rows of programs per
+    SM), and which row it loads ahead.
 
     Certified head counts: 24 (tp1) and 6 (a tp4 rank), each with its own
     in_proj row stride. Uncertified: more than one token per request (MTP
@@ -347,8 +398,9 @@ class GdpRecurrent(OpWrapper):
         num_rows = num_tokens * num_heads
         if num_rows == 0:
             return out
-        grid = (triton.cdiv(value_dim, _BLOCK_V), min(num_rows, _MAX_GRID_ROWS))
-        _gdp_recurrent_kernel[grid](
+        grid_rows = min(num_rows, _ROWS_PER_SM * _num_sms(q.device.index), _MAX_GRID_ROWS)
+        grid = (triton.cdiv(value_dim, _BLOCK_V), grid_rows)
+        _GDP_RECURRENT[grid](
             q,
             k,
             v,

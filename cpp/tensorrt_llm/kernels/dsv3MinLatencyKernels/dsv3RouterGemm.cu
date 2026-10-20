@@ -340,6 +340,32 @@ template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__n
 template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 16, 256, 4096>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
+// num_experts=512, hidden_dim=3072 instantiations (Nemotron-4 nano preview), 1 to 8 tokens only: from about 12
+// tokens cuBLAS is the faster GEMM at this shape, so dsv3_router_gemm_op sends larger batches there.
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 1, 512, 3072>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 2, 512, 3072>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 3, 512, 3072>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 4, 512, 3072>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 5, 512, 3072>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 6, 512, 3072>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 7, 512, 3072>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 8, 512, 3072>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
 } // namespace kernels::dsv3MinLatencyKernels
 
 TRTLLM_NAMESPACE_END

@@ -180,6 +180,12 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \
+    case tensorrt_llm::DataType::kFLOAT:                                                                               \
+    {                                                                                                                  \
+        using TYPE = float;                                                                                            \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
     default:                                                                                                           \
     {                                                                                                                  \
         TLLM_CHECK_WITH_INFO(false, "Unsupported dtype for moe_a2a_combine");                                          \
@@ -1464,13 +1470,18 @@ __device__ void vectorized_combine(
     {
         vectorized_combine_impl<4, OutputT, InputT>(output, size_per_token, sources, source_count);
     }
-    else if (size_per_token % 2 == 0)
+    else if constexpr (sizeof(InputT) <= 2)
     {
-        vectorized_combine_impl<2, OutputT, InputT>(output, size_per_token, sources, source_count);
-    }
-    else if constexpr (sizeof(InputT) == 1)
-    {
-        vectorized_combine_impl<1, OutputT, InputT>(output, size_per_token, sources, source_count);
+        // A vector narrower than one element holds none: these widths exist for 2- and 1-byte inputs only (an
+        // fp32 row is always a multiple of 4 bytes).
+        if (size_per_token % 2 == 0)
+        {
+            vectorized_combine_impl<2, OutputT, InputT>(output, size_per_token, sources, source_count);
+        }
+        else if constexpr (sizeof(InputT) == 1)
+        {
+            vectorized_combine_impl<1, OutputT, InputT>(output, size_per_token, sources, source_count);
+        }
     }
 }
 

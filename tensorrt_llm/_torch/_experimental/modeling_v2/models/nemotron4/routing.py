@@ -126,10 +126,27 @@ def _text_shape(text_config: Any) -> dict:
     return shape
 
 
-#: The one draft length the targets run: the checkpoint's trained depth, two
+#: The draft length every target runs: the checkpoint's trained depth, two
 #: drafts over its one repeated MTP layer, so a verify step carries 3 tokens per
 #: request. It is the length the MTP identity, acceptance and GSM8K gates run.
 _DRAFT_LEN = 2
+
+#: The draft lengths a target runs beyond `_DRAFT_LEN`. tp1 also runs three to
+#: five: the repeated layer drafts a third, fourth and fifth depth, and a verify
+#: step carries 4, 5 or 6 tokens per request; dep4 also runs three. Each length
+#: is one its target's own MTP identity and acceptance gates run.
+_MORE_DRAFT_LENS = {"tp1": (3, 4, 5), "dep4": (3,)}
+
+
+def _draft_lens(topology: Optional[str]) -> tuple[int, ...]:
+    """The draft lengths the topology's target runs, in increasing order."""
+    return (_DRAFT_LEN,) + _MORE_DRAFT_LENS.get(topology, ())
+
+
+def _drafts(lengths: tuple[int, ...]) -> str:
+    """`(2,)` as "2", `(2, 3)` as "2 or 3", `(2, 3, 4, 5)` as "2, 3, 4 or 5"."""
+    *rest, last = (str(n) for n in lengths)
+    return f"{', '.join(rest)} or {last}" if rest else last
 
 
 def _speculation_declined(spec_config: Optional[Any], topology: Optional[str]) -> Optional[str]:
@@ -138,9 +155,10 @@ def _speculation_declined(spec_config: Optional[Any], topology: Optional[str]) -
     The draft path is the checkpoint's own MTP layer (``mtp.layers.0``, which
     ``mtp_use_repeated_layer`` repeats for every draft depth) driven by the
     one-model MTP-Eagle loop: one linear draft chain per request, the drafter's
-    weights loaded from the target checkpoint, ``_DRAFT_LEN`` drafts on every
-    step. The model loader resolves the mode against the checkpoint config
-    before routing, so ``spec_dec_mode`` is the mode the engine will run.
+    weights loaded from the target checkpoint, one of the topology's draft
+    lengths (`_draft_lens`) on every step. The model loader resolves the mode
+    against the checkpoint config before routing, so ``spec_dec_mode`` is the
+    mode the engine will run.
     """
     if spec_config is None:
         return None
@@ -180,20 +198,21 @@ def _speculation_declined(spec_config: Optional[Any], topology: Optional[str]) -
         else:
             why = (
                 f"no gate covers a draft length that changes from step to step: the gates run "
-                f"{_DRAFT_LEN} drafts on every step"
+                f"{_drafts(_draft_lens(topology))} drafts on every step"
             )
         return f"{schedule} changes the draft length per step, and {why}"
-    if spec_config.max_draft_len != _DRAFT_LEN:
-        why = (
-            f"the target runs {_DRAFT_LEN} drafts, the checkpoint's trained depth, which is the "
-            "length its gates certify"
+    lengths = _draft_lens(topology)
+    if spec_config.max_draft_len not in lengths:
+        verify = _drafts(tuple(1 + n for n in lengths))
+        next_depths = "next one" if len(lengths) == 2 else "next ones"
+        why = f"the target runs {_drafts(lengths)} drafts, " + (
+            f"the checkpoint's trained depth and the repeated layer's {next_depths}, which are "
+            "the lengths its gates certify and the verify lengths thop_attention's cells cover "
+            f"({verify} query tokens a request)"
+            if len(lengths) > 1
+            else "the checkpoint's trained depth, which is the length its gates certify and the "
+            f"one verify length thop_attention's cells cover ({verify} query tokens a request)"
         )
-        if topology == "tp4":
-            why += (
-                "; on a tp4 rank it is also the one certified length whose verify gives "
-                "decode's bits (gdp_verify: a request's stride, (1 + max_draft_len) x 4632, "
-                "must not be a multiple of 16, as decode's 4632 is not)"
-            )
         return f"max_draft_len={spec_config.max_draft_len}: {why}"
     return None
 
@@ -240,13 +259,13 @@ def route(
     # MTP layer's weights and KV), so every mode the targets have no path for is declined
     # here rather than left to crash in the model. The draft length is part of that
     # structure: it sets the tokens per request of every verify step and the steps of the
-    # draft loop, and the targets run only the trained depth. So is a schedule that changes
-    # it from step to step. The acceptance rule and SA drafting are knobs: they change
-    # which drafts are kept, not which code runs.
+    # draft loop, and each target runs only the lengths its gates certify (`_draft_lens`).
+    # So is a schedule that changes it from step to step. The acceptance rule and SA
+    # drafting are knobs: they change which drafts are kept, not which code runs.
     declined = _speculation_declined(spec_config, topology)
 
     # nemotron4-nano-preview's text model on GB300s (sm103), with one-model MTP-Eagle on the
-    # checkpoint's MTP layer at its trained draft length or no speculative decoding.
+    # checkpoint's MTP layer at a draft length its target runs, or no speculative decoding.
     if compute_capability == (10, 3) and not differs and declined is None:
         # One line per target on purpose: test_modeling_v2_claims finds a family's targets
         # by reading these imports, and the formatter and isort would wrap them.
@@ -288,6 +307,7 @@ def route(
         "dep4 (4 ranks, attention DP, the routed experts split four ways and nothing else "
         "divided) and tp4 (4 ranks, no attention DP, the mixers' heads and every MLP's and "
         "routed expert's intermediate width split four ways), each with one-model MTP-Eagle "
-        f"on the checkpoint's MTP layer at max_draft_len={_DRAFT_LEN} without a "
-        "draft_len_schedule, or without speculative decoding"
+        f"on the checkpoint's MTP layer at max_draft_len={_DRAFT_LEN} (tp1 also "
+        f"{_drafts(_MORE_DRAFT_LENS['tp1'])}, dep4 also {_drafts(_MORE_DRAFT_LENS['dep4'])}) "
+        "without a draft_len_schedule, or without speculative decoding"
     )

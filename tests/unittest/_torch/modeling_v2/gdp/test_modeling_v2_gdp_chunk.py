@@ -12,28 +12,18 @@ import zlib
 import pytest
 import torch
 import torch.nn.functional as F
-import triton
 from triton.runtime.autotuner import Autotuner
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp import gdp_chunk as gdp_chunk_module
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import (
-    _chunk_list,
-    _decay_cumsum_kernel,
-    _expand_kernel,
-    _jit,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import _chunk_lists
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gdp.gdp_chunk import gdp_chunk as op
 from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
 )
-from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_kernel_o
-from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from tensorrt_llm._torch.modules.fla.cumsum import chunk_local_cumsum
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices, prepare_chunk_offsets
-from tensorrt_llm._torch.modules.fla.solve_tril import solve_tril
-from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd
 
 __extra_import_path__ = [".."]
 from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: E402,F401
@@ -270,140 +260,14 @@ def test_guard_refuses_offsets_that_miss_the_tokens() -> None:
             op(**args)
 
 
-#: `chunk_fwd_kernel_o` at the config its autotuner picks for the 8K prefill. The
-#: kernel's configs fall into two groups that round differently (BK 64 / BV 64 on
-#: two warps against the rest), so the comparison pins one, of the larger group.
-_VENDORED_O = dict(BK=64, BV=64, num_warps=4, num_stages=2)
-
-
-def _through_the_wrappers(
-    q, k, v, g, beta, state_pool, slots, cu_seqlens, has_initial_state, scale
-):
-    """The entry's stages run the way the vendored wrappers run them: each wrapper
-    builds its chunk list on the host with `prepare_chunk_indices`, sizes its grid
-    from the list's length and launches with its own constants (`fwd_h` autotuned).
-    The output stage is the vendored `chunk_fwd_kernel_o` over every sub-step, at
-    `_VENDORED_O`, of which the mixer keeps each token's last. The expansion and the
-    decay cumsum are the entry's. Writes the final states into `state_pool[slots]`
-    and returns the kept output."""
-    num_tokens, nh, h, dv = v.shape
-    dk = k.shape[-1]
-    steps = num_tokens * nh
-    cu_steps = cu_seqlens.long() * nh
-    q_norm = q.new_empty(num_tokens, h, dk)
-    k_steps = k.new_empty(1, steps, h, dk)
-    v_steps = v.new_empty(1, steps, h, dv)
-    beta_steps = beta.new_empty(1, steps, h)
-    _expand_kernel[(num_tokens,)](
-        q,
-        k,
-        v,
-        beta,
-        q_norm,
-        k_steps,
-        v_steps,
-        beta_steps,
-        *q.stride(),
-        *k.stride(),
-        *v.stride(),
-        *beta.stride(),
-        H=h,
-        NH=nh,
-        K=dk,
-        V=dv,
-        BH=triton.next_power_of_2(h),
-        BK=triton.next_power_of_2(dk),
-        BV=triton.next_power_of_2(dv),
-        num_warps=4,
-    )
-    # The vendored output stage takes a query per sub-step: zero but on the last.
-    q_steps = q.new_zeros(num_tokens, nh, h, dk)
-    q_steps[:, -1] = q_norm
-    q_steps = q_steps.view(1, steps, h, dk)
-    chunk_indices = prepare_chunk_indices(cu_steps, 64)
-    g_cumsum = torch.empty(1, steps, h, dtype=torch.float32, device="cuda")
-    _decay_cumsum_kernel[(chunk_indices.shape[0],)](
-        g,
-        g_cumsum,
-        cu_steps,
-        chunk_indices,
-        *g.stride(),
-        H=h,
-        NH=nh,
-        BT=64,
-        BH=triton.next_power_of_2(h),
-        num_warps=4,
-    )
-    a = chunk_scaled_dot_kkt_fwd(
-        k=k_steps,
-        beta=beta_steps,
-        g_cumsum=g_cumsum,
-        cu_seqlens=cu_steps,
-        chunk_size=64,
-        output_dtype=torch.float32,
-    )
-    a = solve_tril(A=a, cu_seqlens=cu_steps, output_dtype=k_steps.dtype)
-    w, u = recompute_w_u_fwd(
-        k=k_steps, v=v_steps, beta=beta_steps, g_cumsum=g_cumsum, A=a, cu_seqlens=cu_steps
-    )
-    rows = slots.long()
-    initial = torch.where(has_initial_state[:, None, None, None], state_pool[rows], 0.0)
-    states, v_new, final = chunk_gated_delta_rule_fwd_h(
-        k=k_steps,
-        w=w,
-        u=u,
-        g=g_cumsum,
-        initial_state=initial,
-        output_final_state=True,
-        chunk_size=64,
-        cu_seqlens=cu_steps,
-    )
-    o = torch.empty_like(v_new)
-    _jit(chunk_fwd_kernel_o)[(triton.cdiv(dv, _VENDORED_O["BV"]), chunk_indices.shape[0], h)](
-        q_steps,
-        k_steps,
-        v_new,
-        states,
-        g_cumsum,
-        o,
-        cu_steps,
-        chunk_indices,
-        scale,
-        T=steps,
-        H=h,
-        Hg=h,
-        K=dk,
-        V=dv,
-        BT=64,
-        USE_G=True,
-        IS_VARLEN=True,
-        **_VENDORED_O,
-    )
-    state_pool[rows] = final.to(state_pool.dtype)
-    return o.view(num_tokens, nh, h, dv)[:, -1].clone()
-
-
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_the_stages_are_the_vendored_ones_bitwise(cell) -> None:
-    """The entry against `_through_the_wrappers`: the output and the whole pool
-    memory agree bit for bit. So the entry's own launch configs change no bit --
-    `fwd_h`'s configs all round alike, which is what lets the entry pin one -- and
-    `_last_step_o_kernel` computes exactly what the vendored output stage computes
-    for the rows the mixer keeps, while computing no other row."""
-    args, raw = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
-    raw_before = raw.clone()
-    want = _through_the_wrappers(**args)
-    want_raw = raw.clone()
-    raw.copy_(raw_before)
-    got = op(**args)
-    assert torch.equal(got, want), "the entry's output differs from the vendored stages'"
-    assert torch.equal(raw, want_raw), "the entry's pool differs from the vendored stages'"
-
-
-def _host_chunk_list(cu_steps, steps, chunk_size):
-    """`_chunk_list` the way the wrappers build it: on the host, exactly as long as
-    the batch's chunk count."""
-    return prepare_chunk_indices(cu_steps, chunk_size), prepare_chunk_offsets(cu_steps, chunk_size)
+def _host_chunk_lists(cu_seqlens, num_householder, steps, sizes):
+    """`_chunk_lists` the way the wrappers build the lists: on the host, each exactly as
+    long as the batch's chunk count."""
+    cu_steps = cu_seqlens.long() * num_householder
+    return cu_steps, [
+        (prepare_chunk_indices(cu_steps, size), prepare_chunk_offsets(cu_steps, size))
+        for size in sizes
+    ]
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -417,7 +281,7 @@ def test_the_bound_sized_grids_change_no_bit(cell, monkeypatch) -> None:
     want = op(**args).clone()
     want_raw = raw.clone()
     raw.copy_(raw_before)
-    monkeypatch.setattr(gdp_chunk_module, "_chunk_list", _host_chunk_list)
+    monkeypatch.setattr(gdp_chunk_module, "_chunk_lists", _host_chunk_lists)
     got = op(**args)
     assert torch.equal(got, want), "the exact grids' output differs from the bound grids'"
     assert torch.equal(raw, want_raw), "the exact grids' pool differs from the bound grids'"
@@ -487,29 +351,35 @@ def test_two_processes_give_identical_bits() -> None:
     assert digests[0] == digests[1], f"two processes disagree: {digests}"
 
 
-@pytest.mark.parametrize("chunk_size", [16, 32, 64])
-def test_the_device_chunk_list_is_the_host_list(chunk_size) -> None:
-    """`_chunk_list` against the host builders the wrappers call,
-    `prepare_chunk_indices` and `prepare_chunk_offsets`: one to 300 sequences, past
-    the kernel's 64-sequence block, with lengths of one sub-step, exact multiples of
-    the chunk, one past them, and anything up to 2100. The entries past the real
-    chunks name the last sequence and a chunk past its end, and one sequence gets no
-    such entry at all."""
-    g = torch.Generator().manual_seed(chunk_size)
+@pytest.mark.parametrize("sizes", [(64, 16), (32, 64), (16, 16)])
+@pytest.mark.parametrize("num_householder", [1, 3])
+def test_the_device_chunk_lists_are_the_host_lists(sizes, num_householder) -> None:
+    """`_chunk_lists` against the host builders the wrappers call, for both of its
+    chunk sizes from one launch: `cu_steps` is the token offsets times the
+    Householder count, and each list's `prepare_chunk_indices` and
+    `prepare_chunk_offsets`. One to 300 sequences, past the kernel's 64-sequence
+    block, with lengths of one sub-step, exact multiples of a chunk, one past them,
+    and anything up to 2100. The entries past the real chunks name the last sequence
+    and a chunk past its end, and one sequence gets no such entry at all."""
+    g = torch.Generator().manual_seed(sizes[0] * 10 + num_householder)
     for num_seqs in (1, 2, 3, 63, 64, 65, 200, 300):
         lens = torch.randint(1, 2100, (num_seqs,), generator=g)
-        lens[1::5] = chunk_size * torch.randint(1, 20, lens[1::5].shape, generator=g)
+        lens[1::5] = sizes[0] * torch.randint(1, 20, lens[1::5].shape, generator=g)
         lens[2::5] = lens[1::5][: lens[2::5].numel()] + 1
         lens[3::5] = 1
         cu = F.pad(lens.cumsum(0), (1, 0)).cuda()
-        chunk_indices, chunk_offsets = _chunk_list(cu, int(lens.sum()), chunk_size)
-        want = prepare_chunk_indices(cu, chunk_size)
-        assert torch.equal(chunk_offsets, prepare_chunk_offsets(cu, chunk_size)), num_seqs
-        assert torch.equal(chunk_indices[: want.shape[0]], want), num_seqs
-        past = chunk_indices[want.shape[0] :].cpu()
-        assert (past[:, 0] == num_seqs - 1).all(), num_seqs
-        assert (past[:, 1] * chunk_size >= int(lens[-1])).all(), num_seqs
-        assert num_seqs > 1 or past.numel() == 0
+        steps = int(lens.sum()) * num_householder
+        cu_steps, lists = _chunk_lists(cu, num_householder, steps, sizes)
+        assert cu_steps.dtype == torch.long
+        assert torch.equal(cu_steps, cu.long() * num_householder), num_seqs
+        for size, (chunk_indices, chunk_offsets) in zip(sizes, lists):
+            want = prepare_chunk_indices(cu_steps, size)
+            assert torch.equal(chunk_offsets, prepare_chunk_offsets(cu_steps, size)), num_seqs
+            assert torch.equal(chunk_indices[: want.shape[0]], want), num_seqs
+            past = chunk_indices[want.shape[0] :].cpu()
+            assert (past[:, 0] == num_seqs - 1).all(), num_seqs
+            assert (past[:, 1] * size >= int(lens[-1]) * num_householder).all(), num_seqs
+            assert num_seqs > 1 or past.numel() == 0
 
 
 def test_the_call_never_waits_for_the_device() -> None:

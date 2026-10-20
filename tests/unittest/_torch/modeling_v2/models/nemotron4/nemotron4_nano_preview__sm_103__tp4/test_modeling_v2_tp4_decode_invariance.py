@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test (one 4-GPU node): the nemotron4 tp4 decode step is batch-invariant on every rank, on
-real weights and real cache state.
+"""GPU test (one 4-GPU node): how far the nemotron4 tp4 decode step moves with its batch on every
+rank, on real weights and real cache state.
+
+A request's decode step runs cuBLAS and ``thop_attention``'s generation kernels, which pick their
+kernels by the batch, so its logits and the state it writes move with the batch it runs in. Each
+probe's step in eager and padded CUDA-graph batches is held to its step alone within bands derived
+from measurement (the job's ``LOGIT_BAND`` and the rest, stated there); every rank holds the same
+bits of it, and the padding rows write no slot, exactly.
 
 Collected entry point of ``_tp4_decode_invariance_ranks.py`` beside it, which says what runs and
 how. That job runs its four ranks as an MPI world under ``mpirun``, the way a tensor-parallel
@@ -108,51 +114,46 @@ def test_reference_rows_are_real(report):
 
 @pytest.mark.no_xdist
 def test_every_rank_forms_the_same_logits_and_kv(report):
-    """Every rank forms each probe's logits from the same hidden state with the whole lm_head and
-    appends the K/V of the one KV head every rank keeps: the four ranks agree bit for bit. With
-    the tests below, every rank's rows in every batch are then the same bits."""
+    """Every rank forms each probe's logits over the whole vocabulary from the same hidden state
+    (vocab-parallel and gathered for a few rows, the whole lm_head above) and appends the K/V of
+    the one KV head every rank keeps: the four ranks agree bit for bit, alone here and in every
+    batch of the tests below."""
     failures = _failures(report, "every_rank_forms_the_same_logits_and_kv")
     assert not failures, "\n".join(failures)
 
 
 @pytest.mark.no_xdist
-def test_eager_rows_do_not_depend_on_the_batch(report):
-    """Every probe inside eager decode batches of every size up to 1024, on every rank: the same
-    logits, recurrent and conv state and appended K/V as alone."""
-    failures = _failures(report, "eager_rows_do_not_depend_on_the_batch")
-    assert not failures, "\n".join(failures[:40])
-
-
-@pytest.mark.no_xdist
-def test_graph_rows_equal_the_eager_row(report):
-    """Every probe inside padded CUDA-graph decode batches of every size up to 1024, on every
-    rank: the same bits as alone and eager, and the padding rows write no slot."""
-    failures = _failures(report, "graph_rows_equal_the_eager_row")
-    assert not failures, "\n".join(failures[:40])
-
-
-@pytest.mark.no_xdist
-def test_attention_is_within_band_of_thop_attention(report):
-    """On a 64-row eager step in every attention layer of every rank: the invariant entry's append
-    is the qkv GEMM's K/V, thop_attention's append writes the same bytes, and the two outputs
-    over the rank's 4 query heads are within 4 element / 1.41 rms bf16 ulp of each other (each
-    kernel within 2 element ulp of an fp32 reference; relative RMS 0.64 and 0.77 ulp)."""
-    failures = _failures(report, "attention_is_within_band_of_thop_attention")
+def test_decode_attends_through_thop_and_appends_each_rows_kv(report):
+    """A decode step's eight attention layers run ``thop_attention`` and nothing else, on every
+    rank, and on a 64-row eager step each row's K and V land where the manager's page table puts
+    its token: the K and V columns of its qkv row, bit for bit."""
+    failures = _failures(report, "decode_attends_through_thop_and_appends_each_rows_kv")
     assert not failures, "\n".join(failures)
 
 
 @pytest.mark.no_xdist
-@pytest.mark.parametrize("rival", ["cublas_mm", "thop_attention", "nccl_allreduce"])
-def test_the_replaced_paths_depend_on_the_batch(report, rival):
-    """The comparison has teeth on this model's own state: with the decode step's GEMMs that run
-    through ``invariant_mm`` put back on ``cublas_mm``, its generation attention back on
-    ``thop_attention``, or its all-reduce on NCCL instead of the MNNVL entry, some probe's step
-    differs between its batch of one and the eager batches, on every rank. Each rival's
-    reference is that rival's own batch of one."""
-    ranks = report["checks"][f"rival_{rival}"]["ranks"]
-    moved = [found["differ"] for found in ranks]
-    assert all(moved), (
-        f"with {rival} back in the decode step, no probe's row moved with the batch on some rank "
-        f"({moved} of {ranks[0]['compared']} per rank), so the comparison cannot tell an "
-        "invariant step from a variant one there"
-    )
+def test_eager_rows_stay_within_the_band(report):
+    """Every probe inside eager decode batches of every size up to 1024, on every rank, against its
+    step alone: its logits, recurrent and conv state and appended K/V within the bands, and every
+    rank holding the same bits of its logits and K/V. The job reports the drift and every top-1
+    change with the alone step's margin there."""
+    failures = _failures(report, "eager_rows_stay_within_the_band")
+    assert not failures, "\n".join(failures[:40])
+
+
+@pytest.mark.no_xdist
+def test_graph_rows_stay_within_the_band(report):
+    """Every probe inside padded CUDA-graph decode batches of every size up to 1024, B = 1
+    included, on every rank, against its eager step alone: within the bands, every rank holding
+    the same bits, and the padding rows write no slot. The job reports, besides, each graph batch
+    against the same rows run eagerly."""
+    failures = _failures(report, "graph_rows_stay_within_the_band")
+    assert not failures, "\n".join(failures[:40])
+
+
+@pytest.mark.no_xdist
+def test_the_band_tells_a_state_one_token_off(report):
+    """A decode step from the state one token too far moves every probe's logits by more than
+    twice the logit band, on every rank (its top gaps it can move by less than the gap band)."""
+    failures = _failures(report, "the_band_tells_a_state_one_token_off")
+    assert not failures, "\n".join(failures)

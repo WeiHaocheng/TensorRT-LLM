@@ -1,40 +1,42 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test: the nemotron4 dep4 MTP verify step gives every token the bits of its decode step,
-across the attention-DP group, on real weights and real cache state, over the four GPUs of one node.
+"""GPU test: the nemotron4 dep4 MTP verify step against the decode steps of the same tokens, across
+the attention-DP group, on real weights and real cache state, over the four GPUs of one node.
 
 Under one-model MTP-Eagle (``max_draft_len`` 2) a generation row carries its last accepted token
 and two drafts, and the trunk verifies the three in one step: 3B rows through every GEMM, three
 tokens per request through attention, the GDP mixers through the verify entries, and every rank's
-tokens through the routed MoE's collectives. Greedy output with MTP on is token-identical to MTP off
-only if token j of that step gets the bits it gets as an MTP-off decode step of its own -- whatever
-batch it runs in on its rank and whatever the other three ranks run beside it: its fp32 logits, the
-K/V it appends in every attention layer, and the GDP recurrent and conv state after it in every GDP
-layer, which the verify stores in the hybrid manager's per-position buffers and the worker's commit
-(``update_mamba_states``) promotes into the slot.
+tokens through the routed MoE's collectives. A decode step runs the same entries over one token a
+row -- cuBLAS for every GEMM, ``thop_attention``'s generation kernels -- and the GDP and conv
+decode entries. cuBLAS picks its kernel by the row count, thop by the batch size, history length
+and tokens per row, the verify entries sum in their own order, and the routed MoE's window and
+reduce-scatter move with the other ranks' load, so a verify token sits near its decode step's bits
+rather than on them. It is held to its decode step as tp1's test holds it
+(``test_modeling_v2_verify_invariance.py``): within bands derived from measurement (the job's
+``LOGIT_BAND`` and the rest, stated there), its fp32 logits, its state in every GDP layer and its
+K/V in every attention layer; reported, whether its logits move from its verify alone.
 
 The measurement runs once, as a 4-rank MPI job (`_dep4_verify_invariance_job.py`, which says what
 each rank builds and runs); this module starts it, reads the records and gates them:
 
-* `test_the_combine_sums_each_tokens_partials_in_one_order`: on every split the runs make, the
-  routed MoE's fp32 reduce-scatter adds a token's four partials in one order;
 * `test_reference_rows_are_real`: what the runs are compared against is worth comparing;
-* `test_verify_rows_equal_the_decode_rows`, per group of runs: every probe's three verify tokens
-  equal its decode steps', and no run wrote a slot its rows do not own;
-* `test_commit_leaves_the_decode_state_of_the_accepted_tokens`: the worker's commit rolls back
-  exactly, on every rank and on an idle one;
+* `test_decode_and_verify_attend_through_thop`: the attention entry of both steps;
+* `test_verify_rows_within_the_band_of_decode`, per group of runs: every probe's three verify
+  tokens against its decode steps', and no run wrote a slot its rows do not own;
+* `test_commit_promotes_the_state_the_verify_stored`: the worker's commit promotes exactly the
+  verified state, on every rank and on an idle one;
 * `test_verify_at_the_length_limit`: the longest history a verify starts from;
-* `test_the_verify_rows_move_with_cublas`: the comparison has teeth on this model's state;
+* `test_the_band_tells_a_state_one_token_off`: the bands have teeth;
+* `test_the_drift_over_consecutive_verifies`: MTP on along MTP off's own tokens, the deviation
+  dep4's MTP identity and acceptance gates rest on;
 * `test_the_mtp_layer_drafts_as_prefill_drafts`: the MTP layer's draft step, its MoE across the
-  ranks, is the same in both targets, and the decode target's row-invariant MoE is not handed its
-  weights.
+  ranks, in both targets.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -95,31 +97,6 @@ def measured(tmp_path_factory) -> dict:
 
 
 @pytest.mark.gpu4
-def test_the_combine_sums_each_tokens_partials_in_one_order(measured) -> None:
-    """The routed MoE's combine -- the catalog `reducescatter` on fp32 partials of the MoE width,
-    sizes None when the ranks' counts agree, else the counts -- returns each token's sum of its
-    four partials in one order on every split the verify runs make, padded and ragged, eager and
-    replayed: the ring chain ((P[r+1] + P[r+2]) + P[r+3]) + P[r] that ends at the token's own rank,
-    bit for bit. Verify steps send three rows per request through it, so their splits are not the
-    decode steps'. That order is NCCL's algorithm choice on this node rather than a promise of the
-    op; if this fails, the order changed and a verify token's bits follow the other ranks' loads.
-    The chain is told apart from ascending rank order on every split on every rank but the last,
-    where the two orders coincide."""
-    records = measured["combine"]
-    assert len(records) == J.WORLD_SIZE * len(J.combine_layouts())
-    off = [r for r in records if r["ring_equal"] != 1.0]
-    distinct = [r for r in records if r["rank"] < J.WORLD_SIZE - 1]
-    print(
-        f"combine: {len(records) - len(off)} of {len(records)} rank records equal the ring chain "
-        f"bitwise; ascending order equals it on {min(r['ascending_equal'] for r in distinct):.3f}"
-        f"-{max(r['ascending_equal'] for r in distinct):.3f} of elements on ranks 0-2"
-    )
-    assert not off, f"the combine left the ring chain on {off[:8]}"
-    blind = [r for r in distinct if r["ascending_equal"] == 1.0]
-    assert not blind, f"the payload cannot tell the ring chain from ascending order on {blind[:8]}"
-
-
-@pytest.mark.gpu4
 def test_reference_rows_are_real(measured) -> None:
     """The reference -- each probe's three MTP-off decode steps alone on its rank, the other ranks
     idle -- is worth comparing against: finite logits, non-zero state in every GDP layer of its
@@ -136,17 +113,28 @@ def test_reference_rows_are_real(measured) -> None:
 
 
 @pytest.mark.gpu4
+def test_decode_and_verify_attend_through_thop(measured) -> None:
+    """The trunk's attention layers run `thop_attention` in a decode step (one token a row) and in
+    a verify step (three), and nothing else, on every rank."""
+    records = measured["attention"]
+    assert sorted(r["rank"] for r in records) == list(range(J.WORLD_SIZE))
+    for r in records:
+        assert r["decode"] == [1] * r["layers"], f"rank {r['rank']}: decode {r['decode']}"
+        assert r["verify"] == [J.TOKENS] * r["layers"], f"rank {r['rank']}: verify {r['verify']}"
+
+
+@pytest.mark.gpu4
 @pytest.mark.parametrize("group", J.GROUPS)
-def test_verify_rows_equal_the_decode_rows(measured, group) -> None:
-    """Every probe in every run of `group` (eager or padded-graph verify batches on its rank, the
-    other ranks idle, verifying, decoding or prefilling): each of its three verify tokens has the
-    bits of its decode step -- logits, the stored state in all 32 GDP layers, the K/V in all 8
-    attention layers. A verify writes no slot, nor does a placeholder row (padding, the
-    attention-DP dummy); a decoding rank writes only its rows' slots, a prefilling one only its
-    loader's. Prints the counts (`-s`)."""
+def test_verify_rows_within_the_band_of_decode(measured, group) -> None:
+    """Every probe in every run of `group` (its verify alone with every entry's guard on, then
+    eager or padded-graph verify batches on its rank, the other ranks idle, verifying, decoding or
+    prefilling): each of its three verify tokens within the bands of its decode step. A verify
+    writes no slot, nor does a placeholder row (padding, the attention-DP dummy); a decoding rank
+    writes only its rows' slots, a prefilling one only its loader's. Prints the worst case of each
+    compared quantity and how many probe rows move from their verify alone (`-s`)."""
     runs = [r for r in measured["runs"] if r["group"] == group]
     compared = sum(r["compared"] for r in runs)
-    diffs = [d for r in runs for d in r["diffs"]]
+    failures = [f for r in runs for f in r["failures"]]
     leaks = [
         f"{r['step']} rank {r['rank']} ({r['kind']}): slots {r['illegal_writes']}"
         for r in runs
@@ -154,23 +142,33 @@ def test_verify_rows_equal_the_decode_rows(measured, group) -> None:
     ]
     steps = {r["step"] for r in runs}
     sizes = sorted({r["graph_size"] for r in runs if r["graph_size"]})
+    worst = [r["worst"] for r in runs if r["worst"]]
+    summary = (
+        ", ".join(f"{key} {max(w[key] for w in worst):.4g}" for key in J.WORST_KEYS)
+        if worst
+        else "none"
+    )
+    flips = [m for w in worst for m in w["flip_margins"]]
     print(
         f"{group}: {len(steps)} steps, {len(runs) // J.WORLD_SIZE} lockstep runs, "
-        f"{compared} probe rows ({compared * J.TOKENS} tokens) compared, {len(diffs)} differences"
+        f"{compared} probe rows ({compared * J.TOKENS} tokens) compared; worst {summary}; "
+        f"{len(flips)} top-1 changes at decode margins {[round(m, 4) for m in flips]}; "
+        f"{sum(r['moved'] for r in runs)} probe rows move from their verify alone, max |logit "
+        f"diff| {max(r['moved_logit'] for r in runs):.4f}"
         + (f", graph sizes {sizes}" if sizes else "")
     )
     assert compared > 0, f"{group}: no probe row was compared"
-    assert not diffs, "\n".join(diffs[:40])
+    assert not failures, "\n".join(failures[:40])
     assert not leaks, "runs wrote slots their rows do not own:\n" + "\n".join(leaks[:20])
 
 
 @pytest.mark.gpu4
-def test_commit_leaves_the_decode_state_of_the_accepted_tokens(measured) -> None:
+def test_commit_promotes_the_state_the_verify_stored(measured) -> None:
     """After a padded graph verify (15 rows in the graph of 16 on every rank, then with the last
     rank idle: the attention-DP dummy and padding), the worker's commit (`update_mamba_states` with
-    the engine's own slots, the dummies' included) leaves in each probe's slot the state its decode
-    steps reach over its accepted tokens -- one, two or three -- in every GDP layer, and writes no
-    slot outside the step's rows'."""
+    the engine's own slots, the dummies' included) leaves in each probe's slot exactly the state
+    the verify stored for its last accepted token -- one, two or three -- in every GDP layer,
+    within the state bands of its decode steps'. It writes no slot outside the step's rows'."""
     records = measured["commit"]
     assert len(records) == 2 * J.WORLD_SIZE, len(records)
     failures = [f for r in records for f in r["failures"]]
@@ -178,7 +176,8 @@ def test_commit_leaves_the_decode_state_of_the_accepted_tokens(measured) -> None
     for r in records:
         print(
             f"commit rank {r['rank']}{' (idle)' if r['idle'] else ''}: {r['rows']} rows, probes "
-            f"accepted {r['accepted']}, real slots written {len(r['real_written'])}"
+            f"accepted {r['accepted']}, real slots written {len(r['real_written'])}, recurrent / "
+            f"conv state {r['ssm']:.3g} / {r['conv']:.3g} of max |decode|"
         )
     assert {n for r in records for n in r["accepted"]} == {1, 2, 3}
     assert not failures, "\n".join(failures[:40])
@@ -190,64 +189,90 @@ def test_commit_leaves_the_decode_state_of_the_accepted_tokens(measured) -> None
 @pytest.mark.gpu4
 def test_verify_at_the_length_limit(measured) -> None:
     """A request whose last accepted token is its `MAX_SEQ_LEN - 1`-th, the longest history a
-    verify starts from, verifies two drafts on every rank: its lengths reach `MAX_SEQ_LEN + 1`. The
-    cache manager's `max_seq_len` -- which the attention entry is handed and sizes its grid from --
-    counts the drafts, so the entry's guard accepts the call; at the bare `MAX_SEQ_LEN` it refuses
-    it. The verify, alone and in a padded graph beside two probes, gives each token the bits of its
-    decode step."""
+    verify starts from, verifies two drafts on every rank: its lengths reach `MAX_SEQ_LEN + 1`.
+    The cache manager's `max_seq_len` -- which thop_attention is handed as its bound and as its
+    attention window -- counts the drafts, so the window holds every key; a window of the bare
+    `MAX_SEQ_LEN` would drop the oldest. The verify, alone and in a padded graph beside two
+    probes, keeps each token within the bands of its decode step."""
     records = measured["limit"]
     assert len(records) == J.WORLD_SIZE
     for r in records:
-        print(
-            f"limit rank {r['rank']}: lengths up to {r['longest']}, max_seq_len {r['bound']} "
-            f"(net {J.MAX_SEQ_LEN}), {r['compared']} rows compared"
+        worst = ", ".join(
+            f"{key} {max(w[key] for w in r['worst']):.4g}" for key in J.WORST_KEYS if r["worst"]
         )
-        assert r["longest"] == J.MAX_SEQ_LEN + J.DRAFT - 1 and r["bound"] >= r["longest"], r
-        assert r["refused_at_bare_limit"] and r["finite"], r
+        print(
+            f"limit rank {r['rank']}: lengths up to {r['longest']}, max_seq_len {r['bound']}, "
+            f"attention window {r['window']} (net {J.MAX_SEQ_LEN}), {r['compared']} rows compared; "
+            f"worst {worst}"
+        )
+        assert r["longest"] == J.MAX_SEQ_LEN + J.DRAFT - 1, r
+        assert min(r["bound"], r["window"]) >= r["longest"] > J.MAX_SEQ_LEN, r
+        assert r["finite"], r
         assert r["compared"] == 4, r
-        assert not r["diffs"], "\n".join(r["diffs"][:40])
+        assert not r["failures"], "\n".join(r["failures"][:40])
 
 
 @pytest.mark.gpu4
-def test_the_verify_rows_move_with_cublas(measured) -> None:
-    """The comparison has teeth on this model's own state: with the GEMMs that run through
-    `invariant_mm` put back on `cublas_mm` -- what the verify ran before it was made invariant --
-    some probe's verify tokens differ from that rival's own decode steps."""
-    records = measured["rivals"]
+def test_the_band_tells_a_state_one_token_off(measured) -> None:
+    """The bands have teeth: a verify that starts from the state one token too far -- every GDP
+    slot holding the state after t0 already, as a rollback that kept a rejected draft would leave
+    it -- moves every probe's logits by more than twice the logit band, and one of its top gaps by
+    more than the gap band, each probe alone on its rank. (Measured: at least 4.546 and 0.752.)"""
+    records = measured["teeth"]
     assert len(records) == J.WORLD_SIZE
-    compared = sum(r["compared"] for r in records)
-    differ = [d for r in records for d in r["differ"]]
-    # Each line names one token ("... at row R: token J: what differs"), several per token.
-    tokens = {re.match(r"^(.*?: token \d+): ", line).group(1) for line in differ}
-    print(f"rival cublas_mm: {len(tokens)} of {compared} verify tokens differ from its own decode")
-    for line in differ[:24]:
-        print(f"  {line}")
-    assert differ, (
-        "with cublas_mm back in the verify no token moved, so the comparison cannot tell an "
-        "invariant verify from a variant one here"
+    for r in records:
+        for line in r["lines"]:
+            print(line)
+    logit = min(r["logit"] for r in records)
+    gap = min(r["gap"] for r in records)
+    print(f"one token off: at least {logit:.3f} / {gap:.3f}, bands {J.LOGIT_BAND} / {J.GAP_BAND}")
+    assert logit > 2 * J.LOGIT_BAND and gap > J.GAP_BAND, (logit, gap)
+
+
+@pytest.mark.gpu4
+def test_the_drift_over_consecutive_verifies(measured) -> None:
+    """MTP on along MTP off's own greedy tokens, as far as dep4's MTP identity gate generates:
+    each probe's 255 or 1023 tokens after t0 decoded one a step, alone on its rank (MTP off), then
+    verified three a step from the same state, alone on its rank in the padded graph of one (as
+    the identity gate runs a prompt) with every draft accepted and its state committed (MTP on);
+    the other ranks run their own probes alike. The decode leg's first tokens are the reference's.
+    At every matched position the verify's logits stay within the drift bands of the decode
+    step's, and every top-1 change sits at a decode margin within the gap band."""
+    records = measured["drift"]
+    assert len(records) == J.WORLD_SIZE
+    for r in records:
+        for line in r["lines"]:
+            print(f"drift {line}")
+    flips = [f for r in records for f in r["flips"]]
+    print(
+        f"drift: max |logit diff| {max(r['logit'] for r in records):.4f}, max top-gap shift "
+        f"{max(r['gap'] for r in records):.4f} over {sum(r['positions'] for r in records)} "
+        f"positions; top-1 changes (probe, position, decode margin): {flips}"
     )
+    failures = [f for r in records for f in r["failures"]]
+    assert not failures, "\n".join(failures[:40])
 
 
 @pytest.mark.gpu4
 def test_the_mtp_layer_drafts_as_prefill_drafts(measured) -> None:
     """The MTP layer's draft step runs the same kernels in the decode target as in the prefill
     target -- cuBLAS on `_mtp_view`'s `.t()` views, thop_attention, its MoE across the ranks sized
-    by the worker's counts -- so on a draft step of every rank's probes (t1 after the trunk's
-    hidden state of t0, over the MTP layer's KV of the prompt) the decode target's output, through
-    `MTPLayer`'s routing, equals the prefill target's bit for bit. The decode target's
-    row-invariant `_moe` reads the stored [out, in] weights, so handing it the MTP layer's views
-    misreads them; its guard says so, on every rank, before the step's first collective."""
+    by the worker's counts: on a draft step of every rank's probes (t1 after the trunk's hidden
+    state of t0, over the MTP layer's KV of the prompt), `MTPLayer` routes a decode-only step to
+    the decode target, and the draft logits of the two targets agree within the logit band."""
     records = measured["draft"]
     assert len(records) == J.WORLD_SIZE
     agree = sum(r["drafts_equal_t2"] for r in records)
     rows = sum(r["rows"] for r in records)
+    worst = max(r["logit"] for r in records)
+    print(f"draft step: decode against prefill target, max |logit diff| {worst:.4f}")
     print(f"draft step: {agree} of {rows} drafts equal the trunk's greedy t2")
     for r in records:
         assert r["finite"], r
-        assert r["decode_equals_prefill"], (
-            f"rank {r['rank']}: the decode target's MTP layer differs"
-        )
         assert r["routed_equals_decode"], (
             f"rank {r['rank']}: MTPLayer did not route to DecodeTarget"
         )
-        assert "x and weight must share K" in r["hazard_caught"], r
+        assert r["logit"] <= J.LOGIT_BAND, (
+            f"rank {r['rank']}: the decode target's draft logits {r['logit']:.4g} from the "
+            f"prefill target's"
+        )

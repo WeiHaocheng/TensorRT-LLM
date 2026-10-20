@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test (one 4-GPU node): an MTP verify step of the nemotron4 tp4 target's GDP mixer rolls
-back exactly, on every rank's own hybrid cache manager.
+back to the state MTP-off decode reaches, on every rank's own hybrid cache manager.
 
-Collected entry point of ``_tp4_mtp_rollback_ranks.py`` beside it, which says what runs and how:
-layer 0's real GDP mixer at each rank's 6 heads, through the targets' own ``_gdp`` with its real
-all-reduce, on both hybrid managers built under ``MTPDecodingConfig(max_draft_len=2)``, committed
-by the managers' own ``update_mamba_states``. The job runs its four ranks as an MPI world under
+Collected entry point of ``_tp4_mtp_rollback_ranks.py`` beside it, which says what runs and how,
+and derives its bands (``state_band`` and ``OUT_BAND``): layer 0's real GDP mixer at each rank's 6
+heads, through the targets' own ``_gdp`` with its real all-reduce, on both hybrid managers built
+under ``MTPDecodingConfig(max_draft_len=2)``, committed by the managers' own
+``update_mamba_states``. The job runs its four ranks as an MPI world under
 ``mpirun``, so it is started in a fresh interpreter: the launcher must not import
 ``tensorrt_llm``, which calls ``MPI_Init``, and an MPI-initialized process cannot start
 ``mpirun``. Each test reads its own case from the job's report, every rank's record of it.
@@ -97,20 +98,28 @@ def _records(report: dict, kind: str, case: str) -> list[dict]:
     return found
 
 
+def _separated(records: list[dict]) -> None:
+    assert all(r["distinct"] for r in records), (
+        "the states after 1, 2 and 3 tokens lie within the state band of each other, so a commit "
+        f"from the wrong position could pass: {[r['separation'] for r in records]} fp32 ulp apart"
+    )
+
+
 @pytest.mark.no_xdist
 @pytest.mark.parametrize("kind", ["v2", "v1"])
-def test_verify_then_commit_equals_decode_over_the_accepted_tokens(report, kind):
+def test_verify_then_commit_reaches_decode_over_the_accepted_tokens(report, kind):
     """A padded CUDA-graph-shaped verify step on every rank: 5 requests and 3 padding rows
     (graph batch 8), T = 3, two verify -> commit rounds covering accepted counts 1..3. Every real
-    row's committed recurrent and conv state of the rank's heads equals its slot after the
-    accepted decode steps (one token each through the same mixer); the states after one, two and
-    three tokens differ pairwise; the verify writes no slot and the commit only the step's slots;
-    the verify's output rows -- after the rank's ``out_proj`` partials met in the all-reduce --
-    are the decode steps' rows."""
+    row's committed state of the rank's heads is its slot's after the accepted decode steps (one
+    token each through the decode entries, on the verify's own in_proj output): the conv state
+    bit for bit, the recurrent state within the job's ``state_band``; the states after one, two
+    and three tokens lie farther apart than that band; the verify writes no slot and the commit
+    only the step's slots; the GDP verify entry's output rows lie within the job's ``OUT_BAND`` of
+    the decode entry's."""
     records = _records(report, kind, "padded")
     failures = [f"rank {r['rank']}: {f}" for r in records for f in r["failures"]]
     assert not failures, "\n".join(failures)
-    assert all(r["distinct"] for r in records), "the states after 1, 2 and 3 tokens coincide"
+    _separated(records)
 
 
 @pytest.mark.no_xdist
@@ -119,9 +128,10 @@ def test_mixed_step_commits_only_its_generation_rows(report, kind):
     """A mixed step on every rank: a fresh 37-token prompt (context row 0) beside 3 verify rows.
     The context row's tokens go through the prefill entries into its own slot; the generation
     rows verify from theirs, and the commit, offset past the context row, leaves the state the
-    decode entries reach over the verify rows' own in_proj output, never touching the context
-    row's slot; the output rows are the decode steps'."""
+    decode entries reach over the verify rows' own in_proj output -- the conv state bit for bit,
+    the recurrent state within ``state_band`` -- never touching the context row's slot; the GDP
+    verify entry's output rows lie within ``OUT_BAND`` of the decode entry's."""
     records = _records(report, kind, "mixed")
     failures = [f"rank {r['rank']}: {f}" for r in records for f in r["failures"]]
     assert not failures, "\n".join(failures)
-    assert all(r["distinct"] for r in records), "the states after 1, 2 and 3 tokens coincide"
+    _separated(records)

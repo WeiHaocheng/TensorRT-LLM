@@ -193,6 +193,9 @@ class MtpLayerObserver:
         layer_forward = self.layer.forward
         rmsnorm, mm = M.flashinfer_rmsnorm, M.cublas_mm
         fused, noaux = M.flashinfer_fused_add_rmsnorm, M.noaux_tc_op
+        # A target whose decode steps run their small GEMMs through the low-M entries picks
+        # them with `lowm_entry`; those GEMMs are observed as cublas_mm's are.
+        lowm = getattr(M, "lowm_entry", None)
         stage = self._stage
 
         def forward(
@@ -224,14 +227,29 @@ class MtpLayerObserver:
                 stage[role] = out.clone()
             return out
 
-        def observed_mm(mat_a, mat_b, *args, **kwargs):
-            out = mm(mat_a, mat_b, *args, **kwargs)
+        def record_mm(mat_a, mat_b, out):
             role = self.gemms.get(mat_b.data_ptr())
             if role is not None:
                 stage[role] = out.clone()
             elif mat_b.data_ptr() == self.o_proj:
                 stage["attn"], stage["o"] = mat_a.clone(), out.clone()
+
+        def observed_mm(mat_a, mat_b, *args, **kwargs):
+            out = mm(mat_a, mat_b, *args, **kwargs)
+            record_mm(mat_a, mat_b, out)
             return out
+
+        def observed_lowm(m, k, n):
+            entry = lowm(m, k, n)
+            if entry is None:
+                return None
+
+            def observed(mat_a, mat_b, *args, **kwargs):
+                out = entry(mat_a, mat_b, *args, **kwargs)
+                record_mm(mat_a, mat_b, out)
+                return out
+
+            return observed
 
         def observed_fused(x, residual, weight, eps):
             if weight.data_ptr() == self.final:
@@ -251,6 +269,8 @@ class MtpLayerObserver:
         mp.setattr(self.layer, "forward", forward)
         mp.setattr(M, "flashinfer_rmsnorm", observed_rmsnorm)
         mp.setattr(M, "cublas_mm", observed_mm)
+        if lowm is not None:
+            mp.setattr(M, "lowm_entry", observed_lowm)
         mp.setattr(M, "flashinfer_fused_add_rmsnorm", observed_fused)
         mp.setattr(M, "noaux_tc_op", observed_noaux)
 
@@ -853,12 +873,12 @@ OUTPUT_PAIRS = (
 STAGES = (
     "enorm",  # flashinfer_rmsnorm(embedding, enorm)
     "hnorm",  # flashinfer_rmsnorm(hidden, hnorm)
-    "eh_proj",  # cublas_mm(cat(e, h), eh_proj)
+    "eh_proj",  # the GEMM entry's (cat(e, h), eh_proj)
     "routed_norm",  # flashinfer_rmsnorm(x, shortcut_input_layernorm)
     "input_norm",  # flashinfer_rmsnorm(x, input_layernorm)
-    "qkv",  # cublas_mm(a, qkv)
+    "qkv",  # the GEMM entry's (a, qkv)
     "attention",  # thop_attention: the rows' queries over the cached keys and their own
-    "o_proj",  # cublas_mm(attention, o_proj)
+    "o_proj",  # the GEMM entry's (attention, o_proj)
     "residual",  # flashinfer_fused_add_rmsnorm's residual: x + o
     "pre_moe_norm",  # its normed output: pre_moe_layernorm(x + o)
     "moe",  # _moe(routed, shared) with the target's routing
@@ -1311,7 +1331,14 @@ LOGIT_BAND = 0.85
 against `R_t`, and of HF's own implementation against `R_hf_t`. Measured: target 0.419, HF
 0.379."""
 
-_NORM_BAND = (2.5, 0.12)  # measured 1.25 / 0.059: one rounding of the norm's fp32 result
+# One rounding of the norm's fp32 result, against an fp32 reference that rounds once too: the two
+# land on different bf16 neighbours only where the exact value sits within their fp32 noise of a
+# rounding midpoint. Measured 1.25 / 0.059 on every cell but one row: a depth-2 decode-walk row whose
+# scale rsqrt(mean(x^2) + eps) = 0.2181818228 lies within 2e-8 of 12/55, which puts many of its
+# products x * w * scale on exact bf16 ties. There 19 of its 3072 outputs round to the other
+# neighbour (0.22 / 0.154), each equally near the float64 result: moving the scale by 2e-7 changes
+# 18 of them. Twice that row's figure.
+_NORM_BAND = (2.5, 0.31)
 STAGE_BANDS = {
     "enorm": _NORM_BAND,
     "hnorm": _NORM_BAND,
@@ -1389,14 +1416,13 @@ def _plant_hidden_not_normed(mp, model, M) -> None:
 def _plant_routed_after_attention(mp, model, M) -> None:
     """The MoE routed on the shared expert's input -- the block's input after attention, as a
     sequential `MoE(mixer(x))` block would route -- instead of the block's input. Planted in the
-    MoE each target's MTP layer calls: `_mtp_moe` where the target keeps one for it, else `_moe`;
-    any further arguments (the collectives' sizes under attention DP) pass through."""
+    MoE each target's MTP layer calls, `_moe`; any further arguments (the collectives' sizes under
+    attention DP) pass through."""
     for target in (model.model._prefill, model.model._decode):
-        name = "_mtp_moe" if hasattr(target, "_mtp_moe") else "_moe"
-        orig = getattr(target, name)
+        orig = target._moe
         mp.setattr(
             target,
-            name,
+            "_moe",
             lambda routed, shared, m, *rest, _orig=orig: _orig(shared, shared, m, *rest),
         )
 

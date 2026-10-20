@@ -2749,6 +2749,72 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void dynamicFP4Quanti
 #endif
 }
 
+// The tanh soft-capped Relu2 alone: out = relu(c * tanh(h / c))^2, c = swiglu_limit[expert of the row], 16-bit h and
+// out (in place or not), no bias, no quantization. Element for element the arithmetic doActivationKernel runs with
+// SoftcapRelu2Adaptor. Each thread owns one 16-byte column vector of kRows consecutive rows: it finds the rows' experts
+// and caps first, then issues every row's load before any row's store. doActivationKernel's vector loads and stores
+// are ordered (and in place a store may alias the next row's load), so it keeps one load in flight per thread and pays
+// the per-row expert lookup in between.
+template <class T, int kRows>
+__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void softcapRelu2Kernel(T* output, T const* gemm_result,
+    int64_t const* expert_first_token_offset, int num_experts_per_node, int64_t inter_size, float const* swiglu_limit)
+{
+    constexpr int64_t kElems = 128 / cutlass::sizeof_bits<T>::value;
+    using Vec = cutlass::Array<T, kElems>;
+    using ComputeVec = cutlass::Array<float, kElems>;
+
+    int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+    int64_t const col = blockIdx.y * blockDim.y + threadIdx.y;
+    if (col >= inter_size / kElems)
+        return;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    for (int64_t row0 = blockIdx.x * kRows; row0 < num_valid_tokens; row0 += static_cast<int64_t>(gridDim.x) * kRows)
+    {
+        int64_t expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, row0 + 1) - 1;
+        float cap[kRows];
+#pragma unroll
+        for (int i = 0; i < kRows; ++i)
+        {
+            while (expert + 1 < num_experts_per_node && expert_first_token_offset[expert + 1] <= row0 + i)
+            {
+                ++expert;
+            }
+            cap[i] = swiglu_limit[expert];
+        }
+
+        Vec h[kRows];
+#pragma unroll
+        for (int i = 0; i < kRows; ++i)
+        {
+            if (row0 + i < num_valid_tokens)
+            {
+                h[i] = loadVec(reinterpret_cast<Vec const*>(gemm_result + (row0 + i) * inter_size) + col);
+            }
+        }
+
+#pragma unroll
+        for (int i = 0; i < kRows; ++i)
+        {
+            if (row0 + i < num_valid_tokens)
+            {
+                SoftcapRelu2Adaptor fn{};
+                fn.limit = cap[i];
+                ComputeVec const act = fn(arrayConvert<Vec, ComputeVec>(h[i]));
+                storeVec(
+                    reinterpret_cast<Vec*>(output + (row0 + i) * inter_size) + col, arrayConvert<ComputeVec, Vec>(act));
+            }
+        }
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 template <class T, class GemmOutputType, class ScaleBiasType>
 void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8_quant, ScaleBiasType const* bias,
     bool bias_is_broadcast, int64_t const* expert_first_token_offset, int num_experts_per_node, int64_t inter_size,
@@ -2769,6 +2835,41 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         : (128 / std::min(sizeof_bits<T>::value, sizeof_bits<GemmOutputType>::value));
 
     int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
+
+    // The soft-capped Relu2 with nothing else to apply (no bias, no quantization) runs softcapRelu2Kernel: the same
+    // values, with the rows' loads in flight together.
+    if constexpr (std::is_same_v<T, GemmOutputType> && !IsNVFP4 && !IsMXFP8 && sizeof_bits<T>::value == 16)
+    {
+        if (activation_type.activation_type == ActivationType::Relu2 && activation_type.swiglu_limit != nullptr
+            && bias == nullptr && fp8_quant == nullptr && prequant_scale == nullptr
+            && fp8_block_scale_out.fp8_out == nullptr)
+        {
+            constexpr int kRows = 8;
+            auto* const kernel = &softcapRelu2Kernel<T, kRows>;
+            static int32_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
+            int32_t const max_blocks_per_sm
+                = tensorrt_llm::common::getMaxActiveBlocksPerSM(kernel, ACTIVATION_THREADS_PER_BLOCK, 0);
+            int64_t const row_blocks = (expanded_num_tokens + kRows - 1) / kRows;
+            int32_t const grid_x = static_cast<int32_t>(
+                std::max<int64_t>(1, std::min<int64_t>(int64_t{sm_count} * max_blocks_per_sm, row_blocks)));
+            int32_t const grid_y = static_cast<int32_t>(
+                (num_elems_in_col + ACTIVATION_THREADS_PER_BLOCK - 1) / ACTIVATION_THREADS_PER_BLOCK);
+
+            cudaLaunchConfig_t config;
+            config.gridDim = dim3(grid_x, grid_y, 1);
+            config.blockDim = dim3(1, ACTIVATION_THREADS_PER_BLOCK, 1);
+            config.dynamicSmemBytes = 0;
+            config.stream = stream;
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+            config.numAttrs = 1;
+            config.attrs = attrs;
+            cudaLaunchKernelEx(&config, kernel, output, gemm_result, expert_first_token_offset, num_experts_per_node,
+                inter_size, activation_type.swiglu_limit);
+            return;
+        }
+    }
 
     auto doActivationKernelLauncher = [&](auto num_rows_per_cta)
     {
@@ -2823,6 +2924,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SiTuAdaptor,
                         decltype(block_scaling_type)::value, num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Relu2:
+                    // A swiglu_limit on Relu2 is its tanh soft cap (SoftcapRelu2Adaptor).
+                    if (activation_type.swiglu_limit)
+                    {
+                        return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SoftcapRelu2Adaptor,
+                            decltype(block_scaling_type)::value, num_rows_per_cta_v, false, kWriteFp8>;
+                    }
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, decltype(block_scaling_type)::value,
                         num_rows_per_cta_v, false, kWriteFp8>;
@@ -2979,6 +3086,11 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
                 case ActivationType::SiTu:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SiTuAdaptor, NVFP4_TYPE, kRows, true>;
                 case ActivationType::Relu2:
+                    if (activation_type.swiglu_limit)
+                    {
+                        return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SoftcapRelu2Adaptor, NVFP4_TYPE,
+                            kRows, true>;
+                    }
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, NVFP4_TYPE, kRows, true>;
                 default:
@@ -3840,6 +3952,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             alpha_scale_ptr_array = computeFP8DequantScale(
                 alpha_scale_ptr_array, num_experts_per_node, quant_params.groupwise.fc1.alpha, stream);
         }
+        // Relu2 with a swiglu_limit is the tanh soft-capped Relu2, which no fused GEMM epilogue implements: the GEMM
+        // adds the bias only, and the activation runs in place afterwards.
+        bool const softcap_relu2
+            = fc1_activation_type.activation_type == ActivationType::Relu2 && fc1_activation_type.swiglu_limit;
         auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{input,
             total_tokens_including_expert, fc1_expert_weights,
             /*scales*/ quant_params.groupwise.group_size > 0
@@ -3849,12 +3965,30 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc1.weight_zeros)
                 : nullptr,
             fc1_expert_biases, reinterpret_cast<OutputType*>(output), alpha_scale_ptr_array, /*occupancy*/ nullptr,
-            fc1_activation_type, expanded_num_rows, /*N*/ int64_t(fc1_out_size),
+            softcap_relu2 ? ActivationType::Identity : fc1_activation_type.activation_type, expanded_num_rows,
+            /*N*/ int64_t(fc1_out_size),
             /*K*/ hidden_size, num_experts_per_node, quant_params.groupwise.group_size, bias_is_broadcast,
             /*use_fused_moe*/ false, stream, config};
         gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 
         sync_check_cuda_error(stream);
+
+        if (softcap_relu2)
+        {
+            if constexpr (std::is_same_v<T, OutputType>)
+            {
+                doActivation<T, OutputType>(output, reinterpret_cast<OutputType const*>(output),
+                    /*fp8_quant*/ nullptr, static_cast<ScaleBiasType const*>(nullptr), bias_is_broadcast,
+                    expert_first_token_offset, num_experts_per_node, inter_size, expanded_num_rows, fc1_activation_type,
+                    quant_params, /*use_per_expert_act_scale*/ false,
+                    /*fc2_act_sf_flat*/ nullptr, stream);
+                sync_check_cuda_error(stream);
+            }
+            else
+            {
+                TLLM_CHECK_WITH_INFO(false, "Soft-capped Relu2 needs the GEMM output type to be the activation type");
+            }
+        }
     }
     else
     {

@@ -10,11 +10,11 @@ import triton.language as tl
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
-# The decode entry's tile, warp count and grid cap. Each token's update has to
-# round exactly as one `gdp_recurrent` call does, and the order of its two
-# reductions over K follows from the tile and the warps.
+# The decode entry's tile, warp count and grid cap: each token's update is one
+# `gdp_recurrent` update, and runs on the same tile.
 from .gdp_recurrent import _BLOCK_V, _MAX_GRID_ROWS, _NUM_WARPS
 
 
@@ -75,7 +75,10 @@ def _gdp_verify_kernel(
     The state tile is loaded once from the request's slot and carried through
     the T tokens in fp32 registers. Each token is `_gdp_recurrent_kernel`'s
     body, statement for statement; the state after it goes to
-    `intermediate[request, token]`, and the slot itself is never written.
+    `intermediate[request, token]`, and the slot itself is never written. A
+    padding row's masks are off: it loads zeros and stores nothing. The slot
+    and the snapshots are each touched once, so the load is evict-first and the
+    stores streaming.
     """
     i_v = tl.program_id(0)
     i_row = tl.program_id(1)
@@ -97,10 +100,10 @@ def _gdp_verify_kernel(
             + o_k[:, None] * stride_s_k
             + o_v[None, :] * stride_s_v
         )
-        b_h = tl.zeros([BK, BV], dtype=tl.float32)
-        if slot >= 0:
-            tl.device_assert(slot < num_slots, "slot out of range")
-            b_h = tl.load(p_state, mask=mask_kv, other=0.0).to(tl.float32)
+        tl.device_assert(slot < num_slots, "slot out of range")
+        b_h = tl.load(
+            p_state, mask=mask_kv & (slot >= 0), other=0.0, eviction_policy="evict_first"
+        ).to(tl.float32)
 
         for t in tl.static_range(T):
             b_g = tl.load(g + i_n * stride_g_n + t * stride_g_t + i_h * stride_g_h).to(tl.float32)
@@ -145,22 +148,30 @@ def _gdp_verify_kernel(
                 b_o.to(out.dtype.element_ty),
                 mask=mask_v,
             )
-            if slot >= 0:
-                p_snapshot = (
-                    intermediate
-                    + i_n * stride_i_n
-                    + t * stride_i_t
-                    + i_h * stride_i_h
-                    + o_k[:, None] * stride_i_k
-                    + o_v[None, :] * stride_i_v
-                )
-                tl.store(p_snapshot, b_h.to(intermediate.dtype.element_ty), mask=mask_kv)
+            p_snapshot = (
+                intermediate
+                + i_n * stride_i_n
+                + t * stride_i_t
+                + i_h * stride_i_h
+                + o_k[:, None] * stride_i_k
+                + o_v[None, :] * stride_i_v
+            )
+            tl.store(
+                p_snapshot,
+                b_h.to(intermediate.dtype.element_ty),
+                mask=mask_kv & (slot >= 0),
+                cache_modifier=".cs",
+            )
         i_row += tl.num_programs(1)
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
     """HF `l2norm`: `x * rsqrt(sum(x * x) + 1e-6)` over the head dim."""
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + 1e-6)
+
+
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_GDP_VERIFY = Launch(_gdp_verify_kernel)
 
 
 class GdpVerify(OpWrapper):
@@ -180,10 +191,10 @@ class GdpVerify(OpWrapper):
             out[t] = S^T (l2n(q[t]) * scale)         # read after the token's last step
             intermediate[request, t] = S
 
-    A request's token t output and state are, bit for bit, what the t-th of
-    T consecutive `gdp_recurrent` calls returns and leaves in the slot -- the
-    MTP-off decode of the same tokens -- so promoting snapshot `t` commits
-    exactly the state that decode would have reached. Returns `out`
+    A request's token t output and state are what the t-th of T consecutive
+    `gdp_recurrent` calls returns and leaves in the slot -- the MTP-off decode
+    of the same tokens -- each within the reference's band, so promoting
+    snapshot `t` commits the state decode would have reached. Returns `out`
     `[B, T, H, V]` in `q`'s dtype.
     """
 
@@ -195,8 +206,7 @@ class GdpVerify(OpWrapper):
     # `scale` is what the target passes for HF's `query / sqrt(key_head_dim)`.
     # q, k and v are views of the in_proj output's conv columns, a token per row:
     # a token's row stride is that output's width, 18528, a request's T times it,
-    # and the conv columns start at 1536. `decode_bits`: a cell whose tokens must
-    # get the bits of T `gdp_recurrent` calls on decode's views of the same rows.
+    # and the conv columns start at 1536.
     _NEMOTRON4 = dict(
         heads=24,
         householder=3,
@@ -205,30 +215,26 @@ class GdpVerify(OpWrapper):
         scale=128**-0.5,
         proj_width=18528,
         conv_offset=1536,
-        decode_bits=True,
     )
     # A tp4 rank runs the same mixer on 6 of the 24 heads, its in_proj output
-    # [z 384 | conv 4224 | b 18 | a 6] = 4632 wide. Triton specializes both
-    # kernels on each stride's divisibility by 16. Decode's row stride 4632 is
-    # not divisible, and neither is a draft-2 request's 3 * 4632 = 13896, so a
-    # token there rounds as its decode step does. A draft-1 request's 9264 is
-    # divisible: that compiled variant rounds the reductions otherwise, within
-    # the band of the reference but not with decode's bits (measured: in every
-    # batch of two rows or more some output or state moved).
+    # [z 384 | conv 4224 | b 18 | a 6] = 4632 wide. Triton specializes the
+    # kernel on each stride's divisibility by 16, which a request's stride
+    # T * 4632 meets at an even T and misses at an odd one, so the tp4 cells run
+    # both draft lengths.
     _NEMOTRON4_TP4 = dict(_NEMOTRON4, heads=6, proj_width=4632, conv_offset=384)
-    _NEMOTRON4_TP4_DRAFT1 = dict(_NEMOTRON4_TP4, decode_bits=False)
 
     # tokens is 1 + max_draft_len: 3 for the checkpoint's trained depth (draft
-    # length 2), 2 for draft length 1. The batch sizes are the decode CUDA graphs
-    # the target captures plus the eager size 3; a graph batch ends in one
-    # PAD_SLOT_ID padding row. The pool is a GDP layer's view in one of the two
-    # hybrid managers: "v1" (`CppMambaHybridCacheManager`) follows each slot's
-    # ssm state with its conv state, a slot stride of 221952 floats; "v2"
-    # (`MambaHybridCacheManagerV2`, the default) coalesces the 32 layers' ssm
-    # states per slot, a stride of 6291456 floats, so a slot past 341 sits more
-    # than 2^31 elements in. The two alternate along the batch sizes so each
-    # draft length meets both; at batch 512 both draft lengths run on v2, with
-    # slots that far in.
+    # length 2), 2 for draft length 1, 4 to 6 for draft lengths 3 to 5, which
+    # tp1 also runs (up to its max_batch_size). The batch sizes are the decode
+    # CUDA graphs the target captures plus the eager size 3; a graph batch ends
+    # in one PAD_SLOT_ID padding row.
+    # The pool is a GDP layer's view in one of the two hybrid managers: "v1"
+    # (`CppMambaHybridCacheManager`) follows each slot's ssm state with its conv
+    # state, a slot stride of 221952 floats; "v2" (`MambaHybridCacheManagerV2`,
+    # the default) coalesces the 32 layers' ssm states per slot, a stride of
+    # 6291456 floats, so a slot past 341 sits more than 2^31 elements in. The two
+    # alternate along the batch sizes so each draft length meets both; at batch
+    # 512 every draft length runs on v2, with slots that far in.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="draft 2, concurrency 1: one request, v2 pool",
@@ -327,6 +333,150 @@ class GdpVerify(OpWrapper):
             spec=dict(tokens=2, batch=1024, pad_rows=1, pool="v1", **_NEMOTRON4),
         ),
         Cell(
+            why="draft 3, concurrency 1: one request, v1 pool",
+            spec=dict(tokens=4, batch=1, pad_rows=0, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 2: one request and a padding row, v2 pool",
+            spec=dict(tokens=4, batch=2, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, eager batch 3 (not a power of two), v1 pool",
+            spec=dict(tokens=4, batch=3, pad_rows=0, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 4 with a padding row, v2 pool",
+            spec=dict(tokens=4, batch=4, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 8 with a padding row, v1 pool",
+            spec=dict(tokens=4, batch=8, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 16 with a padding row, v2 pool",
+            spec=dict(tokens=4, batch=16, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 32 with a padding row, v1 pool",
+            spec=dict(tokens=4, batch=32, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 64 with a padding row, v2 pool",
+            spec=dict(tokens=4, batch=64, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 128 with a padding row, v1 pool",
+            spec=dict(tokens=4, batch=128, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 256 with a padding row, v2 pool",
+            spec=dict(tokens=4, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 448 (tp1's max_batch_size), v1 pool",
+            spec=dict(tokens=4, batch=448, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 3, graph batch 512: v2 slots past 2^31 elements",
+            spec=dict(tokens=4, batch=512, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, concurrency 1: one request, v2 pool",
+            spec=dict(tokens=5, batch=1, pad_rows=0, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 2: one request and a padding row, v1 pool",
+            spec=dict(tokens=5, batch=2, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, eager batch 3 (not a power of two), v2 pool",
+            spec=dict(tokens=5, batch=3, pad_rows=0, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 4 with a padding row, v1 pool",
+            spec=dict(tokens=5, batch=4, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 8 with a padding row, v2 pool",
+            spec=dict(tokens=5, batch=8, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 16 with a padding row, v1 pool",
+            spec=dict(tokens=5, batch=16, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 32 with a padding row, v2 pool",
+            spec=dict(tokens=5, batch=32, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 64 with a padding row, v1 pool",
+            spec=dict(tokens=5, batch=64, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 128 with a padding row, v2 pool",
+            spec=dict(tokens=5, batch=128, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 256 with a padding row, v1 pool",
+            spec=dict(tokens=5, batch=256, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 448 (tp1's max_batch_size), v2 pool",
+            spec=dict(tokens=5, batch=448, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 4, graph batch 512: v2 slots past 2^31 elements",
+            spec=dict(tokens=5, batch=512, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, concurrency 1: one request, v1 pool",
+            spec=dict(tokens=6, batch=1, pad_rows=0, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 2: one request and a padding row, v2 pool",
+            spec=dict(tokens=6, batch=2, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, eager batch 3 (not a power of two), v1 pool",
+            spec=dict(tokens=6, batch=3, pad_rows=0, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 4 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=4, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 8 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=8, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 16 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=16, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 32 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=32, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 64 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=64, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 128 with a padding row, v1 pool",
+            spec=dict(tokens=6, batch=128, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 256 with a padding row, v2 pool",
+            spec=dict(tokens=6, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 448 (tp1's max_batch_size), v1 pool",
+            spec=dict(tokens=6, batch=448, pad_rows=1, pool="v1", **_NEMOTRON4),
+        ),
+        Cell(
+            why="draft 5, graph batch 512: v2 slots past 2^31 elements",
+            spec=dict(tokens=6, batch=512, pad_rows=1, pool="v2", **_NEMOTRON4),
+        ),
+        Cell(
             why="tp4 rank, draft 2, concurrency 1: one request, v2 pool",
             spec=dict(tokens=3, batch=1, pad_rows=0, pool="v2", **_NEMOTRON4_TP4),
         ),
@@ -376,27 +526,27 @@ class GdpVerify(OpWrapper):
         ),
         Cell(
             why="tp4 rank, draft 1, concurrency 1: one request, v1 pool",
-            spec=dict(tokens=2, batch=1, pad_rows=0, pool="v1", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=1, pad_rows=0, pool="v1", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, graph batch 2 with a padding row, v2 pool",
-            spec=dict(tokens=2, batch=2, pad_rows=1, pool="v2", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=2, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, eager batch 3, v2 pool",
-            spec=dict(tokens=2, batch=3, pad_rows=0, pool="v2", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=3, pad_rows=0, pool="v2", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, graph batch 64 with a padding row, v1 pool",
-            spec=dict(tokens=2, batch=64, pad_rows=1, pool="v1", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=64, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, graph batch 256 with a padding row, v2 pool",
-            spec=dict(tokens=2, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=256, pad_rows=1, pool="v2", **_NEMOTRON4_TP4),
         ),
         Cell(
             why="tp4 rank, draft 1, graph batch 1024 with a padding row, v1 pool",
-            spec=dict(tokens=2, batch=1024, pad_rows=1, pool="v1", **_NEMOTRON4_TP4_DRAFT1),
+            spec=dict(tokens=2, batch=1024, pad_rows=1, pool="v1", **_NEMOTRON4_TP4),
         ),
     )
 
@@ -425,32 +575,18 @@ class GdpVerify(OpWrapper):
     that share a slot are harmless here, unlike in `gdp_recurrent`: the slot
     is only read.
 
-    Bit-identical to T `gdp_recurrent` calls on the same tokens, outputs and
-    states, for every real request: each token is that kernel's body with its
-    tile and warp count, and the state between tokens stays in fp32 registers,
-    the value the pool round trip would have stored and reloaded. A change to
-    either kernel's arithmetic or tiling breaks that, and so can a change in
-    how Triton compiles the same statements: the token loop rolled
-    (`tl.range`) instead of unrolled moved the snapshots' bits at a single
-    request. The entry's test compares the two bit for bit. A padding row
-    differs from its second token on, since a decode call restarts it from
-    zero and keeps nothing.
+    Each token runs `gdp_recurrent`'s update with its tile and warp count, and
+    the state between tokens stays in fp32 registers, the value the pool round
+    trip would have stored and reloaded. The test holds the verify and its
+    snapshots to the reference, not to the decode entry's bits: the two kernels
+    may round apart, and Triton specializes each on its strides' divisibility
+    by 16, which a request's stride and a decode row's need not share.
 
-    The bits hold only where both kernels compile alike: Triton specializes
-    them on each stride's divisibility by 16. Every stride a token's q, k and v
-    are read through -- the request's here, the row's in a decode call -- has
-    to agree in it with decode's row stride. tp1's in_proj width 18528 and every
-    multiple of it are divisible; a tp4 rank's 4632 is not, and neither is a
-    draft-2 request's 13896, but a draft-1 request's 9264 is (and a draft-3
-    request's 18528). There the verify stays within the reference's band but
-    is not bitwise decode's: measured, and pinned by the entry's test. A target
-    that needs those bits at an even T has to lay its requests out at a stride
-    that is not a multiple of 16.
-
-    Uncertified: T other than 2 and 3, an intermediate whose token dim exceeds
-    T, a pool other than the two managers' layouts, and the shapes
-    `gdp_recurrent` leaves uncertified. CUDA-graph capturable: no host sync and
-    no allocation besides `out`.
+    Uncertified: T other than 2 and 3 (and 4 to 6 at tp1's geometry only, which
+    a dep4 rank shares), an intermediate whose token dim exceeds T, a pool other
+    than the two managers' layouts, and the shapes `gdp_recurrent` leaves
+    uncertified. CUDA-graph capturable: no host sync and no allocation besides
+    `out`.
     """
 
     def __call__(
@@ -473,7 +609,7 @@ class GdpVerify(OpWrapper):
         if num_rows == 0:
             return out
         grid = (triton.cdiv(value_dim, _BLOCK_V), min(num_rows, _MAX_GRID_ROWS))
-        _gdp_verify_kernel[grid](
+        _GDP_VERIFY[grid](
             q,
             k,
             v,

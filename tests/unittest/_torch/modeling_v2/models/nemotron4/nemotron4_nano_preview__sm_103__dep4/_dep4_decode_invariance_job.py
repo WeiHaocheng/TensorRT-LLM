@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The 4-rank job behind `test_modeling_v2_dep4_decode_invariance.py`: the dep4 decode step, run on
-every rank of one node on real weights and real cache state, and compared bit for bit across batch
-shapes.
+every rank of one node on real weights and real cache state, and measured across batch shapes
+against each probe's step alone.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _dep4_decode_invariance_job.py --out <json> [--checkpoint <dir>]
 
@@ -38,13 +38,19 @@ The runs (`STEPS`), all four ranks in lockstep, each rank's probes compared on t
 * padded CUDA-graph batches on one rank, the others idle (the attention-DP dummy plus padding);
 * padded CUDA-graph batches on every rank at once.
 
-Per probe, bitwise: its fp32 logits, the recurrent and conv state of its slot in the 32 GDP layers,
-and the K/V at its decoded position in the 8 attention layers (read through the manager's own page
-table). After every run, only the real rows' slots differ from the snapshot: placeholder rows write
-no state. Beside the model: the reduce-scatter's order on fp32 partials of the MoE width over every
-split the runs make (`COMBINE_LAYOUTS`), the attention entry against `thop_attention` on one step,
-and two rivals -- the replaced cuBLAS GEMMs and `thop_attention` put back -- that must move with the
-batch. Rank 0 writes every rank's records to `--out` as JSON.
+Per probe, against its reference, measured here and gated by the test's bands: its fp32 logits --
+the largest |difference|, the largest shift of a gap between the reference's top-1 and one of its
+top `TOP` tokens, both argmaxes and the reference's top-1 / top-2 margin -- and the recurrent and
+conv state of its slot in the 32 GDP layers and the K/V at its decoded position in the 8 attention
+layers (read through the manager's own page table), each as max |difference| / max |reference|.
+Each graph run is run eagerly too, on the same rows beside the same ranks, and its probes' logits
+compared. After every run, only the real rows' slots differ from the snapshot: placeholder rows
+write no state. The CUDA graphs are captured as the engine captures them: one eager forward at
+every size first, which grows the attention workspace all of them share to what the largest call
+needs, then the captures, which resize nothing. Beside the runs: on one 64-row step on every rank,
+which entry each attention layer calls and the K/V it appends; and a decode step from the state one
+token too far, each probe alone on its rank, which the bands must tell apart. Rank 0 writes every
+rank's records to `--out` as JSON.
 
 Not a pytest module: the ranks run one fixed sequence of collectives in lockstep, and neither this
 file's name nor its functions match pytest's collection patterns. The launcher must not import
@@ -174,31 +180,8 @@ STEPS: tuple[Step, ...] = (
 )
 GROUPS = tuple(dict.fromkeys(s.group for s in STEPS))
 
-RIVALS = ("cublas_mm", "thop_attention")
-"""What the decode step ran before it was made invariant: the six GEMM sites on `cublas_mm`, or
-generation attention on `thop_attention`."""
-RIVAL_SIZES = (2, 3, 8, 64, 256)
-"""Eager batch sizes the rivals run at on one rank, the others idle: cuBLAS changes kernels on
-its row-variant shapes from two rows up, and thop's KV split follows the batch."""
-
-COMBINE_LAYOUTS: tuple[tuple[int, ...], ...] = (
-    *((h,) * WORLD_SIZE for h in (1, 2, 3, 4, 8, 16, 32, 64, 100, 128, 256)),
-    (2, 1, 1, 1),
-    (1, 1, 1, 256),
-    (3, 64, 5, 256),
-    (1, 7, 16, 250),
-    (LOADER_TOKENS, 8, 1, 64),
-    (LOADER_TOKENS, LOADER_TOKENS, LOADER_TOKENS, 3),
-    (MAX_NUM_TOKENS, 1, 1, 1),
-    (1, MAX_NUM_TOKENS, 64, MAX_NUM_TOKENS),
-)
-"""Per-rank counts the routed MoE's reduce-scatter combines: every padded graph height, and the
-ragged splits of eager decode beside idle, decoding and prefilling ranks (up to the prefill steps'
-`MAX_NUM_TOKENS`). Even counts take the padded form (sizes None), the rest the ragged form."""
-COMBINE_GRAPH_HEIGHTS = (1, 8, 64, 256)
-"""Padded heights the combine is also captured and replayed at, as decode graphs run it."""
-COMBINE_WIDTH = 768
-"""The latent width the reduce-scatter combines."""
+TOP = 8
+"""The reference's top tokens whose gap to its top-1 a batched step must keep."""
 
 
 # ----------------------------------------------------------------------------------------------
@@ -318,16 +301,12 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
     assert comm.Get_size() == WORLD_SIZE, f"dep4 needs {WORLD_SIZE} ranks, got {comm.Get_size()}"
 
     # Spawned by mpirun rather than collected by pytest, so the tree's `__extra_import_path__`
-    # is not in play: the family's helpers and `_validating` are reached the plain way.
+    # is not in play: the family's helpers are reached the plain way.
     here = Path(__file__).resolve().parent
-    sys.path[:0] = [str(here.parent), str(here.parents[2])]
+    sys.path[:0] = [str(here.parent)]
 
     import _nemotron4_prompts as P
-    from _validating import ULP
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import (
-        reducescatter,
-    )
     from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__dep4 import (  # noqa: E501
         modeling as M,
     )
@@ -356,64 +335,7 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
     def bits(x: torch.Tensor) -> torch.Tensor:
         return x.view({4: torch.int32, 2: torch.int16}[x.element_size()])
 
-    group = list(range(WORLD_SIZE))
-    records: dict[str, list] = dict(combine=[], reference=[], runs=[], attention=[], rivals=[])
-
-    # ------------------------------------------------------------------------------------------
-    # The combine's order, on the MoE width, over every split the runs make
-    # ------------------------------------------------------------------------------------------
-
-    def partials(seed: int, r: int, rows: int) -> torch.Tensor:
-        g = torch.Generator(device="cuda").manual_seed(seed * 16 + r)
-        # Mixed magnitudes, as expert partial sums are.
-        scale = torch.exp(torch.randn(rows, 1, generator=g, device="cuda") * 2.0)
-        return torch.randn(rows, COMBINE_WIDTH, generator=g, device="cuda") * scale
-
-    def check_combine(name: str, counts, out: torch.Tensor, seed: int) -> None:
-        start = sum(counts[:rank])
-        mine = slice(start, start + counts[rank])
-        parts = [partials(seed, r, sum(counts))[mine] for r in range(WORLD_SIZE)]
-        ring = parts[(rank + 1) % WORLD_SIZE].clone()
-        for k in range(2, WORLD_SIZE + 1):
-            ring = ring + parts[(rank + k) % WORLD_SIZE]
-        ascending = ((parts[0] + parts[1]) + parts[2]) + parts[3]
-        records["combine"].append(
-            dict(
-                layout=name,
-                counts=list(counts),
-                rank=rank,
-                rows=counts[rank],
-                ring_equal=float((bits(out) == bits(ring)).float().mean()),
-                ascending_equal=float((bits(out) == bits(ascending)).float().mean()),
-            )
-        )
-
-    with torch.inference_mode():
-        seed = 0
-        for counts in COMBINE_LAYOUTS:
-            seed += 1
-            sizes = None if len(set(counts)) == 1 else list(counts)
-            out = reducescatter(partials(seed, rank, sum(counts)), sizes, group)
-            check_combine(f"eager {list(counts)}", counts, out, seed)
-        for height in COMBINE_GRAPH_HEIGHTS:
-            seed += 1
-            counts = (height,) * WORLD_SIZE
-            static = partials(seed + 1000, rank, sum(counts))
-            reducescatter(static, None, group)
-            torch.cuda.synchronize()
-            comm.Barrier()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                out = reducescatter(static, None, group)
-            torch.cuda.synchronize()
-            comm.Barrier()
-            static.copy_(partials(seed, rank, sum(counts)))
-            graph.replay()
-            torch.cuda.synchronize()
-            check_combine(f"graph {list(counts)}", counts, out.clone(), seed)
-            del graph
-            comm.Barrier()
-    say(f"combine: {len(records['combine'])} records on rank 0")
+    records: dict[str, list] = dict(reference=[], runs=[], attention=[], teeth=[])
 
     # ------------------------------------------------------------------------------------------
     # The target, its cache manager and metadata, the requests
@@ -552,6 +474,12 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
         then `prepare()`, then every rank's token count. Context rows feed their whole prompt;
         generation rows feed one token over the prompt already cached; the attention-DP dummy and
         `padding` rows feed one token over nothing cached (one key: their own page)."""
+        # The cache manager stages a step's block-table gather index in one pinned host buffer
+        # that the device reads only when the step's copy runs (`IndexMapper::getCopyIndex`): a
+        # step filled while an earlier one is still queued would hand the earlier one its rows,
+        # and that step's K/V appends would land in another request's pages. So the device
+        # drains first.
+        torch.cuda.synchronize()
         placeholders = int(adp_dummy) + padding
         if not meta.is_cuda_graph:
             meta.seq_lens = torch.tensor(
@@ -658,35 +586,41 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             kv=torch.stack([kv_at(r, i) for i in attention_layers]),
         )
 
-    def differences(got: dict, ref: dict) -> list:
-        out = []
-        if not torch.equal(bits(got["logits"]), bits(ref["logits"])):
-            diff = (got["logits"] - ref["logits"]).abs()
-            out.append(
-                f"logits: {int((diff > 0).sum())} of {diff.numel()} differ, max |diff| "
-                f"{float(diff.max()):.3e}, argmax {int(got['logits'].argmax())} vs "
-                f"{int(ref['logits'].argmax())}"
-            )
-        for name in ("ssm", "conv"):
-            bad = [
-                layer
-                for layer, a, b in zip(gdp_layers, got[name], ref[name])
-                if not torch.equal(bits(a), bits(b))
-            ]
-            if bad:
-                out.append(f"{name} state differs in GDP layers {bad}")
-        bad = [
-            layer
-            for layer, a, b in zip(attention_layers, got["kv"], ref["kv"])
-            if not torch.equal(bits(a), bits(b))
-        ]
-        if bad:
-            out.append(f"appended K/V differs in attention layers {bad}")
-        return out
+    def relative(got: torch.Tensor, ref: torch.Tensor) -> float:
+        """max |got - ref| / max |ref|."""
+        ref = ref.float()
+        return float((got.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-30))
+
+    def logit_drift(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
+        """`(max |got - ref|, the largest change of a gap between ref's top-1 and one of its top
+        TOP)`: the second bounds how far `got` can tip a choice `ref` made among its top tokens."""
+        diff = got - ref
+        top = ref.topk(TOP).indices
+        shift = diff[top] - diff[top[0]]
+        return float(diff.abs().max()), float(shift.abs().max())
+
+    def margin_of(logits: torch.Tensor) -> float:
+        """The top-1 minus top-2 logit: how close a greedy choice is to a tie."""
+        two = logits.topk(2).values
+        return float(two[0] - two[1])
+
+    def drift(got: dict, ref: dict) -> dict:
+        """A probe's decode step against the same step alone, in every layer."""
+        logit, gap = logit_drift(got["logits"], ref["logits"])
+        return dict(
+            logit=logit,
+            gap=gap,
+            ssm=max(relative(a, b) for a, b in zip(got["ssm"], ref["ssm"])),
+            conv=max(relative(a, b) for a, b in zip(got["conv"], ref["conv"])),
+            kv=max(relative(a, b) for a, b in zip(got["kv"], ref["kv"])),
+            argmax=[int(got["logits"].argmax()), int(ref["logits"].argmax())],
+            margin=margin_of(ref["logits"]),
+        )
 
     graphs: dict[int, tuple] = {}
     graph_pool = torch.cuda.graph_pool_handle()
     static_ids = torch.zeros(max(GRAPH_SIZES), dtype=torch.int, device="cuda")
+    workspace = {}
 
     def run_eager(run: Run, counts: list) -> torch.Tensor:
         """One eager step: this rank's decode rows, its loader's prefill, or the attention-DP
@@ -699,17 +633,28 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
         fill(md, [], run.rows, adp_dummy=idle, padding=0, counts=counts)
         return model.forward(attn_metadata=md, input_ids=input_ids([], run.rows, int(idle)))
 
-    def run_graph(run: Run) -> torch.Tensor:
-        """One step replayed in the captured graph of `run.graph_size`, this rank's rows (or the
-        attention-DP dummy) padded with the padding dummy's rows; the real rows' logits."""
-        size = run.graph_size
-        idle = not run.rows
-        padding = size - len(run.rows) - int(idle)
-        counts = [size] * WORLD_SIZE
-        if size not in graphs:
+    def capture_graphs() -> None:
+        """Capture the decode step at every size of GRAPH_SIZES on every rank, in lockstep, as
+        the runner does: first one eager forward on every size's own CUDA-graph metadata, which
+        grows the attention workspace all of them share to what the largest call needs --
+        thop_attention resizes it in place when a call needs more -- then at each size two
+        warmup forwards and the capture, which resize nothing. A resize after a capture would
+        move the workspace under the graph, which keeps its old address."""
+        rows = probes + fillers
+        metadata = {}
+        for size in sorted(GRAPH_SIZES, reverse=True):
             gmd = md.create_cuda_graph_metadata(size, False, 0, get_memory_buffers())
-            fill(gmd, [], run.rows, adp_dummy=idle, padding=padding, counts=counts)
-            static_ids[:size].copy_(input_ids([], run.rows, int(idle) + padding))
+            fill(gmd, [], rows[:size], adp_dummy=False, padding=0, counts=[size] * WORLD_SIZE)
+            static_ids[:size].copy_(input_ids([], rows[:size], 0))
+            model.forward(attn_metadata=gmd, input_ids=static_ids[:size])
+            metadata[size] = gmd
+        torch.cuda.synchronize()
+        comm.Barrier()
+        workspace["address"] = metadata[max(GRAPH_SIZES)].cuda_graph_workspace.data_ptr()
+        for size in GRAPH_SIZES:
+            gmd = metadata[size]
+            fill(gmd, [], rows[:size], adp_dummy=False, padding=0, counts=[size] * WORLD_SIZE)
+            static_ids[:size].copy_(input_ids([], rows[:size], 0))
             ids = static_ids[:size]
             for _ in range(2):
                 model.forward(attn_metadata=gmd, input_ids=ids)
@@ -721,9 +666,23 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
             torch.cuda.synchronize()
             comm.Barrier()
             graphs[size] = (gmd, graph, out)
-        gmd, graph, out = graphs[size]
+        assert gmd.cuda_graph_workspace.data_ptr() == workspace["address"], (
+            "a capture resized the attention workspace"
+        )
         restore()
-        fill(gmd, [], run.rows, adp_dummy=idle, padding=padding, counts=counts)
+
+    def run_graph(run: Run) -> torch.Tensor:
+        """One step replayed in the captured graph of `run.graph_size`, this rank's rows (or the
+        attention-DP dummy) padded with the padding dummy's rows; the real rows' logits."""
+        size = run.graph_size
+        idle = not run.rows
+        padding = size - len(run.rows) - int(idle)
+        gmd, graph, out = graphs[size]
+        assert gmd.cuda_graph_workspace.data_ptr() == workspace["address"], (
+            "the attention workspace moved under the captured graphs"
+        )
+        restore()
+        fill(gmd, [], run.rows, adp_dummy=idle, padding=padding, counts=[size] * WORLD_SIZE)
         static_ids[:size].copy_(input_ids([], run.rows, int(idle) + padding))
         graph.replay()
         return out[: len(run.rows)]
@@ -807,34 +766,36 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                             argmax=int(ref["logits"].argmax()),
                         )
                     )
-    say(f"reference: {len(probes)} probes alone on every rank")
+        capture_graphs()
+    say(f"reference: {len(probes)} probes alone on every rank; graphs captured at {sorted(graphs)}")
 
-    def run_and_compare(run: Run, counts: list, ref: dict, what: str) -> dict:
-        """Run `run`, compare its probes with `ref`, and list the slots no real row owns that
-        the run wrote."""
+    def run_and_compare(run: Run, counts: list) -> dict:
+        """Run `run`, measure its probes against their references (`drift`), and list the slots
+        no real row owns that the run wrote. A graph run is then run eagerly on the same rows,
+        every rank its own count (`counts`), and its probes' logits are compared with the
+        graph's."""
         logits = execute(run, counts)
-        diffs, differing = [], 0
+        drifts = []
         for pos in run.probes:
             r = run.rows[pos]
-            found = differences(row(r, logits[pos]), ref[r.rid])
-            differing += bool(found)
-            diffs += [f"{what}, rank {rank}, {r.name} at row {pos}: {d}" for d in found]
+            found = drift(row(r, logits[pos]), reference[r.rid])
+            drifts.append(dict(probe=r.name, row=pos, **found))
         written = changed_slots()
         real = {slot[r.rid] for r in run.rows}
         if run.prefill:
             real.add(slot[loader.rid])
-        return dict(
-            compared=len(run.probes),
-            differing=differing,
-            diffs=diffs,
-            placeholder_writes=sorted(written - real),
-        )
+        legs = []
+        if run.graph_size:
+            replayed = [logits[pos].clone() for pos in run.probes]
+            eager = run_eager(run, counts)
+            legs = [list(logit_drift(g, eager[pos])) for g, pos in zip(replayed, run.probes)]
+        return dict(drifts=drifts, legs=legs, placeholder_writes=sorted(written - real))
 
     # --- every step ---
     with torch.inference_mode():
         for step in STEPS:
             for counts, run in expand(step):
-                result = run_and_compare(run, counts, reference, step.name)
+                result = run_and_compare(run, counts)
                 records["runs"].append(
                     dict(
                         step=step.name,
@@ -846,116 +807,73 @@ def _rank_body(out_path: str, checkpoint_path: str) -> None:
                         **result,
                     )
                 )
-    say(f"runs: {len(records['runs'])} on rank 0, graphs captured at {sorted(graphs)}")
+    say(f"runs: {len(records['runs'])} on rank 0")
 
-    # --- the attention entry against thop_attention, on one 64-row step on every rank ---
+    # --- decode attention, on one 64-row step on every rank: the entry, the K/V it appends ---
     d = core._decode._d
     k_cols = slice(d.q_width, d.q_width + d.head_dim)
     v_cols = slice(d.q_width + d.head_dim, d.q_width + 2 * d.head_dim)
-    original = M.invariant_gen_attention
-    calls = []
-    rows64 = batches_of(64)[0][0]
+    original = M.thop_attention
+    ((rows64, positions64),) = batches_of(64)
 
-    def both(**kwargs):
+    def recorded(**kwargs):
         out = original(**kwargs)
-        q, num_rows = kwargs["q"], kwargs["q"].shape[0]
+        q = kwargs["q"]
         layer = next(
             i for i in attention_layers if manager.layer_offsets[i] == kwargs["local_layer_idx"]
         )
-        ours = out[:num_rows].clone()
-        appended = torch.stack([kv_at(r, layer) for r in rows64 if r.rid in pages])
-        theirs = M.thop_attention(
-            q=q,
-            output=torch.empty_like(out),
-            local_layer_idx=kwargs["local_layer_idx"],
-            num_heads=kwargs["num_heads"],
-            num_kv_heads=kwargs["num_kv_heads"],
-            head_size=kwargs["head_size"],
-            **core._prefill.step_args(md)["attention"],
-            **M._CALL_CONSTANTS,
-        )
-        after_thop = torch.stack([kv_at(r, layer) for r in rows64 if r.rid in pages])
-        probe_rows = [p for p, r in enumerate(rows64) if r.rid in pages]
-        expected = torch.stack([q[probe_rows, k_cols], q[probe_rows, v_cols]], dim=1)
-        diff = (ours.float() - theirs[:num_rows].float()).abs()
-        scale = theirs[:num_rows].float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-9)
+        appended = torch.stack([kv_at(rows64[p], layer) for p in positions64])
+        expected = torch.stack([q[positions64, k_cols], q[positions64, v_cols]], dim=1)
         records["attention"].append(
             dict(
                 rank=rank,
                 layer=layer,
+                q_rows=int(q.shape[0]),
                 appended_is_qkv=bool(torch.equal(bits(appended), bits(expected))),
-                thop_reappend_same=bool(torch.equal(bits(after_thop), bits(appended))),
-                element_ulp=float((diff / scale).max()) / ULP[torch.bfloat16],
-                rms_ulp=float(
-                    diff.pow(2).mean().sqrt() / theirs[:num_rows].float().pow(2).mean().sqrt()
-                )
-                / ULP[torch.bfloat16],
             )
         )
-        calls.append(layer)
         return out
 
-    M.invariant_gen_attention = both
+    M.thop_attention = recorded
     try:
         with torch.inference_mode():
-            run = Run(step="attention band", group="attention", graph_size=None)
-            run.rows, run.probes = rows64, []
+            run = Run(step="attention", group="attention", graph_size=None)
+            run.rows, run.probes = rows64, positions64
             execute(run, [64] * WORLD_SIZE)
     finally:
-        M.invariant_gen_attention = original
-    assert len(calls) == len(attention_layers), calls
-    say("attention: every rank's 64-row step against thop_attention")
+        M.thop_attention = original
+    say("attention: every rank's 64-row step through thop_attention")
 
-    # --- rivals: the replaced paths put back must move some probe with the batch ---
-    for rival in RIVALS:
-        if rival == "cublas_mm":
-            saved = ("invariant_mm", M.invariant_mm)
-
-            def replaced(x, weight, out_dtype=None):
-                return M.cublas_mm(x, weight.t(), None, out_dtype)
-
-        else:
-            saved = ("invariant_gen_attention", M.invariant_gen_attention)
-
-            def replaced(q, output, local_layer_idx, num_heads, num_kv_heads, head_size, **unused):
-                return M.thop_attention(
-                    q=q,
-                    output=output,
-                    local_layer_idx=local_layer_idx,
-                    num_heads=num_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                    **core._prefill.step_args(md)["attention"],
-                    **M._CALL_CONSTANTS,
-                )
-
-        setattr(M, saved[0], replaced)
-        try:
-            with torch.inference_mode():
-                rival_ref = {}
-                for owner in range(WORLD_SIZE):
-                    for k in range(len(probes)):
-                        run = Run(step="rival reference", group="rival", graph_size=None)
-                        if rank == owner:
-                            run.rows, run.probes = [probes[k]], [0]
-                        logits = execute(run, [1] * WORLD_SIZE)
-                        if rank == owner:
-                            rival_ref[probes[k].rid] = row(probes[k], logits[0])
-                differ, compared, differing = [], 0, 0
-                for owner in range(WORLD_SIZE):
-                    for size in RIVAL_SIZES:
-                        step = Step("rival", _one_rank(size, owner), False)
-                        for counts, run in expand(step):
-                            result = run_and_compare(run, counts, rival_ref, f"B={size}")
-                            compared += result["compared"]
-                            differing += result["differing"]
-                            differ += result["diffs"]
-            records["rivals"].append(
-                dict(rival=rival, rank=rank, compared=compared, differing=differing, differ=differ)
-            )
-        finally:
-            setattr(M, *saved)
-        say(f"rival {rival} done")
+    # --- the bands' teeth: a decode step from the state one token too far, each probe alone ---
+    with torch.inference_mode():
+        smallest, smallest_gap, lines = float("inf"), float("inf"), []
+        for owner in range(WORLD_SIZE):
+            for k in range(len(probes)):
+                restore()
+                counts = [1] * WORLD_SIZE
+                if rank == owner:
+                    # Every GDP slot of the probe holds the state its own decode step left, as a
+                    # rollback that kept a rejected draft would leave it.
+                    r = probes[k]
+                    after = reference[r.rid]
+                    for i, layer in enumerate(gdp_layers):
+                        manager.get_ssm_states(layer)[slot[r.rid]] = after["ssm"][i]
+                        manager.get_conv_states(layer)[slot[r.rid]] = after["conv"][i]
+                    fill(md, [], [r], adp_dummy=False, padding=0, counts=counts)
+                    logits = model.forward(attn_metadata=md, input_ids=input_ids([], [r], 0))
+                    worst_logit, worst_gap = logit_drift(logits[0], after["logits"])
+                    smallest = min(smallest, worst_logit)
+                    smallest_gap = min(smallest_gap, worst_gap)
+                    lines.append(
+                        f"rank {rank} {r.name}: one token off moves the logits by up to "
+                        f"{worst_logit:.3f}, a top gap by up to {worst_gap:.3f}"
+                    )
+                else:
+                    fill(md, [], [], adp_dummy=True, padding=0, counts=counts)
+                    model.forward(attn_metadata=md, input_ids=input_ids([], [], 1))
+        restore()
+        records["teeth"].append(dict(rank=rank, logit=smallest, gap=smallest_gap, lines=lines))
+    say("teeth: one token off, every probe alone")
 
     # ------------------------------------------------------------------------------------------
     # Every rank's records to rank 0

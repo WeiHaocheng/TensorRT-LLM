@@ -1,29 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test: the nemotron4 dep4 decode step is batch-invariant across the attention-DP group, on
-real weights and real cache state, over the four GPUs of one node.
+"""GPU test: how far the nemotron4 dep4 decode step moves with its batch across the attention-DP
+group, on real weights and real cache state, over the four GPUs of one node.
 
-A request's decode step must give the same bits whatever batch it runs in on its own rank -- alone,
-inside a larger eager batch, or inside a padded CUDA-graph batch -- and whatever the other three
-ranks run beside it: nothing (each runs the attention-DP dummy), decode batches of their own, or a
-prefill chunk. Under attention DP all of that changes from step to step with the other ranks' load:
-whether the step runs as a graph, the graph size every rank pads to, the routed MoE's gathered
-token count, where this rank's tokens sit in it, and whether the combine runs the padded or the
-ragged collective. Compared per request: its fp32 logits, the GDP recurrent and conv state it
-writes into its slot (32 layers) and the K/V it appends (8 attention layers).
+A decode step runs its GEMMs through cuBLAS and its attention through ``thop_attention``'s
+generation kernels, and both pick their kernel by the rank's batch: cuBLAS by the row count, thop by
+the batch size and history length. The routed MoE sees every rank's tokens besides: the other ranks'
+load changes the batch the experts' windows run over and the split the reduce-scatter combines. So
+a request's decode step gives slightly different bits alone, inside a larger eager batch or a padded
+CUDA-graph batch on its rank, and beside other ranks that idle (each runs the attention-DP dummy),
+decode or prefill -- what CUDA graphs change between the two legs of a CUDA-graph on / off identity
+run, and what batching changes between a prompt alone and in a batch. This test measures how far,
+per request: its fp32 logits (the largest |difference| and the largest shift of a gap between its
+top-1 and one of its top `J.TOP` tokens), and the GDP recurrent and conv state it writes into its
+slot (32 layers) and the K/V it appends (8 attention layers), each as max |difference| / max
+|alone|. Every quantity is held to a band derived from that measurement (`LOGIT_BAND` and the
+rest). Placeholder rows -- CUDA-graph padding and the attention-DP dummy -- write no slot, exactly.
 
 The measurement runs once, as a 4-rank MPI job (`_dep4_decode_invariance_job.py`, which says what
 each rank builds and runs); this module starts it, reads the records and gates them:
 
-* `test_the_combine_sums_each_tokens_partials_in_one_order`: the routed MoE's fp32 reduce-scatter
-  returns, on every rank and every split the decode steps make (padded and ragged, eager and
-  replayed), exactly the chain ((P[r+1] + P[r+2]) + P[r+3]) + P[r] of a token's four partials;
 * `test_reference_rows_are_real`: what the runs are compared against is worth comparing;
-* `test_rows_do_not_depend_on_the_batch`, per group of runs: every probe's bits equal its
-  reference's, and no placeholder row (padding, attention-DP dummy) writes a state slot;
-* `test_attention_is_within_band_of_thop_attention`: the decode step's attention entry on this
+* `test_decode_attends_through_thop_and_appends_each_rows_kv`: the decode step's attention on this
   target's own pools;
-* `test_the_replaced_paths_depend_on_the_batch`: the comparison has teeth on this model's state.
+* `test_eager_rows_stay_within_the_band` and `test_graph_rows_stay_within_the_band`: every probe
+  against its step alone, group by group of runs, and no placeholder row writes a state slot;
+* `test_the_band_tells_a_state_one_token_off`: the bands have teeth.
 """
 
 from __future__ import annotations
@@ -45,6 +47,31 @@ import _dep4_decode_invariance_job as J  # noqa: E402 -- beside this file
 pytestmark = pytest.mark.no_xdist
 
 _JOB = Path(__file__).resolve().with_name("_dep4_decode_invariance_job.py")
+
+# The bands: how far a probe's decode step may sit from the same step alone on its rank, the other
+# ranks idle. Measured on this model's own state over every probe in every run of the job: eager
+# batches of 2 to 256 rows beside idle, decoding and prefilling ranks, and padded graphs of 1 to
+# 256, every rank padded to the busiest rank's size and an idle rank on the attention-DP dummy. A
+# graph step runs its bf16 GEMMs on the low-M entries for its few rows and its router on the router
+# kernel, where the step alone (eager) runs cuBLAS; and a step whose ranks hold one count takes the
+# MoE's all-to-all where a ragged one takes the reduce-scatter, which group a token's four partials
+# differently. The kernels are deterministic, so the worst cases repeat run to run. The worst
+# cases, over 246 eager and 241 graph rows: |logit diff| 0.5442 eager and 0.9601 in graphs, top-gap
+# shift 0.2974 and 0.5563, recurrent state 0.022 and 0.0425, conv state 0.0496 and K/V 0.0482 of
+# max |alone|; no top-1 changed. A graph batch against the same rows run eagerly, what the
+# CUDA-graph identity gate's legs differ by in one step, measured 0.9659 / 0.5406. Each band is its
+# worst case plus a quarter, rounded up: room for a batch, history, graph size or load on the other
+# ranks the runs did not take, where a GEMM or thop may pick yet another kernel.
+LOGIT_BAND = 1.21
+"""max |batched logit - alone logit| over the vocabulary, fp32."""
+GAP_BAND = 0.70
+"""The largest change, batched against alone, of the gap between the alone step's top-1 and any of
+its top `J.TOP` tokens: how close to a tie the batch can tip the alone step's choice."""
+SSM_BAND = 0.054
+CONV_BAND = 0.062
+KV_BAND = 0.061
+"""max |batched - alone| / max |alone|, per tensor, over every GDP layer (recurrent state fp32, conv
+state bf16) and every attention layer (the appended K/V)."""
 
 
 def _checkpoint_or_skip() -> str:
@@ -89,30 +116,56 @@ def measured(tmp_path_factory) -> dict:
     return json.loads(out.read_text())
 
 
-@pytest.mark.gpu4
-def test_the_combine_sums_each_tokens_partials_in_one_order(measured) -> None:
-    """The routed MoE's combine -- the catalog `reducescatter` on fp32 partials of the MoE width,
-    sizes None when the ranks' counts agree, else the counts -- returns each token's sum of its
-    four partials in one order on every split: the ring chain that ends at the token's own rank,
-    bit for bit on every element. Even splits run NCCL's reduce-scatter and ragged ones a group
-    of reduces, so this is what keeps a token's bits from following the other ranks' loads. That
-    order is NCCL's algorithm choice on this node rather than a promise of the op; if this fails,
-    the order changed and dep4's decode is no longer invariant across the ranks' loads. The chain
-    is told apart from another order: summed in ascending rank order, some elements differ on
-    every split on every rank but the last, where the two orders coincide (measured: 55-87% of
-    the elements agree)."""
-    records = measured["combine"]
-    assert len(records) == J.WORLD_SIZE * (len(J.COMBINE_LAYOUTS) + len(J.COMBINE_GRAPH_HEIGHTS))
-    off = [r for r in records if r["ring_equal"] != 1.0]
-    distinct = [r for r in records if r["rank"] < J.WORLD_SIZE - 1]
-    print(
-        f"combine: {len(records) - len(off)} of {len(records)} rank records equal the ring chain "
-        f"bitwise; ascending order equals it on {min(r['ascending_equal'] for r in distinct):.3f}"
-        f"-{max(r['ascending_equal'] for r in distinct):.3f} of elements on ranks 0-2"
+def _outside(drift: dict) -> list[str]:
+    """What of a probe row's drift lies outside the bands."""
+    out = []
+    for name, key, band in (
+        ("logits", "logit", LOGIT_BAND),
+        ("top-gap shift", "gap", GAP_BAND),
+        ("recurrent state", "ssm", SSM_BAND),
+        ("conv state", "conv", CONV_BAND),
+        ("K/V", "kv", KV_BAND),
+    ):
+        if drift[key] > band:
+            out.append(f"{name} {drift[key]:.4g} outside its band {band:.4g}")
+    return out
+
+
+def _summary(drifts: list[dict]) -> str:
+    flips = [d for d in drifts if d["argmax"][0] != d["argmax"][1]]
+    return (
+        f"{len(drifts)} rows: max |logit diff| {max(d['logit'] for d in drifts):.4f}, max top-gap "
+        f"shift {max(d['gap'] for d in drifts):.4f}, recurrent / conv state / K/V "
+        f"{max(d['ssm'] for d in drifts):.3g} / {max(d['conv'] for d in drifts):.3g} / "
+        f"{max(d['kv'] for d in drifts):.3g} of max |alone|; {len(flips)} top-1 changes"
+        + (f" at alone margins {[round(d['margin'], 4) for d in flips]}" if flips else "")
     )
-    assert not off, f"the combine left the ring chain on {off[:8]}"
-    blind = [r for r in distinct if r["ascending_equal"] == 1.0]
-    assert not blind, f"the payload cannot tell the ring chain from ascending order on {blind[:8]}"
+
+
+def _gate(measured: dict, graph: bool) -> tuple[list[dict], list[str], list[str]]:
+    """The groups of runs that replay a CUDA graph (`graph`) or run eagerly: prints each group's
+    drift, and returns every probe row's drift, what lies outside the bands, and the runs whose
+    placeholder rows wrote a state slot."""
+    drifts, failures, leaks = [], [], []
+    for group in dict.fromkeys(s.group for s in J.STEPS if s.graph == graph):
+        runs = [r for r in measured["runs"] if r["group"] == group]
+        found = [d for r in runs for d in r["drifts"]]
+        assert found, f"{group}: no probe row was compared"
+        sizes = sorted({r["graph_size"] for r in runs if r["graph_size"]})
+        print(f"{group}: {_summary(found)}" + (f", graph sizes {sizes}" if sizes else ""))
+        drifts += found
+        failures += [
+            f"{r['step']}, rank {r['rank']}, {d['probe']} at row {d['row']}: {f}"
+            for r in runs
+            for d in r["drifts"]
+            for f in _outside(d)
+        ]
+        leaks += [
+            f"{r['step']} rank {r['rank']}: slots {r['placeholder_writes']}"
+            for r in runs
+            if r["placeholder_writes"]
+        ]
+    return drifts, failures, leaks
 
 
 @pytest.mark.gpu4
@@ -127,69 +180,70 @@ def test_reference_rows_are_real(measured) -> None:
 
 
 @pytest.mark.gpu4
-@pytest.mark.parametrize("group", J.GROUPS)
-def test_rows_do_not_depend_on_the_batch(measured, group) -> None:
-    """Every probe in every run of `group` (eager or padded-graph batches on its rank, the other
-    ranks idle, decoding or prefilling): the same bits as alone, and no placeholder row -- CUDA-graph
-    padding or the attention-DP dummy -- wrote a state slot. Prints the counts (`-s`)."""
-    runs = [r for r in measured["runs"] if r["group"] == group]
-    compared = sum(r["compared"] for r in runs)
-    diffs = [d for r in runs for d in r["diffs"]]
-    leaks = [
-        f"{r['step']} rank {r['rank']}: slots {r['placeholder_writes']}"
-        for r in runs
-        if r["placeholder_writes"]
-    ]
-    steps = {r["step"] for r in runs}
-    sizes = sorted({r["graph_size"] for r in runs if r["graph_size"]})
-    print(
-        f"{group}: {len(steps)} steps, {len(runs) // J.WORLD_SIZE} lockstep runs, "
-        f"{compared} probe rows compared, {len(diffs)} differences"
-        + (f", graph sizes {sizes}" if sizes else "")
-    )
-    assert compared > 0, f"{group}: no probe row was compared"
-    assert not diffs, "\n".join(diffs[:40])
+def test_decode_attends_through_thop_and_appends_each_rows_kv(measured) -> None:
+    """A decode step's eight attention layers run `thop_attention` and nothing else, one token a
+    row, and on a 64-row eager step on every rank each probe's K and V land where the manager's
+    page table puts its token: the K and V columns of its qkv row, bit for bit."""
+    records = measured["attention"]
+    for rank in range(J.WORLD_SIZE):
+        layers = sorted(r["layer"] for r in records if r["rank"] == rank)
+        assert len(layers) == 8 and len(set(layers)) == 8, f"rank {rank}: thop calls {layers}"
+    for r in records:
+        assert r["q_rows"] == 64, f"rank {r['rank']} layer {r['layer']}: {r['q_rows']} q rows"
+        assert r["appended_is_qkv"], (
+            f"rank {r['rank']} layer {r['layer']}: the appended K/V are not the qkv GEMM's K/V "
+            "columns"
+        )
+
+
+@pytest.mark.gpu4
+def test_eager_rows_stay_within_the_band(measured) -> None:
+    """Every probe in every eager run -- decode batches on its rank while the other ranks idle,
+    decode or prefill -- against its step alone: within the bands, and no placeholder row (the
+    attention-DP dummy) wrote a state slot. Reports each group's drift and every top-1 change
+    with the alone step's margin there (`-s`), then every eager run's together."""
+    drifts, failures, leaks = _gate(measured, graph=False)
+    print(f"eager: {_summary(drifts)}")
+    assert not failures, "\n".join(failures[:40])
     assert not leaks, "placeholder rows wrote state:\n" + "\n".join(leaks[:20])
 
 
 @pytest.mark.gpu4
-def test_attention_is_within_band_of_thop_attention(measured) -> None:
-    """On a 64-row eager decode step on every rank, in every attention layer: the entry appends
-    each probe's K and V -- the qkv GEMM's K and V columns, bit for bit -- where the manager's page
-    table puts the token; `thop_attention`'s append of the same tokens leaves those bytes as they
-    were; and the two outputs are within the band of each other.
-
-    Band, as the tp1 decode test derives it: each kernel is within 2 element ulp of an fp32
-    reference (2.00 for this entry, 1.98 for thop's decode kernels), so 4 element ulp between
-    them; relative RMS 0.64 and 0.77 ulp, so at most 1.41 between them."""
-    records = measured["attention"]
-    assert len(records) == J.WORLD_SIZE * 8, len(records)
-    for r in records:
-        print(
-            f"rank {r['rank']} attention layer {r['layer']}: {r['element_ulp']:.2f} element ulp, "
-            f"{r['rms_ulp']:.3f} rms ulp from thop_attention"
-        )
-        assert r["appended_is_qkv"], f"rank {r['rank']} layer {r['layer']}: appended K/V"
-        assert r["thop_reappend_same"], f"rank {r['rank']} layer {r['layer']}: thop re-append"
-        assert r["element_ulp"] <= 4.0 and r["rms_ulp"] <= 1.41, r
+def test_graph_rows_stay_within_the_band(measured) -> None:
+    """Every probe in every padded CUDA-graph run, B = 1 included, every rank padded to the busiest
+    rank's graph and an idle rank on the attention-DP dummy, against its eager step alone: within
+    the bands, and no placeholder row wrote a state slot. Reports each group's drift, every graph
+    run's together, and each graph run against the same rows run eagerly beside the same ranks --
+    what the CUDA-graph identity gate's two legs differ by in one step."""
+    drifts, failures, leaks = _gate(measured, graph=True)
+    runs = [r for r in measured["runs"] if r["graph_size"]]
+    legs = [leg for r in runs for leg in r["legs"]]
+    print(f"graph: sizes {sorted({r['graph_size'] for r in runs})}, {_summary(drifts)}")
+    print(
+        f"graph against eager, the same rows: max |logit diff| {max(x for x, _ in legs):.4f}, "
+        f"max top-gap shift {max(y for _, y in legs):.4f} over {len(legs)} rows"
+    )
+    assert not failures, "\n".join(failures[:40])
+    assert not leaks, "placeholder rows wrote state:\n" + "\n".join(leaks[:20])
 
 
 @pytest.mark.gpu4
-@pytest.mark.parametrize("rival", J.RIVALS)
-def test_the_replaced_paths_depend_on_the_batch(measured, rival) -> None:
-    """The comparison has teeth on this model's own state: with the decode step's GEMMs that run
-    through `invariant_mm` put back on `cublas_mm`, or its generation attention back on
-    `thop_attention`, some probe's step differs between its batch of one and the eager batches of
-    `J.RIVAL_SIZES` on its rank (the other ranks idle). Each rival's reference is that rival's own
-    batch of one."""
-    records = [r for r in measured["rivals"] if r["rival"] == rival]
+def test_the_band_tells_a_state_one_token_off(measured) -> None:
+    """The bands have teeth: a decode step from the state one token too far -- every GDP slot
+    holding the state its own decode step left, as a rollback that kept a rejected draft would
+    leave it -- moves every probe's logits by more than twice the logit band, each probe alone on
+    its rank, the other ranks idle. (Measured: at least 4.596, on the 4096-token prefix of
+    `gsm8k_multiturn`, whose top gaps it moves by only 0.322, inside the gap band: there the logit
+    band is what tells the two states apart.)"""
+    records = measured["teeth"]
     assert len(records) == J.WORLD_SIZE
-    compared = sum(r["compared"] for r in records)
-    differing = sum(r["differing"] for r in records)
-    print(f"rival {rival}: {differing} of {compared} probe rows differ from their batch of one")
-    for line in (d for r in records for d in r["differ"]):
-        print(f"  {line}")
-    assert differing, (
-        f"with {rival} back in the decode step no probe's row moved with the batch, so the "
-        "comparison cannot tell an invariant step from a variant one here"
+    for r in records:
+        for line in r["lines"]:
+            print(line)
+    logit = min(r["logit"] for r in records)
+    gap = min(r["gap"] for r in records)
+    print(
+        f"one token off: at least {logit:.3f} / {gap:.3f} on every probe, against the bands "
+        f"{LOGIT_BAND} / {GAP_BAND}"
     )
+    assert logit > 2 * LOGIT_BAND, (logit, gap)

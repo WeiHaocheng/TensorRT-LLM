@@ -192,10 +192,13 @@ checkpoints", which is the opposite of what this package is for.
    no built-in implementation has no `off` leg: its detector is a plain-torch
    transcription of the checkpoint's own draft module, run teacher-forced over
    the target's greedy output, and the acceptance it gives.
-4. **Identity** — for a target whose decode step is batch-invariant: greedy
-   tokens identical with CUDA graphs on and off, and with speculative decoding
-   on and off. Each holds only if every row of a step computes its bits from
-   that row alone, so a failure points at the step that is not.
+4. **Identity** — greedy tokens with CUDA graphs on and off, and with
+   speculative decoding on and off, compared prompt by prompt up to the first
+   parting. Kernels that pick their tiling by the batch move a row's logits in
+   the last bits, so two legs may part where the top two tokens are nearly
+   tied: a parting passes only within a near-tie band measured on the target
+   and stated in its test, and fails anywhere else. A miscomputed padding row,
+   recycled state slot or rolled-back draft moves tokens wherever it lands.
 
 Compare a variant against an identity run **in the same session**: one target
 measured 94.7688 and 95.0720 on a bit-identical forward a day apart, so a
@@ -207,10 +210,13 @@ Perf is measured, never gated.
 
 **Every entry is certified on sm_103, and all five targets are gated there.**
 
-The 33 entries -- 23 shared, 7 owned by deepseek, 3 by gpt-oss; the three
-nemotron4 targets own none, every entry they call being shared -- each drive
-their cells through `__call__` and `reference` in pre-merge CI, plus the three
-4-rank collective matrices (all-gather, reduce-scatter, all-reduce).
+The 43 entries -- 33 shared, 7 owned by deepseek, 3 by gpt-oss; the three
+nemotron4 targets own none, every entry they call being shared, and five
+shared entries are surveys' picks that no target calls yet (`cutlass_fused_moe`,
+`gdp_replay`, `moe_a2a_combine`, `moe_a2a_dispatch` and `torch_mm`) -- each
+drive their cells through `__call__` and `reference` in pre-merge CI, plus the
+four 4-rank collective matrices (all-gather, reduce-scatter, all-reduce, and
+the MoE all-to-all's dispatch and combine).
 Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,
 which is the honest state.
@@ -241,22 +247,29 @@ nemotron4-nano-preview's text model / sm_103 has three targets, tp1, dep4 and
 tp4, each gated in `tests/integration/defs/accuracy/test_modeling_v2_nemotron4.py`
 the same five ways: routing on the shipped config; gsm8k paired in one session
 with its MTP variant (one-model MTP-Eagle, draft length 2); token identity with
-CUDA graphs on and off; token identity with MTP on and off; and the acceptance
-gate. TensorRT-LLM has no built-in implementation of this architecture, so there is
+CUDA graphs on and off; MTP on against MTP off, each prompt alone; and the
+acceptance gate. Both identity gates follow the near-tie rule. Every step runs
+its GEMMs through `cublas_mm` and its attention through `thop_attention`, whose
+kernels change with the batch, so a decode row's bits move with the batch it
+runs in and a verify token's sit near its decode step's rather than on them.
+TensorRT-LLM has no built-in implementation of this architecture, so there is
 no stock leg: the gsm8k anchor is the checkpoint's own HuggingFace code under
 the same protocol, and the acceptance anchor is a plain-torch transcription of
-its MTP layer. The MTP layer's module accuracy, and the decode and verify
-invariance the identity gates rest on, are unit tests in each target's test
-directory. The numbers live with those runs, not here: a number written into
-this file is one that drifts with nothing to notice.
+its MTP layer. The MTP layer's module accuracy, and the decode step's drift
+across batches and the verify's drift from decode that the near-tie bands rest
+on, are unit tests in each target's test directory. The numbers live with
+those runs, not here: a number written into this file is one that drifts with
+nothing to notice.
 
 The acceptance row is the one that matters for a speculative variant:
 rejection sampling makes a miscomputed draft layer *slower*, not wrong, so
 boot and accuracy are blind to it and only the acceptance rate against a
 reference can see it. deepseek's draft lengths 1 and 2 remain ungated -- they
 are the dominated end of the measured draft-length axis. The nemotron4 targets
-run draft length 2, the checkpoint's trained depth, and routing declines every
-other length and any per-step draft-length schedule.
+run draft length 2, the checkpoint's trained depth; tp1 also runs 3, 4 and 5,
+the repeated MTP layer's next three depths, each gated the same ways as 2
+(paired gsm8k, MTP identity, acceptance). Routing declines every other length
+and any per-step draft-length schedule.
 
 ### What replaced the version pin
 

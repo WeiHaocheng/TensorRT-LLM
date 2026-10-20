@@ -146,24 +146,6 @@ def test_hf_order_is_two_ulps_away(cell) -> None:
     )
 
 
-@pytest.mark.parametrize("cell", _MULTI_ROW, ids=[c.why[:40] for c in _MULTI_ROW])
-def test_a_row_does_not_depend_on_its_batch(cell) -> None:
-    """A row's bits -- both outputs -- do not move with the number of rows beside it.
-
-    CUDA-graph padding and speculative verify change how many rows share a call, and a
-    target's greedy output stays token-identical across them only if each row comes out the
-    same either way. Each row is normalized by its own sum, so it does: the first row, the
-    first three and all but the last, called alone, are bit-identical to the same rows of the
-    whole call.
-    """
-    x, residual, weight, eps = _build(cell.spec, seed=_seed(cell))
-    whole_x, whole_residual = op(x.clone(), residual.clone(), weight, eps)
-    for n in (1, 3, x.shape[0] - 1):
-        part_x, part_residual = op(x[:n].clone(), residual[:n].clone(), weight, eps)
-        assert torch.equal(part_x, whole_x[:n]), f"rows [0, {n}) moved"
-        assert torch.equal(part_residual, whole_residual[:n]), f"residual rows [0, {n}) moved"
-
-
 def _one(**over):
     g = torch.Generator(device="cuda").manual_seed(7)
     kw = dict(rows=4, hidden=2880, dtype=torch.bfloat16)

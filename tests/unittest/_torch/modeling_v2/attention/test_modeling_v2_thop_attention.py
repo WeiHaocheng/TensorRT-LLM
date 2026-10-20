@@ -169,10 +169,10 @@ exercised:
    32-token pages, histories up to 9344), as cells of stated batches on the
    paged-context path that an engine with chunked prefill takes for every
    step: an 8192-token prefill, a 2048-token chunk on 6144 cached tokens,
-   mixed steps, decode at B = 1, 64 and 1024, and MTP verify steps (3 query
-   tokens per request, linear spec-dec off as sm_103 runs it) at B = 1, 64
-   and 512, alone and beside contexts; and the same cells at a tp4 rank's 4
-   query heads over the replicated KV head (4q/1kv d256). Histories are
+   mixed steps, decode at B = 1, 64, 128 and 1024, and MTP verify steps (3 query
+   tokens per request, linear spec-dec off as sm_103 runs it) at B = 1, 16,
+   64, 128 and 512, alone and beside contexts; and the same cells at a tp4
+   rank's 4 query heads over the replicated KV head (4q/1kv d256). Histories are
    written into scattered pages; each call's appends are checked bitwise, its
    kernels must be trtllm-gen's and never MMHA, and its writes must stay inside
    the workspace it sized (a canary past the end). A one-hot readout pins a
@@ -5520,24 +5520,36 @@ def _element_ulp(out: torch.Tensor, ref: torch.Tensor) -> float:
     return ((o - r).abs() / scale).max().item() / ULP[torch.bfloat16]
 
 
-@pytest.mark.parametrize("geometry", [N4, N4_TP4], ids=["16q", "tp4-4q"])
+#: A history that ends the step at max_seq_len: the longest one a verify row reaches.
+_LONGEST = -1
+
+
+@pytest.mark.parametrize(
+    "geometry, step",
+    [(N4, 3), (N4_TP4, 3), (N4, 4), (N4, 5), (N4, 6)],
+    ids=["16q", "tp4-4q", "16q-T4", "16q-T5", "16q-T6"],
+)
 @pytest.mark.parametrize(
     "batch, histories",
     [
         (1, (1,)),
-        (1, (N4["max_seq_len"] - 3,)),
-        (6, (1, 30, 1000, N4["max_seq_len"] - 3)),
+        (1, (_LONGEST,)),
+        (6, (1, 30, 1000, _LONGEST)),
         (64, (1, 5, 13)),
-        (64, (N4["max_seq_len"] - 3,)),
-        (512, (1, 30, 1000, N4["max_seq_len"] - 3)),
+        (64, (_LONGEST,)),
+        (512, (1, 30, 1000, _LONGEST)),
     ],
     ids=["b1-short", "b1-longest", "b6-mixed", "b64-short", "b64-longest", "b512-mixed"],
 )
-def test_nemotron4_verify_rows_are_causal_within_their_group(batch, histories, geometry) -> None:
-    """Read a 3-token verify step's attention weights out of its output.
+def test_nemotron4_verify_rows_are_causal_within_their_group(
+    batch, histories, geometry, step
+) -> None:
+    """Read a verify step's attention weights out of its output: 3 tokens a
+    request (two drafts), and 4 to 6 at tp1's 16 query heads (its three to
+    five drafts).
 
-    The cached histories carry V = 0 and the step's three tokens carry one-hot
-    V rows (dims 0, 1, 2), so output row t of a request, in every head, is the
+    The cached histories carry V = 0 and the step's tokens carry one-hot V rows
+    (dims 0 .. step - 1), so output row t of a request, in every head, is the
     weight that row put on each token of its own group. Causal within the
     group: row t reads exactly zero at dims t+1.. and a positive weight at
     0..t. The kernel the op picks changes with batch and history -- SwapsAb at
@@ -5549,10 +5561,10 @@ def test_nemotron4_verify_rows_are_causal_within_their_group(batch, histories, g
     element ulp from the output, two gate-widths, where short histories put it
     hundreds away.
     """
-    step = 3
     hq, hkv, dim = geometry["num_heads"], geometry["num_kv_heads"], geometry["head_size"]
     gen = torch.Generator().manual_seed(batch)
     torch.manual_seed(batch)
+    histories = [geometry["max_seq_len"] - step if h == _LONGEST else h for h in histories]
     rows = [(histories[i % len(histories)], step, 1) for i in range(batch)]
     env = _pool(rows, geometry)
     _seed_histories(env, rows, gen, zero_v=True)

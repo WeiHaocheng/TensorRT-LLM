@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from .._launch import Launch
 from .._op import Arch, Cell, OpWrapper
 
 # Every GDP mixer of the checkpoint (`Nemotron4GDPMixer`, 32 layers) has one geometry: 24 heads
@@ -72,6 +73,10 @@ def _gdp_gates_kernel(
     tl.store(g_ptr + row * H + ch, neg_a * softplus, mask=mh)
 
 
+#: The kernel launched straight to its compiled form once compiled (`Launch`).
+_GDP_GATES = Launch(_gdp_gates_kernel)
+
+
 class GdpGates(OpWrapper):
     """`Nemotron4GDPMixer.forward` between the conv and the recurrence, for its gates: from the
     in_proj output's `b` and `a` columns, `beta = sigmoid(b)` reshaped to `[T, n_h, H]` and the
@@ -117,8 +122,8 @@ class GdpGates(OpWrapper):
     where exp(A_log) > 1 a normal number below 2^-126 * exp(A_log) (2.2e-37 at the checkpoint's
     largest). The recurrences read g through exp(), which maps both to exactly 1.0.
 
-    A token's results depend on that token alone, so a row is batch-invariant and a CUDA-graph
-    padding row only computes something nobody reads. CUDA-graph capturable: one launch, no host
+    A token's results depend on that token alone, so a CUDA-graph padding row only computes
+    something nobody reads. CUDA-graph capturable: one launch, no host
     sync, nothing allocated besides the two outputs. `T = 0` launches nothing.
 
     Certified: 24 heads (tp1) and 6 (a tp4 rank), 3 Householder steps, each as its target's in_proj
@@ -134,7 +139,7 @@ class GdpGates(OpWrapper):
         beta = torch.empty(num_tokens, width // heads, heads, dtype=b.dtype, device=b.device)
         g = torch.empty(num_tokens, heads, dtype=torch.float32, device=a.device)
         if num_tokens:
-            _gdp_gates_kernel[(num_tokens,)](
+            _GDP_GATES[(num_tokens,)](
                 b,
                 a,
                 neg_a,

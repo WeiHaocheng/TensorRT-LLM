@@ -133,22 +133,6 @@ def test_two_rounding_order_is_one_ulp_away(cell) -> None:
     )
 
 
-@pytest.mark.parametrize("cell", _MULTI_ROW, ids=[c.why[:44] for c in _MULTI_ROW])
-def test_a_row_does_not_depend_on_its_batch(cell) -> None:
-    """A row's bits do not move with the number of rows beside it.
-
-    CUDA-graph padding and speculative verify change how many rows share a call, and a
-    target's greedy output stays token-identical across them only if each row comes out the
-    same either way. Each row is normalized by its own sum, so it does: the first row, the
-    first three and all but the last, called alone, are bit-identical to the same rows of the
-    whole call.
-    """
-    x, weight, eps = _build(cell.spec, seed=_seed(cell))
-    whole = op(x, weight, eps)
-    for n in (1, 3, x.shape[0] - 1):
-        assert torch.equal(op(x[:n], weight, eps), whole[:n]), f"rows [0, {n}) moved"
-
-
 def test_guard_refuses_fp8_before_the_kernel_answers() -> None:
     """The hazard `is_valid` exists for: accepted, and silently plausible.
 

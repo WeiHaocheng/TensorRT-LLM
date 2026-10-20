@@ -7,9 +7,9 @@ What runs is the target itself: the whole text model on one GPU, built as the en
 ``post_load_weights``), the engine's own hybrid cache manager (``_create_kv_cache_manager``) and the
 engine's TRTLLM attention metadata (``build_attention_metadata``) filled per step as the executor's
 runner fills it. Its forward is never edited: the attention and dense-MLP blocks are observed through
-the module globals the flat forward calls (``wide_residual``, ``cublas_mm`` and ``thop_attention``,
-and in decode steps ``invariant_mm`` and ``invariant_gen_attention``), each call attributed to its
-layer by the weight operand it was handed.
+the module globals the flat forward calls (``wide_residual``, ``cublas_mm``, ``lowm_entry`` -- the
+low-M GEMM entries the decode target picks by row count -- and ``thop_attention``), each call
+attributed to its layer by the weight operand it was handed.
 
 The blocks under test, with the stream reads and writes around them:
 
@@ -288,9 +288,9 @@ class BlockObserver:
     its block read and wrote in the last forward.
 
     Calls are attributed by their weight operand: a GEMM by the target parameter it multiplies
-    (``cublas_mm``'s ``mat_b``, a ``.t()`` view of it; ``invariant_mm``'s ``weight``, the parameter
-    as stored), a ``wide_residual`` call by the read factors and the retention it was handed, an
-    attention call (``thop_attention``, or ``invariant_gen_attention`` in decode) by its
+    (``mat_b`` of ``cublas_mm`` or of the low-M entry ``lowm_entry`` hands the decode target, a
+    ``.t()`` view of it), a ``wide_residual`` call by the read factors
+    and the retention it was handed, an attention call (``thop_attention``) by its
     ``local_layer_idx``. Every recorded tensor is a copy taken at the call (``wide_residual`` writes
     the streams in place). A target that runs these blocks through other entries (another GEMM or
     attention entry) needs those names wrapped here too; until then a block's record misses that
@@ -300,9 +300,8 @@ class BlockObserver:
     WRAPPED = (
         "wide_residual",
         "cublas_mm",
-        "invariant_mm",
+        "lowm_entry",
         "thop_attention",
-        "invariant_gen_attention",
     )
 
     def __init__(self, module, core, manager):
@@ -362,22 +361,23 @@ class BlockObserver:
         self._gemm(mat_a, mat_b, out)
         return out
 
-    def invariant_mm(self, x, weight, *args, **kwargs):
-        out = self.orig["invariant_mm"](x, weight, *args, **kwargs)
-        self._gemm(x, weight, out)
-        return out
+    def lowm_entry(self, m, k, n):
+        entry = self.orig["lowm_entry"](m, k, n)
+        if entry is None:
+            return None
 
-    def _attention(self, name, kwargs):
-        out = self.orig[name](**kwargs)
+        def observed(mat_a, mat_b, *args, **kwargs):
+            out = entry(mat_a, mat_b, *args, **kwargs)
+            self._gemm(mat_a, mat_b, out)
+            return out
+
+        return observed
+
+    def thop_attention(self, **kwargs):
+        out = self.orig["thop_attention"](**kwargs)
         i = self.layer_of_kv[kwargs["local_layer_idx"]]
         self.record[i]["attention"] = out.clone()
         return out
-
-    def thop_attention(self, **kwargs):
-        return self._attention("thop_attention", kwargs)
-
-    def invariant_gen_attention(self, **kwargs):
-        return self._attention("invariant_gen_attention", kwargs)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1015,9 +1015,9 @@ OP_BANDS = {
     ("attention", "next_read"): (4, 0.25),
     ("mlp", "read"): (4, 0.25),
     ("mlp", "next_read"): (4, 0.25),
-    # cublas_mm accumulates in fp32 in its own order and rounds once: one rounding flip where the
-    # two fp32 sums straddle a bf16 boundary (the catalog cublas_mm band is 4 / 2). Measured
-    # <= 1.98 / 0.17.
+    # cublas_mm, and in a decode step the low-M entries, accumulate in fp32 in their own order and
+    # round once: one rounding flip where the two fp32 sums straddle a bf16 boundary (the catalog
+    # band of each is cublas_mm's, 4 / 2). Measured <= 1.98 / 0.17.
     ("attention", "qkv"): (4, 0.5),
     ("attention", "o_proj"): (4, 0.5),
     ("mlp", "up"): (4, 0.5),

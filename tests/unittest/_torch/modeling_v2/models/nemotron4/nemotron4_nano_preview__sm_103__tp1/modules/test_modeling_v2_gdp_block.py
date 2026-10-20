@@ -40,15 +40,17 @@ compared on its own.
 The bands (`_BANDS`) are derived from the entries' own measured errors, before this test ran:
 
 * mixer output u, its out_proj input h and the recurrent state, any step: the chunked prefill is
-  the loosest entry in the path. `gdp_chunk` lands within 12.3 bf16 ulps element-wise and 1.32
-  of relative RMS of the fp32 per-token recurrence in its output, and 3.6 / 1.16 in its final
-  state (108 runs at the checkpoint's decay ranges), against its bands of 32 / 2 and 8 / 2.
+  the loosest entry in the path. `flashinfer_gdp_chunk` lands within 13.1 bf16 ulps element-wise
+  and 1.24 of relative RMS of the fp32 per-token recurrence in its output, and 3.3 / 1.09 in its
+  final state (its test's 240 runs at the checkpoint's decay ranges), against the bands it
+  certifies, 32 / 2 and 8 / 2.
   Downstream of it the gated norm normalizes each head on its own, which keeps a head's relative
   error, and out_proj is a GEMM. The decode steps start from the chunk-built states: a step
   multiplies the state's error by exp(g) <= 1 and by Householder factors (I - beta k k^T), which
   do not expand it, and adds gdp_recurrent's own fp32-level error. Every other op after in_proj
   rounds where the reference rounds: the conv entries flip 6e-5 of their outputs by one bf16 step,
-  the gated norm 1.5e-5, cuBLAS out_proj 0.09% (cublas_mm's measured cells). So the bands are the
+  the gated norm 4.1e-5, out_proj (cuBLAS, or a low-M kernel within cublas_mm's band in a decode
+  step) 0.09% (cublas_mm's measured cells). So the bands are the
   chunk entry's own: 32 / 2 for u and h, 8 / 2 bf16 ulps for the state, against "ref@in_proj".
   Against "reference" u and h keep those bands and the state its RMS band. Its state elements
   are reported, not gated: one bf16 step that in_proj's summation order flips in a recurrence
@@ -58,9 +60,9 @@ The bands (`_BANDS`) are derived from the entries' own measured errors, before t
   D8, which moves a state element 0.1367 -> 0.1351; at D9 the element is 0.050 and the difference
   stays.
 * the recurrence entries on the block's own inputs, teacher-forced at their call (the inputs each
-  call received, run through the entry's own fp32 reference): their certified bands, 32 / 2 and
-  8 / 2 (bf16) for `gdp_chunk`, and for `gdp_recurrent` 2 / 0.25 for its output and 8 / 1 fp32
-  ulps for its state -- the decode path alone is that tight.
+  call received, run through the entry's own fp32 reference): their certified bands, 32 / 2
+  and 8 / 2 (bf16) for `flashinfer_gdp_chunk`, and for `gdp_recurrent` 2 / 0.25 for its output
+  and 8 / 1 fp32 ulps for its state -- the decode path alone is that tight.
 * the read: `wide_residual`'s normed-read band, 4 / 0.5; the write: bit-exact (it is bit-exact
   against the checkpoint's ops); in_proj: cublas_mm's band, 4 / 2.
 * the conv state: a verbatim copy of the last three in_proj outputs of the conv channels, so
@@ -83,12 +85,14 @@ blocks), so its element gate, scaled by the row's largest value, is loose there;
 head, and the RMS gates are what see a mistake in the recurrence.
 
 Measured, both blocks, every step (bf16 ulps, element / relative RMS): against "ref@in_proj" u
-2.0 / 0.77, h 2.82 / 0.72, the state 4.78 / 0.81; against "reference" the same for u and h and
+2.0 / 1.02, h 2.24 / 0.71, the state 3.82 / 0.70; against "reference" the same for u and h and
 for the state's RMS, its elements up to 7.57, where the two references differ by 7.35 themselves.
-The recurrence entries on their recorded inputs: `gdp_chunk` 0.90 / 0.71 out and 4.78 / 0.78
-state, `gdp_recurrent` 0.13 / 0.006 out and 4.6 / 0.5 fp32 ulps state. The graph's replays are
-bit-identical to the eager steps, G7's recycled slot to a zeroed one. The checkpoint's
-double-rounded conv moves the reference's own u by up to 1.09 of RMS (`hf-order`).
+The recurrence entries on their recorded inputs: the chunk entry 0.95 / 0.65 out and 3.82 / 0.61
+state, `gdp_recurrent` 0.11 / 0.07 out and 4.24 / 0.50 fp32 ulps state. The graph's replays
+read and carry the states bit for bit as the eager steps do, and their mixer output is the eager
+step's out_proj input through the GEMM the graph's row count picks; G7's recycled slot gives a
+zeroed one's bits. The checkpoint's double-rounded conv moves the reference's own u by up to
+1.09 of RMS (`hf-order`).
 
 `test_the_bands_reject_planted_mistakes` plants the nearest mistakes in the reference and shows
 each band rejects them.
@@ -109,6 +113,8 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.lowm_direct_mm import lowm_direct_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.lowm_splitk_mm import lowm_splitk_mm
 from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp1 import (  # noqa: E501
     modeling as M,
 )
@@ -131,13 +137,20 @@ BF16, FP32 = ULP[torch.bfloat16], ULP[torch.float32]
 _ENTRIES = (
     M.wide_residual,
     M.cublas_mm,
+    lowm_direct_mm,
+    lowm_splitk_mm,
     M.gdp_gates,
-    M.causal_conv1d_varlen,
+    M.triton_causal_conv1d_varlen,
     M.causal_conv1d_update,
-    M.gdp_chunk,
+    M.flashinfer_gdp_chunk,
     M.gdp_recurrent,
-    M.gated_rmsnorm,
+    M.gated_rmsnorm_multirow,
 )
+
+#: The modeling name of the chunked-prefill recurrence entry the prefill target calls.
+_CHUNK = "flashinfer_gdp_chunk"
+#: The modeling name of the GDP output norm.
+_NORM = "gated_rmsnorm_multirow"
 
 #: The blocks under test: the first `linear_attention` block, the first `shortcut_moe_gdp` one.
 _LAYERS = (0, 6)
@@ -223,17 +236,17 @@ class _Band:
 
 
 _BANDS = {
-    "u": _Band(32.0, 2.0, BF16, "gdp_chunk's out band; later ops keep relative error"),
-    "h": _Band(32.0, 2.0, BF16, "gdp_chunk's out band; the gated norm keeps a head's rel. error"),
-    "state": _Band(8.0, 2.0, BF16, "gdp_chunk's state band; decode steps do not expand it"),
+    "u": _Band(32.0, 2.0, BF16, "the chunk entry's out band; later ops keep relative error"),
+    "h": _Band(32.0, 2.0, BF16, "the chunk entry's out band; the gated norm keeps a head's error"),
+    "state": _Band(8.0, 2.0, BF16, "the chunk entry's state band; decode steps do not expand it"),
     # The independent reference's state: element errors there also carry in_proj's summation
     # order, through the recurrence's inputs (the "state ref vs ref@in_proj" rows); its RMS
     # stays gated.
-    "state, own in_proj": _Band(float("inf"), 2.0, BF16, "gdp_chunk's state RMS band"),
+    "state, own in_proj": _Band(float("inf"), 2.0, BF16, "the chunk entry's state RMS band"),
     "conv_state": _Band(4.0, 2.0, BF16, "cublas_mm's band: the window is in_proj outputs"),
     "x": _Band(4.0, 0.5, BF16, "wide_residual's normed-read band"),
-    "chunk.out": _Band(32.0, 2.0, BF16, "gdp_chunk's certified out band"),
-    "chunk.state": _Band(8.0, 2.0, BF16, "gdp_chunk's certified state band"),
+    "chunk.out": _Band(32.0, 2.0, BF16, "flashinfer_gdp_chunk's certified out band"),
+    "chunk.state": _Band(8.0, 2.0, BF16, "flashinfer_gdp_chunk's certified state band"),
     "recurrent.out": _Band(2.0, 0.25, BF16, "gdp_recurrent's certified out band"),
     "recurrent.state": _Band(8.0, 1.0, FP32, "gdp_recurrent's certified state band"),
 }
@@ -642,8 +655,11 @@ def _metadata_step(manager, request_ids, lens, cached, num_contexts):
     )
 
 
-def _state_args(md, manager, num_rows: int, num_contexts: int, num_ctx_tokens: int) -> dict:
-    """The state fields the targets' `step_args` project out of the prepared metadata."""
+def _state_args(
+    md, manager, num_rows: int, num_contexts: int, num_ctx_tokens: int, max_ctx_len: int = 0
+) -> dict:
+    """The state fields the targets' `step_args` project out of the prepared metadata;
+    `max_ctx_len` is the longest context row's token count."""
     layer = manager.layer
     step = dict(
         state_slots=md.state_slots[:num_rows],
@@ -655,11 +671,20 @@ def _state_args(md, manager, num_rows: int, num_contexts: int, num_ctx_tokens: i
             num_rows=num_rows,
             num_contexts=num_contexts,
             num_ctx_tokens=num_ctx_tokens,
+            max_ctx_len=max_ctx_len,
             query_start_loc=md.query_start_loc,
             query_start_loc_long=md.query_start_loc_long,
             has_initial_state=md.has_initial_states[:num_contexts],
         )
     return step
+
+
+def _in_proj(target, x: torch.Tensor, view) -> torch.Tensor:
+    """The block's in_proj output as the target computes it for these rows: the decode target
+    through the GEMM it picks for the row count (`DecodeTarget._mm`), the prefill target through
+    `cublas_mm`."""
+    mm = target._mm if isinstance(target, M.DecodeTarget) else cublas_mm
+    return mm(x, view.mixer.in_proj)
 
 
 def _block(target, view, reads, streams, step):
@@ -695,11 +720,11 @@ class _Recorder:
 
 
 def _entry_scales(name: str, args: list) -> tuple[dict[int, torch.Tensor], torch.Tensor]:
-    """The operand scales of one recorded `gdp_chunk` / `gdp_recurrent` call, from the inputs it
+    """The operand scales of one recorded chunk / `gdp_recurrent` call, from the inputs it
     received (`args`, with the pool as it was before the call): `({slot: [H, V]}, [T, H])`."""
     q, k, v, g, beta, pool, slots = args[:7]
     num_tokens, n_h, heads, _ = v.shape
-    if name == "gdp_chunk":
+    if name == _CHUNK:
         bounds, resume = args[7].tolist(), args[8].tolist()
     else:
         bounds, resume = list(range(num_tokens + 1)), [True] * num_tokens
@@ -735,11 +760,11 @@ def _entry_rows(report, layer, step, name: str, call: dict, rows: slice | None =
     args[5] = call["pool_before"]
     ref_out, ref_pool = entry.reference(*args)
     state_scales, out_scales = _entry_scales(name, args)
-    kind = "chunk" if name == "gdp_chunk" else "recurrent"
+    kind = "chunk" if name == _CHUNK else "recurrent"
     slots = args[6].tolist()
     if rows is None:
         rows = slice(0, len(slots))
-    if name == "gdp_chunk":  # outputs are tokens; take the chosen requests' tokens
+    if name == _CHUNK:  # outputs are tokens; take the chosen requests' tokens
         bounds = args[7].tolist()
         tokens = slice(bounds[rows.start], bounds[rows.stop])
     else:
@@ -773,21 +798,24 @@ def _entry_rows(report, layer, step, name: str, call: dict, rows: slice | None =
 
 @contextmanager
 def _recording():
-    """Record every `gdp_chunk` / `gdp_recurrent` / `gated_rmsnorm` call the block makes."""
-    recorders = dict(gdp_chunk=_Recorder(M.gdp_chunk), gdp_recurrent=_Recorder(M.gdp_recurrent))
+    """Record every chunk / `gdp_recurrent` / gated-norm call the block makes."""
+    recorders = {
+        _CHUNK: _Recorder(getattr(M, _CHUNK)),
+        "gdp_recurrent": _Recorder(M.gdp_recurrent),
+    }
     norm_outputs = []
-    real_norm = M.gated_rmsnorm
+    real_norm = getattr(M, _NORM)
 
     def norm(*args, **kwargs):
         out = real_norm(*args, **kwargs)
         norm_outputs.append(out.clone())
         return out
 
-    saved = {name: getattr(M, name) for name in (*recorders, "gated_rmsnorm")}
+    saved = {name: getattr(M, name) for name in (*recorders, _NORM)}
     try:
         for name, recorder in recorders.items():
             setattr(M, name, recorder)
-        M.gated_rmsnorm = norm
+        setattr(M, _NORM, norm)
         yield recorders, norm_outputs
     finally:
         for name, op in saved.items():
@@ -914,7 +942,14 @@ def block_run(request, checkpoint, block_inputs):
             cached = [a for a, _ in step.spans]
             md.prepare(_metadata_step(manager, ids, lens, cached, step.num_contexts))
             n_ctx_tokens = sum(lens[: step.num_contexts])
-            args = _state_args(md, manager, len(ids), step.num_contexts, n_ctx_tokens)
+            args = _state_args(
+                md,
+                manager,
+                len(ids),
+                step.num_contexts,
+                n_ctx_tokens,
+                max(lens[: step.num_contexts], default=0),
+            )
             streams_in = _step_streams(inputs, step)
             streams = streams_in.clone()
             calls_before = {k: len(r.calls) for k, r in recorders.items()}
@@ -927,7 +962,7 @@ def block_run(request, checkpoint, block_inputs):
                 streams_in=streams_in,
                 streams=streams.clone(),
                 h=norms[norms_before],
-                proj=cublas_mm(x, view.mixer.in_proj),
+                proj=_in_proj(target, x, view),
             )
             run.records[step.name] = {
                 k: r.calls[calls_before[k] :]
@@ -1185,25 +1220,50 @@ def graph_run(block_run):
     )
 
 
+def _out_proj_at(rows: int, h: torch.Tensor, run) -> torch.Tensor:
+    """out_proj of `h`'s rows through the GEMM the decode target picks for a step of `rows` rows
+    (`DecodeTarget._mm`), the rows past `h`'s zero. Each row of a GEMM's output depends on that
+    row alone, so the first rows are what a step of `rows` rows computes from them."""
+    padded = h.new_zeros(rows, h.shape[1])
+    padded[: h.shape[0]] = h
+    return run.decode._mm(padded, run.view.mixer.out_proj)[: h.shape[0]]
+
+
 def test_decode_steps_replay_in_a_cuda_graph_with_padding(block_run, graph_run):
-    """The graph's replays give the eager steps' outputs, streams and states bit for bit, and its
-    padding rows -- `PAD_SLOT_ID` in the slots the entries read -- touch no slot: neither the
-    padding dummy's own, nor any other outside the five requests'."""
+    """The graph's replays give the eager steps' reads and states bit for bit, and its padding
+    rows -- `PAD_SLOT_ID` in the slots the entries read -- touch no slot: neither the padding
+    dummy's own, nor any other outside the five requests'.
+
+    The decode target picks each GEMM's kernel by the row count (`DecodeTarget._mm`), and the
+    graph runs `_GRAPH_ROWS` rows where the eager steps ran five, so its out_proj may run
+    another kernel: the graph's mixer output must be the eager step's out_proj input through
+    the GEMM a step of `_GRAPH_ROWS` rows picks, bit for bit, and its stream write must be that
+    output's. How far that moves the mixer output from the eager step's is reported."""
     run, gr = block_run, graph_run
     L = run.layer
     report = _Report(f"GDP block, layer {L}: D0-D15 replayed in a CUDA graph of {_GRAPH_ROWS} rows")
     owned = run.pools.owned([r.slot for r in _ROWS])
+    conn = _connection(run.layer_type)
     for step in _DECODE:
         e, g = run.target[step.name], gr.steps[step.name]
         report.require(
             g["slots"] == [r.slot for r in _ROWS] + [PAD_SLOT_ID] * (_GRAPH_ROWS - len(_ROWS)),
             f"layer {L} {step.name}: slots {g['slots']}",
         )
-        for what in ("x", "u", "streams"):
-            report.require(
-                torch.equal(e[what], g[what]),
-                f"layer {L} {step.name}: the graph's {what} differs from the eager step's",
-            )
+        report.require(
+            torch.equal(e["x"], g["x"]),
+            f"layer {L} {step.name}: the graph's x differs from the eager step's",
+        )
+        report.require(
+            torch.equal(g["u"], _out_proj_at(_GRAPH_ROWS, e["h"], run)),
+            f"layer {L} {step.name}: the graph's u is not out_proj of the eager step's h at "
+            f"{_GRAPH_ROWS} rows",
+        )
+        written = R._connection_write(e["streams_in"], g["u"], run.block_w, conn, run.config)
+        report.require(
+            torch.equal(g["streams"], written),
+            f"layer {L} {step.name}: the graph's stream write is not its u's",
+        )
         report.require(
             torch.equal(g["pool"][owned], run.snapshots[step.name][owned]),
             f"layer {L} {step.name}: the graph's states differ from the eager step's",
@@ -1232,8 +1292,11 @@ def test_g7_fresh_prompt_promoted_onto_a_recycled_slot(block_run, graph_run):
 
     The prompt's state is built by the decode path alone; it is also compared with the
     reference, with `gdp_recurrent`'s own reference on the inputs the eager step recorded, and
-    with the same prompt run as a one-token prefill (`gdp_chunk`), which the runner does when
-    CUDA graphs are off."""
+    with the same prompt run as a one-token prefill (`flashinfer_gdp_chunk`), which the runner
+    does when CUDA graphs are off. The eager step runs five rows where the graph runs
+    `_GRAPH_ROWS`, so their mixer outputs are compared as the graph-replay test compares them:
+    the graph's is the eager step's out_proj input through the GEMM the graph's row count
+    picks."""
     run, gr = block_run, graph_run
     L = run.layer
     report = _Report(f"GDP block, layer {L}: G7, a fresh one-token prompt on a recycled slot")
@@ -1306,7 +1369,7 @@ def test_g7_fresh_prompt_promoted_onto_a_recycled_slot(block_run, graph_run):
     eager_manager = _Manager(L, eager_pools)
     eager_manager.slot_of[_G7.request_id] = slot
     md = M.Nemotron4StateMetadata(_GRAPH_ROWS, 128, max_num_tokens=8192)
-    with torch.no_grad(), validating(*_ENTRIES), _recording() as (recorders, _):
+    with torch.no_grad(), validating(*_ENTRIES), _recording() as (recorders, norms):
         md.prepare(_metadata_step(eager_manager, ids[:live], [1] * live, positions + [0], 0))
         streams = inputs.clone()
         x, u = _block(
@@ -1314,17 +1377,18 @@ def test_g7_fresh_prompt_promoted_onto_a_recycled_slot(block_run, graph_run):
         )
         torch.cuda.synchronize()
     report.require(
-        torch.equal(u, recycled["u"])
+        torch.equal(recycled["u"], _out_proj_at(_GRAPH_ROWS, norms[-1], run))
         and torch.equal(eager_pools.raw[owned], recycled["pool"][owned]),
         f"layer {L} G7: the graph step differs from the eager one",
     )
+    report.add(L, "G7", "u (mixer out)", "graph", "eager", _stats(recycled["u"], u, BF16))
     (call,) = recorders["gdp_recurrent"].calls
     _entry_rows(report, L, "G7", "gdp_recurrent", call, rows=slice(live - 1, live))
 
     # Against the references: the prompt alone, from a zero state, through the reference's own
     # fp32 in_proj and through the target's in_proj output (the same GEMM at the eager step's rows).
     x_g7 = recycled["x"][-1:]
-    proj_g7 = cublas_mm(recycled["x"], run.view.mixer.in_proj)[-1:]
+    proj_g7 = _in_proj(run.decode, recycled["x"], run.view)[-1:]
     g_ssm, g_conv = _pool_views(recycled["pool"])
     with torch.no_grad():
         refs = (
@@ -1362,7 +1426,7 @@ def test_g7_fresh_prompt_promoted_onto_a_recycled_slot(block_run, graph_run):
             _BANDS["conv_state"],
         )
 
-    # The same prompt as a one-token prefill: gdp_chunk and the varlen conv instead.
+    # The same prompt as a one-token prefill: the chunk entry and the varlen conv instead.
     prefill_pools = _Pools(seed=0)
     prefill_pools.raw.copy_(after_decode)
     prefill_manager = _Manager(L, prefill_pools)
@@ -1372,7 +1436,7 @@ def test_g7_fresh_prompt_promoted_onto_a_recycled_slot(block_run, graph_run):
         md.prepare(_metadata_step(prefill_manager, [_G7.request_id], [1], [0], 1))
         streams = run.inputs["g7"].clone()
         x_p, u_p = _block(
-            run.prefill, run.view, run.reads, streams, _state_args(md, prefill_manager, 1, 1, 1)
+            run.prefill, run.view, run.reads, streams, _state_args(md, prefill_manager, 1, 1, 1, 1)
         )
         torch.cuda.synchronize()
     report.require(torch.equal(x_p, x_g7), f"layer {L} G7: the prefill path reads another x")

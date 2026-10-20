@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""4-rank job: an MTP verify step of the nemotron4 tp4 target's GDP mixer rolls back exactly, on
-every rank's own cache manager.
+"""4-rank job: an MTP verify step of the nemotron4 tp4 target's GDP mixer rolls back to the state
+MTP-off decode reaches, on every rank's own cache manager.
 
 Under one-model MTP-Eagle a generation row carries its last token and D drafts. Each rank's GDP
 mixer runs the row's 1 + D tokens on its 6 of the 24 heads from the row's state slot without
 writing it, and stores the state after every token in the hybrid cache manager's per-position
 buffers; after acceptance the engine's worker commits the last accepted token's state into the
 slot (`update_mamba_states`). A rejected draft must leave no trace: the committed slot has to be
-the state MTP-off decode reaches over the accepted tokens alone.
+the state MTP-off decode reaches over the accepted tokens alone -- the conv state bit for bit, the
+recurrent state within the band its two entries are certified to (`state_band`).
 
 This script is its own launcher, as the tp4 decode-invariance job is: run it plainly and it starts
 one MPI rank per device named in CUDA_VISIBLE_DEVICES under ``mpirun``, with a deadline it enforces
@@ -33,25 +34,28 @@ The cases, on both managers:
 
 * ``padded``: 5 requests verifying 1 + 2 tokens, padded to a graph batch of 8 with the padding
   dummy's rows (``CUDA_GRAPH_DUMMY_REQUEST_ID - 2``), two verify -> commit rounds whose accepted
-  counts cover 1..3. The reference is three MTP-off decode steps through the same mixer.
+  counts cover 1..3, through DecodeTarget.
 * ``mixed``: a fresh 37-token prompt (a context row) beside 3 verify rows, through PrefillTarget.
-  Its in_proj runs on cuBLAS, whose kernel at the step's 46 rows rounds otherwise than at a decode
-  step's 3 -- mixed steps carry no batch-invariance claim -- so the reference decodes the verify
-  rows' own in_proj output, one token per step through the decode entries (``_gdp_rows``), and
-  finishes each as ``_gdp`` does (the gated norm, the ``out_proj`` partial, the all-reduce).
 
-Per case: every real row's committed recurrent and conv state equals its slot after `accepted`
-MTP-off decode steps over the same tokens; the states after one, two and three tokens differ
-pairwise, so a commit from the wrong position cannot pass; the verify writes no slot; the commit
-writes only the step's rows' engine slots (the padding dummy's included, whose stale snapshot it
-copies) and never a context row's; and the verify's output rows equal the decode steps' rows. Rank
-0 writes every rank's records to `--report` as JSON. Not a pytest module: everything that imports
+In both the reference is MTP-off decode of the verify rows' own in_proj output, one token per step
+through the decode entries (``_gdp_rows``) from the slots the verify read. cuBLAS picks the in_proj
+kernel by the row count, so a decode step's own in_proj can round otherwise than the verify's 24 or
+46 rows; fed the verify's rows, the reference differs from the verify in the GDP entries alone.
+
+Per case: every real row's committed conv state equals its slot after `accepted` MTP-off decode
+steps over the same tokens, bit for bit, and its recurrent state lies within `state_band` of it;
+the states after one, two and three tokens lie farther apart than that band, so a commit from the
+wrong position cannot pass; the verify writes no slot; the commit writes only the step's rows'
+engine slots (the padding dummy's included, whose stale snapshot it copies) and never a context
+row's; and the GDP verify entry's output rows lie within `OUT_BAND` of the decode entry's. Rank 0
+writes every rank's records to `--report` as JSON. Not a pytest module: everything that imports
 `tensorrt_llm` is imported inside the rank body (an MPI-initialized process cannot start `mpirun`).
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -78,6 +82,43 @@ LAYER = 0
 MANAGERS = ("v2", "v1")
 
 _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2.models.nemotron4.nemotron4_nano_preview__sm_103__tp4"
+
+_BF16_ULP = 2.0**-8
+_FP32_ULP = 2.0**-23
+
+# The bands. The verify and its reference read the same q, k, v, beta and decay: the same in_proj
+# rows and gates, and the conv verify entry takes the conv decode entry's arithmetic token by token
+# (its note). A conv state is the window of the last inputs, copied rather than computed, so the
+# committed conv state is the decode steps' bit for bit. The recurrent state and the output rows
+# are computed, by gdp_verify on one side and by t + 1 calls of gdp_recurrent on the other, each
+# certified against the same reference (`test_modeling_v2_gdp_verify.py`): the state after token t
+# within 8 sqrt(t + 1) fp32 ulp of its row's scale element-wise and sqrt(t + 1) of relative RMS
+# (`_compare_states`), a token's output within 2 bf16 ulp and 0.25 (`_compare_out`). So the two
+# sides lie within twice that of each other. A commit from the wrong position moves the state by
+# O(1) of its scale, of the order of 2**23 fp32 ulp, orders beyond; each case measures how far
+# (`apart`).
+#: The output rows' band: (element, relative RMS) in bf16 ulp of each row's largest |decode|.
+OUT_BAND = (4.0, 0.5)
+
+
+def state_band(accepted: int) -> tuple[float, float]:
+    """The committed recurrent state's band after `accepted` tokens: (element, relative RMS) in
+    fp32 ulp of each row's largest |decode|, twice each side's 8 sqrt(t + 1) and sqrt(t + 1) at
+    t = accepted - 1."""
+    depth = math.sqrt(accepted)
+    return 16.0 * depth, 2.0 * depth
+
+
+def ulps(got, want, ulp: float) -> tuple[float, float]:
+    """`got` against `want` as `assert_within_ulp` scores it, in units of `ulp`: the largest
+    |got - want| over its row's largest |want| (a row is the last dim), and the relative RMS."""
+    got = got.float().reshape(-1, got.shape[-1])
+    want = want.float().reshape(-1, want.shape[-1])
+    diff = got - want
+    scale = want.abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
+    element = float((diff.abs() / scale).max()) / ulp
+    rms = float(diff.pow(2).mean().sqrt() / want.pow(2).mean().sqrt().clamp_min(1e-9)) / ulp
+    return element, rms
 
 
 def _rank_body(rank: int, comm, checkpoint: str, log) -> list[dict]:
@@ -154,20 +195,17 @@ def _rank_body(rank: int, comm, checkpoint: str, log) -> list[dict]:
     }
     input_norm, embed = table("input_norm"), table("embed")
 
-    def mixer(row_invariant: bool):
-        """The mixer as each target holds it (`_layer_views`): decode's in_proj is the stored
-        [out, in] weight `invariant_mm` reads, prefill's the `.t()` view `cublas_mm` reads."""
-        return M._Gdp(
-            layer=LAYER,
-            in_proj=w["gdp_in"] if row_invariant else w["gdp_in"].t(),
-            conv=w["gdp_conv"],
-            neg_a=w["gdp_neg_a"],
-            dt_bias=w["gdp_dt_bias"],
-            norm=w["gdp_norm"],
-            out_proj=w["gdp_out"].t(),
-        )
-
-    decode_mixer, prefill_mixer = mixer(True), mixer(False)
+    # The mixer as both targets hold it (`_layer_views`): every GEMM operand the `.t()` view
+    # `cublas_mm` reads.
+    mixer = M._Gdp(
+        layer=LAYER,
+        in_proj=w["gdp_in"].t(),
+        conv=w["gdp_conv"],
+        neg_a=w["gdp_neg_a"],
+        dt_bias=w["gdp_dt_bias"],
+        norm=w["gdp_norm"],
+        out_proj=w["gdp_out"].t(),
+    )
 
     # Collective: every rank builds the TP group's workspace, as `post_load_weights` does.
     workspace = M._allreduce_workspace(
@@ -185,6 +223,24 @@ def _rank_body(rank: int, comm, checkpoint: str, log) -> list[dict]:
         e = embed[ids].float()
         e = e * torch.rsqrt(e.pow(2).mean(-1, keepdim=True) + text.rms_norm_eps)
         return (e.to(torch.bfloat16) * input_norm).contiguous()
+
+    def verified(gdp, *args) -> torch.Tensor:
+        """Run `gdp(*args)`, a target's `_gdp` over a step holding verify rows, and return what
+        `gdp_verify` returned inside it: the verify rows' GDP output, `[rows, T, heads, value]`."""
+        seen, entry = [], M.gdp_verify
+
+        def recorded(*inputs, **kwargs):
+            out = entry(*inputs, **kwargs)
+            seen.append(out.clone())
+            return out
+
+        M.gdp_verify = recorded
+        try:
+            gdp(*args)
+        finally:
+            M.gdp_verify = entry
+        assert len(seen) == 1, f"gdp_verify ran {len(seen)} times in one step"
+        return seen[0]
 
     records = []
     for kind in MANAGERS:
@@ -274,27 +330,88 @@ def _rank_body(rank: int, comm, checkpoint: str, log) -> list[dict]:
             ssm[index] = 0
             conv[index] = 0
             for _ in range(steps):
-                decode._gdp(rows(g, len(slots)), decode_mixer, step(slots))
+                decode._gdp(rows(g, len(slots)), mixer, step(slots))
 
-        def distinct(after: list, num_real: int) -> bool:
-            """The states after one, two and three tokens differ pairwise in every row."""
-            return all(
-                not torch.equal(after[i][k][b], after[j][k][b])
-                for b in range(num_real)
-                for i in range(TOKENS)
-                for j in range(i + 1, TOKENS)
-                for k in (0, 1)
-            )
+        def decode_tokens(proj: torch.Tensor, slots: list, real_slots: list) -> tuple:
+            """MTP-off decode of the verify rows' own in_proj output `proj`, `[rows, T, 4632]`,
+            one token per step through the decode entries (`_gdp_rows`) from the slots as they
+            are: each token's GDP output rows, and the real rows' states after it."""
+            outs, after = [], []
+            for j in range(TOKENS):
+                token = proj[:, j].contiguous()
+                beta, decay = M.gdp_gates(
+                    token[:, dims.beta], token[:, dims.decay], mixer.neg_a, mixer.dt_bias
+                )
+                args = step(slots)
+                outs.append(M._gdp_rows(token, beta, decay, mixer, args["state_slots"], args, dims))
+                after.append(states(real_slots))
+            return outs, after
 
-        def check_states(real_slots: list, expected, what: str) -> list:
+        def apart(after: list, num_real: int) -> float:
+            """How far apart the states after one, two and three tokens lie, the least over the
+            rows and pairs: the recurrent states in fp32 ulp of the row scale (`ulps`), 0 where a
+            pair's conv states are bitwise equal. A commit from the wrong position lands that far
+            from the right state."""
+            least = math.inf
+            for b in range(num_real):
+                for i in range(TOKENS):
+                    for j in range(i + 1, TOKENS):
+                        if torch.equal(after[i][1][b], after[j][1][b]):
+                            return 0.0
+                        least = min(least, ulps(after[i][0][b], after[j][0][b], _FP32_ULP)[0])
+            return least
+
+        def check_states(real_slots: list, accepted: list, after: list, what: str) -> tuple:
+            """Each real row's slot against its state after its `accepted` decode steps: the conv
+            state bit for bit, the recurrent state within `state_band`. Returns the failures and
+            the largest recurrent-state deviation, (element, relative RMS) in fp32 ulp."""
             got = states(real_slots)
-            failures = []
-            for b, (want_ssm, want_conv) in enumerate(expected):
-                if not torch.equal(got[0][b], want_ssm):
-                    failures.append(f"{what}: row {b} recurrent state differs")
-                if not torch.equal(got[1][b], want_conv):
+            failures, worst = [], (0.0, 0.0)
+            for b, n in enumerate(accepted[: len(real_slots)]):
+                if not torch.equal(got[1][b], after[n - 1][1][b]):
                     failures.append(f"{what}: row {b} conv state differs")
-            return failures
+                element, rms = ulps(got[0][b], after[n - 1][0][b], _FP32_ULP)
+                band = state_band(n)
+                if element > band[0] or rms > band[1]:
+                    failures.append(
+                        f"{what}: row {b} recurrent state {element:.3g} / {rms:.3g} fp32 ulp off, "
+                        f"past {band[0]:.3g} / {band[1]:.3g}"
+                    )
+                worst = (max(worst[0], element), max(worst[1], rms))
+            return failures, worst
+
+        def check_out(got: torch.Tensor, want: torch.Tensor, what: str) -> tuple:
+            """The GDP verify entry's output rows against the decode entry's, within `OUT_BAND`.
+            Returns the failures and the deviation, (element, relative RMS) in bf16 ulp."""
+            element, rms = ulps(got, want, _BF16_ULP)
+            failures = []
+            if element > OUT_BAND[0] or rms > OUT_BAND[1]:
+                failures.append(
+                    f"{what}: output rows {element:.3g} / {rms:.3g} bf16 ulp off, past "
+                    f"{OUT_BAND[0]} / {OUT_BAND[1]}"
+                )
+            return failures, (element, rms)
+
+        def record(case: str, failures: list, separation: float, state_ulp, out_ulp) -> None:
+            records.append(
+                dict(
+                    rank=rank,
+                    manager=type(manager).__name__,
+                    kind=kind,
+                    case=case,
+                    failures=failures,
+                    distinct=separation > state_band(TOKENS)[0],
+                    separation=separation,
+                    state_ulp=state_ulp,
+                    out_ulp=out_ulp,
+                )
+            )
+            log(
+                f"{kind} {case}: {len(failures)} failures; recurrent state {state_ulp[0]:.3g} / "
+                f"{state_ulp[1]:.3g} fp32 ulp from decode's, output rows {out_ulp[0]:.3g} / "
+                f"{out_ulp[1]:.3g} bf16 ulp; the states after 1, 2 and 3 tokens at least "
+                f"{separation:.3g} fp32 ulp apart"
+            )
 
         # The same seed on every rank: the ranks feed the same rows, as the engine's ranks do.
         g = torch.Generator(device="cuda").manual_seed(4404 + (kind == "v1"))
@@ -305,11 +422,11 @@ def _rank_body(rank: int, comm, checkpoint: str, log) -> list[dict]:
             padded = real + [PAD_SLOT_ID] * 3
             engine = real + [padding_slot] * 3
             prime(g, real, steps=6)
-            failures, all_distinct = [], True
+            failures, separation, state_ulp, out_ulp = [], math.inf, (0.0, 0.0), (0.0, 0.0)
             for accepted in ([3, 1, 2, 3, 1], [1, 2, 3, 2, 3]):
                 start = snapshot()
-                x = rows(g, len(padded) * TOKENS).view(len(padded), TOKENS, -1)
-                out = decode._gdp(x.reshape(-1, x.shape[-1]), decode_mixer, step(padded))
+                x = rows(g, len(padded) * TOKENS)
+                out = verified(decode._gdp, x, mixer, step(padded))
                 torch.cuda.synchronize()
                 if changed(start):
                     failures.append(f"padded {accepted}: the verify wrote slots {changed(start)}")
@@ -318,33 +435,21 @@ def _rank_body(rank: int, comm, checkpoint: str, log) -> list[dict]:
                 outside = changed(start) - (set(real) | {padding_slot})
                 if outside:
                     failures.append(f"padded {accepted}: the commit wrote slots {outside}")
-                # MTP-off decode over the verify's tokens, one step per position, from the start.
+                # MTP-off decode over the verify rows' own in_proj output -- the same cuBLAS call
+                # on the same rows as DecodeTarget's -- one token per step from the start.
                 restore(start)
-                after, outs = [], []
-                for j in range(TOKENS):
-                    outs.append(decode._gdp(x[:, j].contiguous(), decode_mixer, step(padded)))
-                    after.append(states(real))
-                all_distinct &= distinct(after, len(real))
-                expected = [
-                    (after[accepted[b] - 1][0][b], after[accepted[b] - 1][1][b])
-                    for b in range(len(real))
-                ]
+                proj = M.cublas_mm(x, mixer.in_proj).view(len(padded), TOKENS, -1)
+                outs, after = decode_tokens(proj, padded, real)
+                separation = min(separation, apart(after, len(real)))
                 restore(committed)
-                failures += check_states(real, expected, f"padded {accepted}")
-                verify_rows = out.view(len(padded), TOKENS, -1)[: len(real)]
-                if not torch.equal(verify_rows, torch.stack(outs, dim=1)[: len(real)]):
-                    failures.append(f"padded {accepted}: verify output rows differ from decode's")
-            records.append(
-                dict(
-                    rank=rank,
-                    manager=type(manager).__name__,
-                    kind=kind,
-                    case="padded",
-                    failures=failures,
-                    distinct=all_distinct,
-                )
-            )
-            log(f"{kind} padded: {len(failures)} failures")
+                found, s = check_states(real, accepted, after, f"padded {accepted}")
+                failures += found
+                decoded = torch.stack(outs, dim=1)[: len(real)]
+                found, o = check_out(out[: len(real)], decoded, f"padded {accepted}")
+                failures += found
+                state_ulp = (max(state_ulp[0], s[0]), max(state_ulp[1], s[1]))
+                out_ulp = (max(out_ulp[0], o[0]), max(out_ulp[1], o[1]))
+            record("padded", failures, separation, state_ulp, out_ulp)
 
             # --- mixed: a fresh 37-token prompt beside 3 verify rows ---
             context_slot, real = slot[request_ids[5]], [slot[r] for r in request_ids[:3]]
@@ -355,9 +460,10 @@ def _rank_body(rank: int, comm, checkpoint: str, log) -> list[dict]:
             x = rows(g, len(real) * TOKENS)
             batch_rows = torch.cat([context, x])
             starts = torch.tensor([0, 37], dtype=torch.int32, device="cuda")
-            out = prefill._gdp(
+            out = verified(
+                prefill._gdp,
                 batch_rows,
-                prefill_mixer,
+                mixer,
                 step(
                     [context_slot] + real,
                     num_rows=1 + len(real),
@@ -382,56 +488,16 @@ def _rank_body(rank: int, comm, checkpoint: str, log) -> list[dict]:
             # The verify rows' own in_proj output -- cuBLAS at the mixed step's row count, as
             # PrefillTarget computes it -- decoded one token per step from the start.
             restore(start)
-            proj = M.cublas_mm(batch_rows, prefill_mixer.in_proj)[37:].view(len(real), TOKENS, -1)
-            after, outs = [], []
-            for j in range(TOKENS):
-                token = proj[:, j].contiguous()
-                beta, decay = M.gdp_gates(
-                    token[:, dims.beta],
-                    token[:, dims.decay],
-                    prefill_mixer.neg_a,
-                    prefill_mixer.dt_bias,
-                )
-                y = M._gdp_rows(
-                    token, beta, decay, prefill_mixer, step(real)["state_slots"], step(real), dims
-                )
-                y = M.gated_rmsnorm(
-                    y.view(len(real), dims.gdp_value_dim),
-                    prefill_mixer.norm,
-                    None,
-                    dims.gdp_eps,
-                    z=token[:, : dims.gdp_value_dim],
-                    group_size=dims.gdp_value,
-                    norm_before_gate=False,
-                    is_rms_norm=True,
-                )
-                outs.append(
-                    M.allreduce(
-                        M.cublas_mm(y, prefill_mixer.out_proj), workspace.buffer, workspace.flags
-                    )
-                )
-                after.append(states(real))
+            proj = M.cublas_mm(batch_rows, mixer.in_proj)[37:].view(len(real), TOKENS, -1)
+            outs, after = decode_tokens(proj, real, real)
             torch.cuda.synchronize()
-            expected = [
-                (after[accepted[b] - 1][0][b], after[accepted[b] - 1][1][b])
-                for b in range(len(real))
-            ]
-            mixed_distinct = distinct(after, len(real))
+            separation = apart(after, len(real))
             restore(committed)
-            failures += check_states(real, expected, f"mixed {accepted}")
-            if not torch.equal(out[37:].view(len(real), TOKENS, -1), torch.stack(outs, dim=1)):
-                failures.append("mixed: verify output rows differ from the decode steps' rows")
-            records.append(
-                dict(
-                    rank=rank,
-                    manager=type(manager).__name__,
-                    kind=kind,
-                    case="mixed",
-                    failures=failures,
-                    distinct=mixed_distinct,
-                )
-            )
-            log(f"{kind} mixed: {len(failures)} failures")
+            found, state_ulp = check_states(real, accepted, after, f"mixed {accepted}")
+            failures += found
+            found, out_ulp = check_out(out, torch.stack(outs, dim=1), f"mixed {accepted}")
+            failures += found
+            record("mixed", failures, separation, state_ulp, out_ulp)
         manager.shutdown()
         comm.Barrier()
     return records

@@ -7,8 +7,7 @@ The entry owns what is certified: `CELLS` is the list, `reference` the gate, `is
 guard. This file turns a cell into the buffers a target hands the op -- the conv columns of the
 in_proj output's generation rows as x, one layer's view of a hybrid-cache state pool as
 conv_state, one layer's view of the manager's intermediate conv buffer as the window buffer --
-drives the decode entry over the same tokens to pin the verify bit for bit, and holds the inputs
-the guard exists to refuse.
+and holds the inputs the guard exists to refuse.
 """
 
 import zlib
@@ -17,9 +16,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_update import (
-    causal_conv1d_update as decode,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.conv.causal_conv1d_verify import (
     causal_conv1d_verify as op,
 )
@@ -46,10 +42,6 @@ WINDOW_LAYERS, WINDOW_LAYER = 3, 1
 #: Bound on the fraction of outputs that may differ from the reference at all; see `_compare`.
 MAX_MISMATCH_FRACTION = 1e-3
 
-#: Leading channels the bitwise test sets to exact zeros -- state and inputs -- under negative
-#: taps, where the products are -0 and only an fma chain started from +0 gives +0.
-ZERO_CHANNELS = 64
-
 GRAPH_CELLS = [c for c in op.CELLS if c.spec["graph"]]
 
 
@@ -59,9 +51,8 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     `out` and `ref` are `[rows, dim]`, a row being one token of one request. Kernel and
     reference sum the same four bf16 products in fp32 -- the kernel as an fma chain, the
     reference as products then adds -- apply SiLU in fp32 and round once to bf16, exactly as the
-    decode entry and its reference do; each token here is bit for bit a decode step (pinned by
-    `test_equals_decode_steps_bit_for_bit`), so the decode entry's band and its derivation carry
-    over unchanged. Measured over every cell, five seeds each: only batches of 16 or fewer ever
+    decode entry and its reference do, so the decode entry's band and its derivation carry over
+    unchanged. Measured over every cell, five seeds each: only batches of 16 or fewer ever
     came out bit-identical; at most 3.0e-5 of the outputs differ, each by exactly one ulp of its
     own magnitude; the worst element 1.17 ulp at its row's scale, the relative RMS 0.0074 ulp.
     With the checkpoint's own taps (all 32 GDP layers, T = 3, batch 64) the three measure 0.95,
@@ -201,64 +192,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     out = op(**kwargs)
     assert out is kwargs["x"], "the op writes x in place and returns it"
     _check(proj, raw, buf, kwargs, ref_out, ref_windows, before, cell.spec)
-
-
-def _decode_steps(kwargs, spec):
-    """T one-token calls of the decode entry over the same tokens, on a copy of the pool:
-    `(outputs [live, dim, T], windows [live, T, dim, W - 1])` -- each window the slot's conv
-    state after that step, what the verify has to store for the commit."""
-    slots = kwargs["conv_state_indices"]
-    live = slots != PAD_SLOT_ID
-    owned = slots[live].long()
-    states = kwargs["conv_state"].clone()
-    outs, windows = [], []
-    for t in range(spec["tokens"]):
-        x_t = kwargs["x"][:, :, t : t + 1].clone()
-        decode(
-            x=x_t,
-            conv_state=states,
-            weight=kwargs["weight"],
-            bias_=None,
-            silu_activation=True,
-            cache_seqlens_=None,
-            conv_state_indices=slots,
-            pad_slot_id=PAD_SLOT_ID,
-        )
-        outs.append(x_t[live])
-        windows.append(states[owned].clone())
-    return torch.cat(outs, dim=-1), torch.stack(windows, dim=1)
-
-
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_equals_decode_steps_bit_for_bit(cell) -> None:
-    """One verify call gives every token the bits T decode steps give it, output and window.
-
-    MTP-on greedy identity rests on this: the accepted tokens' conv outputs feed the rest of the
-    layer, and the accepted window becomes the slot's state, exactly as if the tokens had run
-    one decode step each. Compared as bit patterns, so a +0 against a -0 counts: the leading
-    channels hold exact zeros under negative taps, where the products are -0 and the decode
-    kernel's fma chain from +0 gives +0."""
-    spec = cell.spec
-    proj, raw, buf, kwargs = _build(spec, seed=zlib.crc32(cell.why.encode()) % 2**31 + 1)
-    x, states, weight = kwargs["x"], kwargs["conv_state"], kwargs["weight"]
-    x[:, :ZERO_CHANNELS] = 0
-    states[:, :ZERO_CHANNELS] = 0
-    weight[:ZERO_CHANNELS] = -(weight[:ZERO_CHANNELS].abs() + 0.01)
-    expected_out, expected_windows = _decode_steps(kwargs, spec)
-
-    live = kwargs["conv_state_indices"] != PAD_SLOT_ID
-    with validating(op):
-        op(**kwargs)
-    out = x[live]
-    assert torch.equal(out.view(torch.int16), expected_out.view(torch.int16)), (
-        f"{(out.view(torch.int16) != expected_out.view(torch.int16)).float().mean().item():.2e} "
-        "of the outputs differ from the decode steps' bits"
-    )
-    assert bool((out[:, :ZERO_CHANNELS].view(torch.int16) == 0).all()), "a zero output is not +0"
-    windows = kwargs["intermediate_conv_window"][live.nonzero().squeeze(1), : spec["tokens"]]
-    assert torch.equal(windows.view(torch.int16), expected_windows.view(torch.int16)), (
-        "a window differs from the decode steps' state after that token"
-    )
 
 
 @pytest.mark.parametrize("cell", GRAPH_CELLS, ids=[c.why[:44] for c in GRAPH_CELLS])
