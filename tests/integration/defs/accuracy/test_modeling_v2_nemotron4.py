@@ -846,10 +846,10 @@ class TestModelingV2Nemotron4NanoPreviewSm103Dep4Identity(_CudaGraphIdentity):
 
     # The near-tie band: the largest shift of a top gap between the CUDA-graph
     # and eager legs at matched positions, measured by this gate over every
-    # compared request (4380 requests, 33 graph sizes): 1.2859; plus a quarter,
+    # compared request (4380 requests, 33 graph sizes): 1.1632; plus a quarter,
     # rounded up. Where the legs parted, the CUDA-graph leg emitted the eager
-    # leg's runner-up at margins of 0.0025 to 0.4656.
-    NEAR_TIE_BAND = 1.61
+    # leg's runner-up at margins of 0.0005 to 0.4607.
+    NEAR_TIE_BAND = 1.46
 
     def _ranks(self, prompts) -> dict[str, int]:
         """Where each fixed prompt runs: one long prompt per rank, the short ones dealt round-robin."""
